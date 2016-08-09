@@ -1,0 +1,4 @@
+true: safe_string, bin_annot, debug
+<*/*>: warn(@32@20@25@26@34@33@37@39)
+
+<pack.{ml,mli,byte,native}>: use_unix, use_bigarray, linkdep(bs.o)
