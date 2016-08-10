@@ -26,6 +26,8 @@ struct
       for i = 0 to length v - 1
       do Bytes.set buf i (get v i) done;
       Bytes.unsafe_to_string buf
+
+    external blit : t -> int -> t -> int -> int -> unit = "bigstring_memcpy" [@@noalloc]
   end
 
   module Bytes =
@@ -35,6 +37,7 @@ struct
     external get_u16 : t -> int -> int = "%caml_string_get16u"
     external get_u32 : t -> int -> Int32.t = "%caml_string_get32u"
     external get_u64 : t -> int -> Int64.t = "%caml_string_get64u"
+    external blit : t -> int -> t -> int -> int -> unit = "bytes_memcpy" [@@noalloc]
   end
 
   type st = St
@@ -87,9 +90,7 @@ struct
     | Bytes src, Bytes dst ->
       Bytes.blit src src_idx dst dst_idx len
     | Bigstring src, Bigstring dst ->
-      let src' = Bigstring.sub src src_idx len in
-      let dst' = Bigstring.sub dst dst_idx len in
-      Bigstring.blit src' dst'
+      Bigstring.blit src src_idx dst dst_idx len
 end
 
 module Z =
@@ -515,10 +516,12 @@ struct
     { last  : bool
     ; hold  : int
     ; bits  : int
+    ; o_off : int
     ; o_pos : int
-    ; o_avl : int
+    ; o_len : int
+    ; i_off : int
     ; i_pos : int
-    ; i_avl : int
+    ; i_len : int
     ; write : int
     ; state : ('i, 'o) state }
   and ('i, 'o) state =
@@ -538,7 +541,7 @@ struct
     | Wait  of ('i, 'o) t
     | Flush of ('i, 'o) t
     | Ok    of ('i, 'o) t
-    | Error of ('i, 'o) t
+    | Error of ('i, 'o) t * error
   and code =
     | Length
     | ExtLength of int
@@ -556,32 +559,33 @@ struct
     String.concat "" (aux [] d)
 
   let pp fmt { last; hold; bits
-             ; o_pos; o_avl
-             ; i_pos; i_avl; write
+             ; o_off; o_pos; o_len
+             ; i_off; i_pos; i_len; write
              ; state } =
     pp fmt "{@[<hov>last = %b;@ \
                     hold = %s;@ \
                     bits = %d;@ \
+                    o_off = %d;@ \
                     o_pos = %d;@ \
-                    o_avl = %d;@ \
+                    o_len = %d;@ \
+                    i_off = %d;@ \
                     i_pos = %d;@ \
-                    i_avl = %d;@ \
+                    i_len = %d;@ \
                     write = %d;@]}"
       last (bin_of_int hold) bits
-      o_pos o_avl i_pos i_avl write
+      o_off o_pos o_len i_off i_pos i_len write
 
-  let error src dst t exn =
-    Error { t with state = Exception exn }
+  let error t exn =
+    Error ({ t with state = Exception exn }, exn)
 
   (* Continuation passing-style stored in [Dictionary] *)
   module KDictionary =
   struct
     let rec get_byte k src dst t =
-      if t.i_avl > 0
-      then let byte = Char.code @@ B.get src t.i_pos in
+      if t.i_len - t.i_pos > 0
+      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
            k byte src dst
-             { t with i_pos = t.i_pos + 1
-                    ; i_avl = t.i_avl - 1 }
+             { t with i_pos = t.i_pos + 1 }
       else Wait { t with state = Dictionary (get_byte k) }
 
     let peek_bits n k src dst t =
@@ -624,11 +628,10 @@ struct
   module KFlat =
   struct
     let rec get_byte k src dst t =
-      if t.i_avl > 0
-      then let byte = Char.code @@ B.get src t.i_pos in
+      if t.i_len - t.i_pos > 0
+      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
            k byte src dst
-             { t with i_pos = t.i_pos + 1
-                    ; i_avl = t.i_avl - 1 }
+             { t with i_pos = t.i_pos + 1 }
       else Wait { t with state = Flat (get_byte k) }
 
     let get_ui16 k =
@@ -643,11 +646,10 @@ struct
     let rec get lookup k src dst t =
       if t.bits < lookup.Lookup.max
       then
-        if t.i_avl > 0
-        then let byte = Char.code @@ B.get src t.i_pos in
+        if t.i_len - t.i_pos > 0
+        then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
         (get[@tailcall]) lookup k src dst
           { t with i_pos = t.i_pos + 1
-                 ; i_avl = t.i_avl - 1
                  ; hold  = t.hold lor (byte lsl t.bits)
                  ; bits  = t.bits + 8 }
         else Wait { t with state = Inflate (get lookup k) }
@@ -657,31 +659,27 @@ struct
                               ; bits = t.bits - len }
 
     let rec put_chr window chr k src dst t =
-      if t.o_avl > 0
+      if t.o_len - t.o_pos > 0
       then begin
         let window = Window.write_char chr window in
-        B.set dst t.o_pos chr;
+        B.set dst (t.o_off + t.o_pos) chr;
 
-        k window src dst { t with o_pos = t.o_pos + 1
-                                ; o_avl = t.o_avl - 1
-                                ; write = t.write + 1 }
+        k window src dst { t with o_pos = t.o_pos + 1 }
       end else Flush { t with state = Inflate (put_chr window chr k) }
 
     let rec fill_chr window length chr k src dst t =
-      if t.o_avl > 0
+      if t.o_len - t.o_pos > 0
       then begin
-        let len = min length t.o_avl in
+        let len = min length (t.o_len - t.o_pos) in
 
         let window = Window.fill_char chr len window in
-        B.fill dst t.o_pos len chr;
+        B.fill dst (t.o_off + t.o_pos) len chr;
 
         if length - len > 0
         then Flush
           { t with o_pos = t.o_pos + len
-                 ; o_avl = t.o_avl - len
                  ; state = Inflate (fill_chr window (length - len) chr k) }
-        else k window src dst { t with o_pos = t.o_pos + len
-                                     ; o_avl = t.o_avl - len }
+        else k window src dst { t with o_pos = t.o_pos + len }
       end else Flush { t with state = Inflate (fill_chr window length chr k) }
 
     let rec write window lookup_chr lookup_dst length distance k src dst t =
@@ -692,7 +690,7 @@ struct
 
         fill_chr window length chr k src dst t
       | distance ->
-        let len = min t.o_avl length in
+        let len = min (t.o_len - t.o_pos) length in
         let off = Window.((window.wpos - distance) % window) in
         let sze = window.Window.size in
 
@@ -703,13 +701,13 @@ struct
           if ext > 0
           then begin
             let window0 = Window.write_rw window.Window.buffer off pre window in
-            B.blit   window0.Window.buffer off dst t.o_pos pre;
+            B.blit   window0.Window.buffer off dst (t.o_off + t.o_pos) pre;
             let window1 = Window.write_rw window0.Window.buffer 0 ext window0 in
-            B.blit   window1.Window.buffer 0 dst (t.o_pos + pre) ext;
+            B.blit   window1.Window.buffer 0 dst (t.o_off + t.o_pos + pre) ext;
             window1
           end else begin
             let window0 = Window.write_rw window.Window.buffer off len window in
-            B.blit   window0.Window.buffer off dst t.o_pos len;
+            B.blit   window0.Window.buffer off dst (t.o_off + t.o_pos) len;
             window0
           end
         in
@@ -717,12 +715,10 @@ struct
         if length - len > 0
         then Flush
           { t with o_pos = t.o_pos + len
-                 ; o_avl = t.o_avl - len
                  ; write = t.write + len
                  ; state = Inflate (write window lookup_chr lookup_dst (length - len) distance k) }
         else Cont
           { t with o_pos = t.o_pos + len
-                 ; o_avl = t.o_avl - len
                  ; write = t.write + len
                  ; state = Inffast (window, lookup_chr, lookup_dst, Length) }
 
@@ -730,15 +726,14 @@ struct
       let len = Array.get _extra_dbits distance in
 
       if t.bits < len
-      then if t.i_avl > 0
-           then let byte = Char.code @@ B.get src t.i_pos in
+      then if t.i_len - t.i_pos > 0
+           then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
                 read_extra_dist
                   distance k
                   src dst
                   { t with hold = t.hold lor (byte lsl t.bits)
                          ; bits = t.bits + 8
-                         ; i_pos = t.i_pos + 1
-                         ; i_avl = t.i_avl - 1 }
+                         ; i_pos = t.i_pos + 1 }
            else Wait
              { t with state = Inflate (read_extra_dist distance k) }
       else let extra = t.hold land ((1 lsl len) - 1) in
@@ -750,15 +745,14 @@ struct
       let len = Array.get _extra_lbits length in
 
       if t.bits < len
-      then if t.i_avl > 0
-           then let byte = Char.code @@ B.get src t.i_pos in
+      then if t.i_len - t.i_pos > 0
+           then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
                 read_extra_length
                   length k
                   src dst
                   { t with hold = t.hold lor (byte lsl t.bits)
                          ; bits = t.bits + 8
-                         ; i_pos = t.i_pos + 1
-                         ; i_avl = t.i_avl - 1 }
+                         ; i_pos = t.i_pos + 1 }
            else Wait
              { t with state = Inflate (read_extra_length length k) }
       else let extra = t.hold land ((1 lsl len) - 1) in
@@ -779,11 +773,10 @@ struct
       then let byte = t.hold land 255 in
            k byte src dst { t with hold = t.hold lsr 8
                                  ; bits = t.bits - 8 }
-      else if t.i_avl > 0
-      then let byte = Char.code @@ B.get src t.i_pos in
+      else if t.i_len - t.i_pos > 0
+      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
             k byte src dst
-              { t with i_pos = t.i_pos + 1
-                     ; i_avl = t.i_avl - 1 }
+              { t with i_pos = t.i_pos + 1 }
       else Wait { t with state = Crc (get_byte k) }
   end
 
@@ -826,7 +819,7 @@ struct
         | 16 ->
           let aux n src dst t =
             if state.idx + n + 3 > state.max
-            then error src dst t Invalid_dictionary
+            then error t Invalid_dictionary
             else begin
               for j = 0 to n + 3 - 1
               do Array.set state.dictionary (state.idx + j) state.prv done;
@@ -843,7 +836,7 @@ struct
         | 17 ->
           let aux n src dst t =
             if state.idx + n + 3 > state.max
-            then error src dst t Invalid_dictionary
+            then error t Invalid_dictionary
             else begin
               if state.idx + n + 3 < state.max
               then get (fun src dst t -> (loop[@tailcall])
@@ -857,7 +850,7 @@ struct
         | 18 ->
           let aux n src dst t =
             if state.idx + n + 11 > state.max
-            then error src dst t Invalid_dictionary
+            then error t Invalid_dictionary
             else begin
               if state.idx + n + 11 < state.max
               then get ((loop[@tailclal])
@@ -867,7 +860,7 @@ struct
           in
 
           KDictionary.get_bits 7 aux src dst t
-        | _ -> error src dst t Invalid_dictionary
+        | _ -> error t Invalid_dictionary
       in
 
       get (fun src dst t -> (loop[@tailcall]) (make max) src dst t) src dst t
@@ -946,36 +939,28 @@ struct
 
   let flat window src dst t =
     let rec loop window length src dst t =
-      let n = min length (min t.i_avl t.o_avl) in
+      let n = min length (min (t.i_len - t.i_pos) (t.o_len - t.o_pos)) in
 
-      let window = Window.write_ro src t.i_pos n window in
-      B.blit src t.i_pos dst t.o_pos n;
+      let window = Window.write_ro src (t.i_off + t.i_pos) n window in
+      B.blit src (t.i_off + t.i_pos) dst (t.o_off + t.o_pos) n;
 
       if length - n = 0
       then Cont  { t with i_pos = t.i_pos + n
-                        ; i_avl = t.i_avl - n
                         ; o_pos = t.o_pos + n
-                        ; o_avl = t.o_avl - n
                         ; state = Switch window }
-      else match t.i_avl - n, t.o_avl - n with
+      else match t.i_len - (t.i_pos + n), t.o_len - (t.o_pos + n) with
       | 0, b ->
         Wait  { t with i_pos = t.i_pos + n
-                     ; i_avl = 0
                      ; o_pos = t.o_pos + n
-                     ; o_avl = b
                      ; state = Flat (loop window (length - n)) }
       | a, 0 ->
         Flush { t with i_pos = t.i_pos + n
-                     ; i_avl = a
                      ; o_pos = t.o_pos + n
-                     ; o_avl = 0
                      ; state = Flat (loop window (length - n)) }
       | a, b ->
         Cont { t with i_pos = t.i_pos + n
-                     ; i_avl = a
-                     ; o_pos = t.o_pos + n
-                     ; o_avl = b
-                     ; state = Flat (loop window (length - n)) }
+                    ; o_pos = t.o_pos + n
+                    ; state = Flat (loop window (length - n)) }
     in
 
     let header window len nlen src dst t =
@@ -1030,28 +1015,24 @@ struct
     let goto = ref goto   in
 
     let i_pos = ref t.i_pos in
-    let i_avl = ref t.i_avl in
 
     let o_pos = ref t.o_pos in
-    let o_avl = ref t.o_avl in
     let write = ref t.write in
 
     let window = ref window in
 
     try
-      while !i_avl > 1 && !o_avl > 0
+      while t.i_len - !i_pos > 1 && t.o_len - !o_pos > 0
       do match !goto with
          | Length ->
            if !bits < lookup_chr.Lookup.max
            then begin
-             hold := !hold lor ((Char.code @@ B.get src !i_pos) lsl !bits);
+             hold := !hold lor ((Char.code @@ B.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
-             decr i_avl;
-             hold := !hold lor ((Char.code @@ B.get src !i_pos) lsl !bits);
+             hold := !hold lor ((Char.code @@ B.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
-             decr i_avl;
            end;
 
            let (len, value) = Array.get lookup_chr.Lookup.table (!hold land lookup_chr.Lookup.mask) in
@@ -1061,11 +1042,10 @@ struct
 
            if value < 256
            then begin
-             B.set dst !o_pos (Char.chr value);
+             B.set dst (t.o_off + !o_pos) (Char.chr value);
              window := Window.write_char (Char.chr value) !window;
              incr o_pos;
              incr write;
-             decr o_avl;
 
              goto := Length;
            end else if value = 256 then begin raise End
@@ -1077,10 +1057,9 @@ struct
 
            if !bits < len
            then begin
-             hold := !hold lor ((Char.code @@ B.get src !i_pos) lsl !bits);
+             hold := !hold lor ((Char.code @@ B.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
-             decr i_avl;
            end;
 
            let extra = !hold land ((1 lsl len) - 1) in
@@ -1091,14 +1070,12 @@ struct
          | Dist length ->
            if !bits < lookup_dst.Lookup.max
            then begin
-             hold := !hold lor ((Char.code @@ B.get src !i_pos) lsl !bits);
+             hold := !hold lor ((Char.code @@ B.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
-             decr i_avl;
-             hold := !hold lor ((Char.code @@ B.get src !i_pos) lsl !bits);
+             hold := !hold lor ((Char.code @@ B.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
-             decr i_avl;
            end;
 
            let (len, value) = Array.get lookup_dst.Lookup.table (!hold land lookup_dst.Lookup.mask) in
@@ -1111,14 +1088,12 @@ struct
 
            if !bits < len
            then begin
-             hold := !hold lor ((Char.code @@ B.get src !i_pos) lsl !bits);
+             hold := !hold lor ((Char.code @@ B.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
-             decr i_avl;
-             hold := !hold lor ((Char.code @@ B.get src !i_pos) lsl !bits);
+             hold := !hold lor ((Char.code @@ B.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
-             decr i_avl;
            end;
 
            let extra = !hold land ((1 lsl len) - 1) in
@@ -1131,17 +1106,16 @@ struct
            let chr = B.get !window.Window.buffer
              Window.((!window.wpos - 1) % !window) in
 
-           let n = min length !o_avl in
+           let n = min length (t.o_len - !o_pos) in
 
            window := Window.fill_char chr n !window;
-           B.fill dst !o_pos n chr;
+           B.fill dst (t.o_off + !o_pos) n chr;
 
            o_pos := !o_pos + n;
            write := !write + n;
-           o_avl := !o_avl - n;
            goto  := if length - n = 0 then Length else Write (length - n, 1)
          | Write (length, dist) ->
-           let n = min length !o_avl in
+           let n = min length (t.o_len - !o_pos) in
 
            let off = Window.((!window.Window.wpos - dist) % !window) in
            let len = !window.Window.size in
@@ -1152,19 +1126,18 @@ struct
            window := if ext > 0
              then begin
                let window0 = Window.write_rw !window.Window.buffer off pre !window in
-               B.blit   window0.Window.buffer off dst !o_pos pre;
+               B.blit   window0.Window.buffer off dst (t.o_off + !o_pos) pre;
                let window1 = Window.write_rw window0.Window.buffer 0 ext window0 in
-               B.blit   window1.Window.buffer 0 dst (!o_pos + pre) ext;
+               B.blit   window1.Window.buffer 0 dst (t.o_off + !o_pos + pre) ext;
                window1
              end else begin
                let window0 = Window.write_rw !window.Window.buffer off n !window in
-               B.blit   window0.Window.buffer off dst !o_pos n;
+               B.blit   window0.Window.buffer off dst (t.o_off + !o_pos) n;
                window0
              end;
 
            o_pos := !o_pos + n;
            write := !write + n;
-           o_avl := !o_avl - n;
            goto  := if length - n = 0 then Length else Write (length - n, dist)
       done;
 
@@ -1216,18 +1189,14 @@ struct
       Cont { t with hold = !hold
                   ; bits = !bits
                   ; i_pos = !i_pos
-                  ; i_avl = !i_avl
                   ; o_pos = !o_pos
-                  ; o_avl = !o_avl
                   ; write = !write
                   ; state = state }
     with End ->
       Cont { t with hold = !hold
                   ; bits = !bits
                   ; i_pos = !i_pos
-                  ; i_avl = !i_avl
                   ; o_pos = !o_pos
-                  ; o_avl = !o_avl
                   ; write = !write
                   ; state = Switch !window }
 
@@ -1243,11 +1212,10 @@ struct
          Cont { t with hold = t.hold lsr 2
                      ; bits = t.bits - 2
                      ; state }
-    else if t.i_avl > 0
-    then let byte = Char.code @@ B.get src t.i_pos in
+    else if (t.i_len - t.i_pos) > 0
+    then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
 
          Cont { t with i_pos = t.i_pos + 1
-                     ; i_avl = t.i_avl - 1
                      ; hold  = (t.hold lor (byte lsl t.bits))
                      ; bits  = t.bits + 8 }
     else Wait t
@@ -1260,24 +1228,22 @@ struct
                      ; hold  = t.hold lsr 1
                      ; bits  = t.bits - 1
                      ; state = Block window }
-    else if t.i_avl > 0
-    then let byte = Char.code @@ B.get src t.i_pos in
+    else if (t.i_len - t.i_pos) > 0
+    then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
 
          Cont { t with i_pos = t.i_pos + 1
-                     ; i_avl = t.i_avl - 1
                      ; hold  = (t.hold lor (byte lsl t.bits))
                      ; bits  = t.bits + 8 }
     else Wait t
 
   let header src dst t =
-    if t.i_avl > 1
-    then let byte0 = Char.code @@ B.get src t.i_pos in
-         let _     = Char.code @@ B.get src (t.i_pos + 1) in
+    if (t.i_len - t.i_pos) > 1
+    then let byte0 = Char.code @@ B.get src (t.i_off + t.i_pos) in
+         let _     = Char.code @@ B.get src (t.i_off + t.i_pos + 1) in
 
          let window = Window.make_by ~proof:dst (1 lsl (byte0 lsr 4 + 8)) in
 
          Cont { t with i_pos = t.i_pos + 2
-                     ; i_avl = t.i_avl - 2
                      ; state = Last window }
     else Wait t
 
@@ -1294,7 +1260,7 @@ struct
       | Inflate k -> k src dst t
       | Switch window -> switch src dst t window
       | Crc k -> k src dst t
-      | Exception exn -> error src dst t exn
+      | Exception exn -> error t exn
     in
 
     let rec loop t =
@@ -1303,7 +1269,7 @@ struct
       | Wait t -> `Await t
       | Flush t -> `Flush t
       | Ok t -> `End t
-      | Error t -> `Error t
+      | Error (t, exn) -> `Error (t, exn)
     in
 
     loop t
@@ -1312,39 +1278,166 @@ struct
     { last  = false
     ; hold  = 0
     ; bits  = 0
+    ; i_off = 0
     ; i_pos = 0
-    ; i_avl = 0
+    ; i_len = 0
+    ; o_off = 0
     ; o_pos = 0
-    ; o_avl = 0
+    ; o_len = 0
     ; write = 0
     ; state = Header }
 
+  let sp = Format.sprintf
+
   let refill off len t =
-    { t with i_pos = off
-           ; i_avl = len }
+    if t.i_pos = t.i_len
+    then { t with i_off = off
+                ; i_len = len
+                ; i_pos = 0 }
+    else raise (Invalid_argument (sp "Z.refill: you lost something (pos: %d, len: %d)" t.i_pos t.i_len))
 
   let flush off len t =
-    { t with o_pos = off
-           ; o_avl = len }
+    { t with o_off = off
+           ; o_len = len
+           ; o_pos = 0 }
 
-  let available_in t  = t.i_avl
-  let available_out t = t.o_avl
+  let available_in t  = t.i_len - t.i_pos
+  let available_out t = t.o_len - t.i_pos
 
   let used_in t  = t.i_pos
   let used_out t = t.o_pos
+
+  let write t = t.write
 
   let extract_error { state; _ } = match state with
     | Exception exn -> Some exn
     | _ -> None
 end
 
-module Pack =
+module H =
+struct
+  type error = ..
+  type error += Reserved_opcode of int
+
+  type 'i t =
+    { i_off  : int
+    ; i_pos  : int
+    ; i_len  : int
+    ; source : int
+    ; source_length : int
+    ; result_length : int
+    ; hunks         : 'i obj list
+    ; state  : 'i state }
+  and 'i state =
+    | Header of ('i B.t -> 'i t -> 'i res)
+    | List   of ('i B.t -> 'i t -> 'i res)
+    | Insert of ('i B.t * int * int)
+    | Exception of error
+  and 'i res =
+    | Wait of 'i t
+    | Error of 'i t * error
+    | Cont of 'i t
+    | Ok of 'i t * 'i obj
+  and 'i obj =
+    | RefDelta of 'i B.t
+    | RefOfs
+
+  let await t      = Wait t
+  let error t exn  = Error ({ t with state = Exception exn }, exn)
+
+  module KHeader =
+  struct
+    let rec get_byte k src t =
+      if t.i_len - t.i_pos > 0
+      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+           k byte src { t with i_pos = t.i_pos + 1 }
+      else await { t with state = Header ((get_byte[@tailcall]) k) }
+  end
+
+  module KList =
+  struct
+    let rec get_byte k src t =
+      if t.i_len > 0
+      then let byte = Char.code @@ B.get src t.i_off in
+           k byte src { t with i_pos = t.i_pos + 1 }
+      else await { t with state = List ((get_byte[@tailcall]) k) }
+  end
+
+  let insert src t buffer (off, rest) =
+    let n = min (t.i_len - t.i_pos) rest in
+    B.blit src (t.i_off + t.i_pos) buffer off n;
+    if rest - n = 0
+    then Cont { t with hunks = (RefDelta buffer) :: t.hunks }
+    else await { t with i_pos = t.i_pos + n
+                      ; state = Insert (buffer, off + n, rest - n) }
+
+  let list src t =
+    KList.get_byte
+      (fun opcode src t ->
+        Format.printf "opcode: %d\n%!" opcode;
+
+        if opcode = 0 then error t (Reserved_opcode opcode)
+        else match opcode land 0x80 with
+        | 0 -> Cont { t with state = Insert (B.from ~proof:src opcode, 0, opcode) }
+        | _ -> assert false)
+      src t
+
+  let header =
+    KHeader.get_byte
+    @@ fun source_length -> KHeader.get_byte
+    @@ fun result_length src t ->
+       Cont { t with state = List list
+                   ; source_length
+                   ; result_length }
+
+  let eval src t =
+    let eval0 t = match t.state with
+      | Header k -> k src t
+      | List k -> k src t
+      | Insert (buffer, off, rest) -> insert src t buffer (off, rest)
+      | Exception exn -> error t exn
+    in
+
+    let rec loop t =
+      match eval0 t with
+      | Cont t -> loop t
+      | Wait t -> `Await t
+      | Error (t, exn) -> `Error (t, exn)
+      | Ok (t, obj) -> `Ok (t, obj)
+    in
+
+    loop t
+
+  let default source =
+    { i_off = 0
+    ; i_pos = 0
+    ; i_len = 0
+    ; source
+    ; source_length = 0
+    ; result_length = 0
+    ; hunks = []
+    ; state = Header header }
+
+  let sp = Format.sprintf
+
+  let refill off len t =
+    if t.i_pos = t.i_len 
+    then { t with i_off = off
+                ; i_len = len }
+    else raise (Invalid_argument (sp "Hunks.refill: you lost something"))
+
+  let available_in t = t.i_len
+  let used_in t = t.i_pos
+end
+
+module Unpack =
 struct
   type error = ..
   type error += Invalid_byte of int
   type error += Reserved_kind of int
   type error += Invalid_kind of int
   type error += Inflate_error of Z.error
+  type error += Hunk_error of H.error
   type error += Invalid_length of int * int
 
   let pp = Format.fprintf
@@ -1357,21 +1450,24 @@ struct
 
   type ('i, 'o) t =
     { i_off   : int
+    ; i_pos   : int
     ; i_len   : int
-    ; chunk   : int
+    ; o_buf   : 'o B.t
     ; version : Int32.t
     ; objects : Int32.t
     ; state   : ('i, 'o) state }
   and ('i, 'o) state =
     | Header of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
     | Object of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
-    | Unzip of { length : int; kind : kind; count : int; output : 'o B.t; state : ('i, 'o) Z.t; }
+    | Length of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
+    | Unzip of { length : int; kind : kind; z : ('i, 'o) Z.t; }
+    | Hunks of { z : ('i, 'o) Z.t; h : 'i H.t; }
     | Next of { length : int; count : int; kind : kind; }
     | Exception of error
   and ('i, 'o) res =
     | Wait of ('i, 'o) t
     | Flush of ('i, 'o) t
-    | Error of ('i, 'o) t
+    | Error of ('i, 'o) t * error
     | Cont of ('i, 'o) t
     | Ok of ('i, 'o) t
   and kind =
@@ -1386,145 +1482,166 @@ struct
     | Blob -> pp fmt "Blob"
     | Tag -> pp fmt "Tag"
 
-  let pp fmt { i_off; i_len; chunk; version; objects; state; } =
+  let pp fmt { i_off; i_pos; i_len; o_buf; version; objects; state; } =
     match state with
-    | Unzip { state; _ } ->
+    | Unzip { z; _ } ->
       pp fmt "{@[<hov>i_off = %d;@ \
+                      i_pos = %d;@ \
                       i_len = %d;@ \
-                      chunk = %d;@ \
                       version = %ld;@ \
                       objects = %ld;@ \
                       z = %a;@]}"
-        i_off i_len chunk version objects Z.pp state
+        i_off i_pos i_len version objects Z.pp z
     | _ ->
       pp fmt "{@[<hov>i_off = %d;@ \
+                      i_pos = %d;@ \
                       i_len = %d;@ \
-                      chunk = %d;@ \
                       version = %ld;@ \
                       objects = %ld;@]}"
-        i_off i_len chunk version objects
+        i_off i_pos i_len version objects
 
   let await t      = Wait t
   let flush t      = Flush t
-  let error t exn  = Error { t with state = Exception exn }
+  let error t exn  = Error ({ t with state = Exception exn }, exn)
   let continue t   = Cont t
   let rec ok src t = Ok { t with state = Header ok }
 
   module KHeader =
   struct
     let rec check_byte chr k src t =
-      if t.i_len > 0 && B.get src t.i_off = chr
-      then k src { t with i_off = t.i_off + 1
-                        ; i_len = t.i_len - 1 }
+      if (t.i_len - t.i_pos) > 0 && B.get src (t.i_off + t.i_pos) = chr
+      then k src { t with i_pos = t.i_pos + 1 }
       else if t.i_len = 0
       then await { t with state = Header ((check_byte[@tailcall]) chr k) }
-      else error { t with i_off = t.i_off + 1
-                        ; i_len = t.i_len - 1 }
-                 (Invalid_byte (Char.code @@ B.get src t.i_off))
+      else error { t with i_pos = t.i_pos + 1 }
+                 (Invalid_byte (Char.code @@ B.get src (t.i_off + t.i_pos)))
 
     let rec get_byte k src t =
       if t.i_len > 0
-      then let byte = Char.code @@ B.get src t.i_off in
-           k byte src { t with i_off = t.i_off + 1
-                             ; i_len = t.i_len - 1 }
+      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+           k byte src { t with i_pos = t.i_pos + 1 }
       else await { t with state = Header ((get_byte[@tailcall]) k) }
 
     let rec get_u32 k src t =
       if t.i_len > 3
-      then k (B.get_u32 src t.i_off) src
-             { t with i_off = t.i_off + 4
-                    ; i_len = t.i_len - 4 }
+      then k (B.get_u32 src (t.i_off + t.i_pos)) src
+             { t with i_pos = t.i_pos + 4 }
       else await { t with state = Header ((get_u32[@tailcall]) k) }
+  end
+
+  module KLength =
+  struct
+    let rec get_byte k src t =
+      if t.i_len > 0
+      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+           k byte src { t with i_pos = t.i_pos + 1 }
+      else await { t with state = Length ((get_byte[@tailcall]) k) }
   end
 
   module KObject =
   struct
     let rec get_byte k src t =
       if t.i_len > 0
-      then let byte = Char.code @@ B.get src t.i_off in
-           k byte src { t with i_off = t.i_off + 1
-                             ; i_len = t.i_len - 1 }
+      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+           k byte src { t with i_pos = t.i_pos + 1 }
       else await { t with state = Object ((get_byte[@tailcall]) k) }
   end
 
-  let rec length msb typ (len, bit) src t = match msb with
+  let rec length msb (len, bit) k src t = match msb with
     | true ->
+      KLength.get_byte
+        (fun byte src t ->
+           let msb = byte land 0x80 <> 0 in
+           (length[@tailcall]) msb (len lor ((byte land 0x7F) lsl bit), bit + 7)
+           k src t)
+        src t
+    | false -> k len src t
+
+  let hunks src t z h =
+    match Z.eval src t.o_buf z with
+    | `Await z ->
+      await { t with state = Hunks { z; h; } }
+    | `Error (z, exn) -> error t (Inflate_error exn)
+    | `End z ->
+      if Z.used_out z <> 0
+      then match H.eval t.o_buf (H.refill 0 (Z.used_out z) h) with
+           | _ -> assert false
+      else assert false
+    | `Flush z ->
+      match H.eval t.o_buf (H.refill 0 (Z.used_out z) h) with
+      | `Await h ->
+        Cont { t with state = Hunks { z = (Z.flush 0 (B.length t.o_buf) z)
+                                    ; h } }
+      | `Error (h, exn) -> error t (Hunk_error exn)
+      | `Ok h -> assert false
+
+  let switch typ len src t =
+    match typ with
+    | 0b000 | 0b101 -> error t (Reserved_kind typ)
+    | 0b001 ->
+      Cont { t with state = Unzip { length = len
+                                  ; kind = Commit
+                                  ; z = Z.flush 0 (B.length t.o_buf)
+                                        @@ Z.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                        @@ Z.default; } }
+    | 0b010 ->
+      Cont { t with state = Unzip { length = len
+                                  ; kind = Tree
+                                  ; z = Z.flush 0 (B.length t.o_buf)
+                                        @@ Z.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                        @@ Z.default; } }
+    | 0b011 ->
+      Cont { t with state = Unzip { length = len
+                                  ; kind = Blob
+                                  ; z = Z.flush 0 (B.length t.o_buf)
+                                        @@ Z.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                        @@ Z.default; } }
+    | 0b100 ->
+      Cont { t with state = Unzip { length = len
+                                  ; kind = Tag
+                                  ; z = Z.flush 0 (B.length t.o_buf)
+                                        @@ Z.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                        @@ Z.default; } }
+    | 0b110 ->
       KObject.get_byte
         (fun byte src t ->
-           let msb = byte land 0x80 = 1 in
-           (length[@tailcall]) msb typ
-             (len lor ((byte land 0x7F) lsl bit), bit + 7)
+           let msb = byte land 0x80 <> 0 in
+           length msb (byte land 0x7F, 7)
+             (fun source src t ->
+               Cont { t with state = Hunks { z = Z.flush 0 (B.length t.o_buf)
+                                                 @@ Z.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                                 @@ Z.default
+                                           ; h = H.default source } })
              src t)
         src t
-    | false -> match typ with
-      | 0b000 | 0b101 -> error t (Reserved_kind typ)
-      | 0b001 ->
-        Cont { t with state = Unzip { length = len
-                                    ; kind = Commit
-                                    ; count = 0
-                                    ; output = B.from ~proof:src t.chunk
-                                    ; state = Z.flush 0 t.chunk @@ Z.refill t.i_off t.i_len Z.default; } }
-      | 0b010 ->
-        Cont { t with state = Unzip { length = len
-                                    ; kind = Tree
-                                    ; count = 0
-                                    ; output = B.from ~proof:src t.chunk
-                                    ; state = Z.flush 0 t.chunk @@ Z.refill t.i_off t.i_len Z.default; } }
-      | 0b011 ->
-        Cont { t with state = Unzip { length = len
-                                    ; kind = Blob
-                                    ; count = 0
-                                    ; output = B.from ~proof:src t.chunk
-                                    ; state = Z.flush 0 t.chunk @@ Z.refill t.i_off t.i_len Z.default; } }
-      | 0b100 ->
-        Cont { t with state = Unzip { length = len
-                                    ; kind = Tag
-                                    ; count = 0
-                                    ; output = B.from ~proof:src t.chunk
-                                    ; state = Z.flush 0 t.chunk @@ Z.refill t.i_off t.i_len Z.default; } }
-      | _  -> error t (Invalid_kind typ)
+    | _  -> error t (Invalid_kind typ)
 
   let kind src t =
     KObject.get_byte
       (fun byte src t ->
          let msb = byte land 0x80 <> 0 in
          let typ = (byte land 0x70) lsr 4 in
-         length msb typ (byte land 0x0F, 4) src t)
+         length msb (byte land 0x0F, 4) (switch typ) src t)
       src t
 
-  let unzip src t length kind count output z =
-    match Z.eval src output z with
+  let unzip src t length kind z =
+    match Z.eval src t.o_buf z with
     | `Await z ->
       await { t with state = Unzip { length
                                    ; kind
-                                   ; count
-                                   ; output
-                                   ; state = z }
-                     ; i_off = Z.used_in z
-                     ; i_len = Z.available_in z }
+                                   ; z } }
     | `Flush z ->
       flush { t with state = Unzip { length
                                    ; kind
-                                   ; count = count + (Z.used_out z)
-                                   ; output
-                                   ; state = z }
-                     ; i_off = Z.used_in z
-                     ; i_len = Z.available_in z }
+                                   ; z } }
     | `End z ->
       if Z.used_out z <> 0
       then flush { t with state = Unzip { length
-                        ; kind
-                        ; count = count + (Z.used_out z)
-                        ; output
-                        ; state = z }
-                        ; i_off = Z.used_in z
-                        ; i_len = Z.available_in z }
-      else Cont { t with state = Next { length; count; kind; }
-                         ; i_off = Z.used_in z
-                         ; i_len = Z.available_in z }
-    | `Error z -> match Z.extract_error z with
-      | Some exn -> error t (Inflate_error exn)
-      | None -> assert false
+                                        ; kind
+                                        ; z } }
+      else Cont { t with state = Next { length; count = Z.write z; kind; }
+                       ; i_pos = t.i_pos + Z.used_in z }
+    | `Error (z, exn) -> error t (Inflate_error exn)
 
   let next src t length count kind =
     if length = count
@@ -1551,30 +1668,38 @@ struct
     @@ KHeader.check_byte 'K'
     @@ version
 
-  let default ?(chunk = 4096) =
+  let default ~proof ?(chunk = 4096) =
     { i_off   = 0
+    ; i_pos   = 0
     ; i_len   = 0
-    ; chunk
+    ; o_buf   = B.from ~proof chunk
     ; version = 0l
     ; objects = 0l
     ; state   = Header header }
 
-  let refill off len t = match t.state with
-    | Unzip { length; kind; count; output; state; } ->
-      { t with i_off = off
-             ; i_len = len
-             ; state = Unzip { length; kind; count; output; state = Z.refill off len state; } }
-    | _ -> { t with i_off = off
-                  ; i_len = len }
+  let sp = Format.sprintf
+
+  let refill off len t =
+    if t.i_len - t.i_pos = 0
+    then match t.state with
+         | Unzip { length; kind; z; } ->
+           { t with i_off = off
+                  ; i_len = len
+                  ; i_pos = 0
+                  ; state = Unzip { length; kind; z = Z.refill off len z; } }
+         | _ -> { t with i_off = off
+                       ; i_len = len
+                       ; i_pos = 0 }
+    else raise (Invalid_argument (sp "Unpack.refill: you lost something (pos: %d, len: %d)" t.i_pos t.i_len))
 
   let flush off len t = match t.state with
-    | Unzip { length; kind; count; output; state; } ->
-      { t with state = Unzip { length; kind; count; output; state = Z.flush off len state; } }
+    | Unzip { length; kind; z; } ->
+      { t with state = Unzip { length; kind; z = Z.flush off len z; } }
     | _ -> raise (Invalid_argument "flush: bad state")
 
   let output t = match t.state with
-    | Unzip { output; state; _ } ->
-      output, Z.used_out state
+    | Unzip { z; _ } ->
+      t.o_buf, Z.used_out z
     | _ -> raise (Invalid_argument "output: bad state")
 
   let next_object t = match t.state with
@@ -1592,8 +1717,11 @@ struct
     let eval0 t = match t.state with
       | Header k -> k src t
       | Object k -> k src t
-      | Unzip { length; kind; count; output; state; } ->
-        unzip src t length kind count output state
+      | Length k -> k src t
+      | Unzip { length; kind; z; } ->
+        unzip src t length kind  z
+      | Hunks { z; h; } ->
+        hunks src t z h
       | Next { length; count; kind; } -> next src t length count kind
       | Exception exn -> error t exn
     in
@@ -1605,16 +1733,13 @@ struct
       | Wait t -> `Await t
       | Flush t -> `Flush t
       | Ok t -> `End t
-      | Error t -> `Error t
+      | Error (t, exn) -> `Error (t, exn)
     in
 
     loop t
-
-  let extract_error { state; _ } = match state with
-    | Exception exn -> Some exn
-    | _ -> None
 end
 
+(* from ocaml-hex *)
 module Hex =
 struct
   let to_char x y =
@@ -1622,7 +1747,7 @@ struct
       | '0'..'9' -> Char.code c - 48 (* Char.code '0' *)
       | 'A'..'F' -> Char.code c - 55 (* Char.code 'A' + 10 *)
       | 'a'..'f' -> Char.code c - 87 (* Char.code 'a' + 10 *)
-      | _ -> raise (Invalid_argument (Format.sprintf "to_char: %d is an invalid char" (Char.code c)))
+      | _ -> raise (Invalid_argument (Format.sprintf "Hex.to_char: %d is an invalid char" (Char.code c)))
     in
     Char.chr (code x lsl 4 + code y)
 
@@ -1711,26 +1836,24 @@ let () =
   let buf     = Buffer.create 4096 in
 
   let rec loop t =
-    match Pack.eval (B.from_bigstring tmp) t with
+    match Unpack.eval (B.from_bigstring tmp) t with
     | `Await t ->
       let n = bs_read Unix.stdin tmp 0 4096 in
-      loop (Pack.refill 0 n t)
+      loop (Unpack.refill 0 n t)
     | `Flush t ->
-      let o, n = Pack.output t in
+      let o, n = Unpack.output t in
       let () = match o with B.Bigstring v -> Buffer.add_substring buf (B.Bigstring.to_string v) 0 n in
-      loop (Pack.flush 0 n t)
+      loop (Unpack.flush 0 n t)
     | `Object t ->
-      let kind = Pack.kind t in
+      let kind = Unpack.kind t in
       Format.printf "%a:\n%a\n%!"
-        Pack.pp_kind kind
+        Unpack.pp_kind kind
         Hex.hexdump (Hex.of_string_fast @@ Buffer.contents buf);
 
       let () = Buffer.clear buf in
-      loop (Pack.next_object t)
+      loop (Unpack.next_object t)
     | `End t -> ()
-    | `Error t -> match Pack.extract_error t with
-      | Some exn -> Format.eprintf "%a\n%!" Pack.pp_error exn
-      | None -> assert false
+    | `Error (t, exn) -> Format.eprintf "%a\n%!" Unpack.pp_error exn
   in
 
-  loop (Pack.default ~chunk:4096)
+  loop (Unpack.default ~proof:(B.from_bigstring tmp) ~chunk:4096)
