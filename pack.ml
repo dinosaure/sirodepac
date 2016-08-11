@@ -1,3 +1,5 @@
+let () = Printexc.record_backtrace true
+
 module B =
 struct
   module Bigstring =
@@ -91,6 +93,10 @@ struct
       Bytes.blit src src_idx dst dst_idx len
     | Bigstring src, Bigstring dst ->
       Bigstring.blit src src_idx dst dst_idx len
+
+  let pp : type a. Format.formatter -> a t -> unit = fun fmt -> function
+    | Bytes v -> Format.fprintf fmt "%S" (Bytes.unsafe_to_string v)
+    | Bigstring v -> Format.fprintf fmt "%S" (Bigstring.to_string v)
 end
 
 module Z =
@@ -1318,83 +1324,156 @@ module H =
 struct
   type error = ..
   type error += Reserved_opcode of int
+  type error += Wrong_insert_hunk of int * int * int
 
   type 'i t =
     { i_off  : int
     ; i_pos  : int
     ; i_len  : int
-    ; source : int
+    ; read   : int
+    ; length   : int
+    ; backward : int
     ; source_length : int
-    ; result_length : int
+    ; target_length : int
     ; hunks         : 'i obj list
     ; state  : 'i state }
   and 'i state =
-    | Header of ('i B.t -> 'i t -> 'i res)
-    | List   of ('i B.t -> 'i t -> 'i res)
-    | Insert of ('i B.t * int * int)
+    | Header    of ('i B.t -> 'i t -> 'i res)
+    | List      of ('i B.t -> 'i t -> 'i res)
+    | Is_insert of ('i B.t * int * int)
+    | Is_copy   of ('i B.t -> 'i t -> 'i res)
+    | End
     | Exception of error
   and 'i res =
-    | Wait of 'i t
+    | Wait  of 'i t
     | Error of 'i t * error
-    | Cont of 'i t
-    | Ok of 'i t * 'i obj
+    | Cont  of 'i t
+    | Ok    of 'i t * 'i obj list
   and 'i obj =
-    | RefDelta of 'i B.t
-    | RefOfs
+    | Insert of 'i B.t
+    | Copy of int * int
+
+  let pp = Format.fprintf
+
+  let pp_lst ~sep pp_data fmt lst =
+    let rec aux = function
+      | [] -> ()
+      | [ x ] -> pp_data fmt x
+      | x :: r -> pp fmt "%a%a" pp_data x sep (); aux r
+    in aux lst
+
+  let pp_obj fmt = function
+    | Insert buf ->
+      pp fmt "(Insert %a)" B.pp buf
+    | Copy (off, len) ->
+      pp fmt "(Copy (%d, %d))" off len
 
   let await t      = Wait t
   let error t exn  = Error ({ t with state = Exception exn }, exn)
+  let ok t         = Ok ({ t with state = End }, t.hunks)
 
   module KHeader =
   struct
     let rec get_byte k src t =
       if t.i_len - t.i_pos > 0
       then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
-           k byte src { t with i_pos = t.i_pos + 1 }
+           k byte src { t with i_pos = t.i_pos + 1
+                             ; read = t.read + 1 }
       else await { t with state = Header ((get_byte[@tailcall]) k) }
+
+    let rec length msb (len, bit) k src t = match msb with
+      | true ->
+        get_byte
+          (fun byte src t ->
+             let msb = byte land 0x80 <> 0 in
+             (length[@tailcall]) msb (len lor ((byte land 0x7F) lsl bit), bit + 7)
+             k src t)
+          src t
+      | false -> k len src t
+
+    let length k src t =
+      get_byte
+        (fun byte src t ->
+           let msb = byte land 0x80 <> 0 in
+           length msb ((byte land 0x7F), 7) k src t)
+        src t
   end
 
   module KList =
   struct
     let rec get_byte k src t =
       if t.i_len > 0
-      then let byte = Char.code @@ B.get src t.i_off in
-           k byte src { t with i_pos = t.i_pos + 1 }
+      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+           k byte src { t with i_pos = t.i_pos + 1
+                             ; read = t.read + 1 }
       else await { t with state = List ((get_byte[@tailcall]) k) }
   end
+
+  let rec copy opcode =
+    let rec get_byte flag k src t =
+      if not flag
+      then k 0 src t
+      else if t.i_len > 0
+           then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+                k byte src { t with i_pos = t.i_pos + 1
+                                  ; read = t.read + 1 }
+           else await { t with state = Is_copy ((get_byte[@tailcall]) flag k)}
+    in
+
+    get_byte ((opcode lsr 0) land 1 <> 0)
+    @@ fun o0 -> get_byte ((opcode lsr 1) land 1 <> 0)
+    @@ fun o1 -> get_byte ((opcode lsr 2) land 1 <> 0)
+    @@ fun o2 -> get_byte ((opcode lsr 3) land 1 <> 0)
+    @@ fun o3 -> get_byte ((opcode lsr 4) land 1 <> 0)
+    @@ fun l0 -> get_byte ((opcode lsr 5) land 1 <> 0)
+    @@ fun l1 -> get_byte ((opcode lsr 6) land 1 <> 0)
+    @@ fun l2 src t ->
+      let copy_offset = o0 lor (o1 lsl 8) lor (o2 lsl 16) lor (o3 lsl 24) in
+      let copy_length = l0 lor (l1 lsl 8) lor (l2 lsl 16) in
+
+      if copy_offset + copy_length > t.source_length
+      then error t (Wrong_insert_hunk (copy_offset, copy_length, t.source_length))
+      else Cont { t with hunks = (Copy (copy_offset, copy_length)) :: t.hunks
+                       ; state = List list }
+
+  and list src t =
+    if t.read < t.length
+    then KList.get_byte
+           (fun opcode src t ->
+             if opcode = 0 then error t (Reserved_opcode opcode)
+             else match opcode land 0x80 with
+             | 0 -> Cont { t with state = Is_insert (B.from ~proof:src opcode, 0, opcode) }
+             | _ -> Cont { t with state = Is_copy (copy opcode) })
+           src t
+    else ok t
 
   let insert src t buffer (off, rest) =
     let n = min (t.i_len - t.i_pos) rest in
     B.blit src (t.i_off + t.i_pos) buffer off n;
     if rest - n = 0
-    then Cont { t with hunks = (RefDelta buffer) :: t.hunks }
+    then Cont { t with hunks = (Insert buffer) :: t.hunks
+                     ; i_pos = t.i_pos + n
+                     ; read = t.read + n
+                     ; state = List list }
     else await { t with i_pos = t.i_pos + n
-                      ; state = Insert (buffer, off + n, rest - n) }
-
-  let list src t =
-    KList.get_byte
-      (fun opcode src t ->
-        Format.printf "opcode: %d\n%!" opcode;
-
-        if opcode = 0 then error t (Reserved_opcode opcode)
-        else match opcode land 0x80 with
-        | 0 -> Cont { t with state = Insert (B.from ~proof:src opcode, 0, opcode) }
-        | _ -> assert false)
-      src t
+                      ; read = t.read + n
+                      ; state = Is_insert (buffer, off + n, rest - n) }
 
   let header =
-    KHeader.get_byte
-    @@ fun source_length -> KHeader.get_byte
-    @@ fun result_length src t ->
+    KHeader.length
+    @@ fun source_length -> KHeader.length
+    @@ fun target_length src t ->
        Cont { t with state = List list
                    ; source_length
-                   ; result_length }
+                   ; target_length }
 
   let eval src t =
     let eval0 t = match t.state with
       | Header k -> k src t
       | List k -> k src t
-      | Insert (buffer, off, rest) -> insert src t buffer (off, rest)
+      | Is_insert (buffer, off, rest) -> insert src t buffer (off, rest)
+      | Is_copy k -> k src t
+      | End -> ok t
       | Exception exn -> error t exn
     in
 
@@ -1403,18 +1482,20 @@ struct
       | Cont t -> loop t
       | Wait t -> `Await t
       | Error (t, exn) -> `Error (t, exn)
-      | Ok (t, obj) -> `Ok (t, obj)
+      | Ok (t, objs) -> `Ok (t, objs)
     in
 
     loop t
 
-  let default source =
+  let default length backward =
     { i_off = 0
     ; i_pos = 0
     ; i_len = 0
-    ; source
+    ; read  = 0
+    ; length
+    ; backward
     ; source_length = 0
-    ; result_length = 0
+    ; target_length = 0
     ; hunks = []
     ; state = Header header }
 
@@ -1438,14 +1519,15 @@ struct
   type error += Invalid_kind of int
   type error += Inflate_error of Z.error
   type error += Hunk_error of H.error
+  type error += Hunk_input
   type error += Invalid_length of int * int
 
   let pp = Format.fprintf
   let pp_error fmt = function
-    | Invalid_byte byte -> pp fmt "(Invalid_byte %02x)" byte
-    | Reserved_kind byte -> pp fmt "(Reserved_byte %02x)" byte
-    | Invalid_kind byte -> pp fmt "(Invalid_kind %02x)" byte
-    | Inflate_error err -> pp fmt "(Inflate_error %a)" Z.pp_error err
+    | Invalid_byte byte              -> pp fmt "(Invalid_byte %02x)" byte
+    | Reserved_kind byte             -> pp fmt "(Reserved_byte %02x)" byte
+    | Invalid_kind byte              -> pp fmt "(Invalid_kind %02x)" byte
+    | Inflate_error err              -> pp fmt "(Inflate_error %a)" Z.pp_error err
     | Invalid_length (expected, has) -> pp fmt "(Invalid_length (%d <> %d))" expected has
 
   type ('i, 'o) t =
@@ -1457,30 +1539,33 @@ struct
     ; objects : Int32.t
     ; state   : ('i, 'o) state }
   and ('i, 'o) state =
-    | Header of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
-    | Object of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
-    | Length of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
-    | Unzip of { length : int; kind : kind; z : ('i, 'o) Z.t; }
-    | Hunks of { z : ('i, 'o) Z.t; h : 'i H.t; }
-    | Next of { length : int; count : int; kind : kind; }
+    | Header    of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
+    | Object    of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
+    | Length    of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
+    | Unzip     of { length : int; kind : 'i kind; z : ('i, 'o) Z.t; }
+    | Hunks     of { length : int; z : ('i, 'o) Z.t; h : 'i H.t; }
+    | Next      of { length : int; count : int; kind : 'i kind; }
     | Exception of error
   and ('i, 'o) res =
-    | Wait of ('i, 'o) t
+    | Wait  of ('i, 'o) t
     | Flush of ('i, 'o) t
     | Error of ('i, 'o) t * error
-    | Cont of ('i, 'o) t
-    | Ok of ('i, 'o) t
-  and kind =
+    | Cont  of ('i, 'o) t
+    | Ok    of ('i, 'o) t
+  and 'i kind =
     | Commit
     | Tree
     | Blob
     | Tag
+    | Hunk of 'i H.obj list
 
   let pp_kind fmt = function
     | Commit -> pp fmt "Commit"
     | Tree -> pp fmt "Tree"
     | Blob -> pp fmt "Blob"
     | Tag -> pp fmt "Tag"
+    | Hunk lst -> pp fmt "(Hunks [@[<hov>%a@]])"
+      (H.pp_lst ~sep:(fun fmt () -> pp fmt ";@ ") H.pp_obj) lst
 
   let pp fmt { i_off; i_pos; i_len; o_buf; version; objects; state; } =
     match state with
@@ -1557,23 +1642,36 @@ struct
         src t
     | false -> k len src t
 
-  let hunks src t z h =
+  let hunks src t length z h =
     match Z.eval src t.o_buf z with
     | `Await z ->
-      await { t with state = Hunks { z; h; } }
+      await { t with state = Hunks { length; z; h; }
+                   ; i_pos = t.i_pos + Z.used_in z }
     | `Error (z, exn) -> error t (Inflate_error exn)
     | `End z ->
-      if Z.used_out z <> 0
-      then match H.eval t.o_buf (H.refill 0 (Z.used_out z) h) with
-           | _ -> assert false
-      else assert false
+      let ret = if Z.used_out z <> 0
+                then H.eval t.o_buf (H.refill 0 (Z.used_out z) h)
+                else H.eval t.o_buf h
+      in
+      (match ret with
+       | `Ok (h, lst) ->
+         Cont { t with state = Next { length
+                                    ; count = Z.write z
+                                    ; kind = Hunk lst }
+                     ; i_pos = t.i_pos + Z.used_in z }
+       | `Await h -> error t Hunk_input
+       | `Error (h, exn) -> error t (Hunk_error exn))
     | `Flush z ->
       match H.eval t.o_buf (H.refill 0 (Z.used_out z) h) with
       | `Await h ->
-        Cont { t with state = Hunks { z = (Z.flush 0 (B.length t.o_buf) z)
+        Cont { t with state = Hunks { length
+                                    ; z = (Z.flush 0 (B.length t.o_buf) z)
                                     ; h } }
       | `Error (h, exn) -> error t (Hunk_error exn)
-      | `Ok h -> assert false
+      | `Ok (h, objs) ->
+        Cont { t with state = Hunks { length
+                                    ; z = (Z.flush 0 (B.length t.o_buf) z)
+                                    ; h } }
 
   let switch typ len src t =
     match typ with
@@ -1607,11 +1705,12 @@ struct
         (fun byte src t ->
            let msb = byte land 0x80 <> 0 in
            length msb (byte land 0x7F, 7)
-             (fun source src t ->
-               Cont { t with state = Hunks { z = Z.flush 0 (B.length t.o_buf)
+             (fun backward src t ->
+               Cont { t with state = Hunks { length = len
+                                           ; z = Z.flush 0 (B.length t.o_buf)
                                                  @@ Z.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                                  @@ Z.default
-                                           ; h = H.default source } })
+                                           ; h = H.default len backward } })
              src t)
         src t
     | _  -> error t (Invalid_kind typ)
@@ -1629,7 +1728,8 @@ struct
     | `Await z ->
       await { t with state = Unzip { length
                                    ; kind
-                                   ; z } }
+                                   ; z }
+                   ; i_pos = t.i_pos + Z.used_in z }
     | `Flush z ->
       flush { t with state = Unzip { length
                                    ; kind
@@ -1687,6 +1787,11 @@ struct
                   ; i_len = len
                   ; i_pos = 0
                   ; state = Unzip { length; kind; z = Z.refill off len z; } }
+         | Hunks { length; z; h; } ->
+           { t with i_off = off
+                  ; i_len = len
+                  ; i_pos = 0
+                  ; state = Hunks { length; z = Z.refill off len z; h; } }
          | _ -> { t with i_off = off
                        ; i_len = len
                        ; i_pos = 0 }
@@ -1720,8 +1825,8 @@ struct
       | Length k -> k src t
       | Unzip { length; kind; z; } ->
         unzip src t length kind  z
-      | Hunks { z; h; } ->
-        hunks src t z h
+      | Hunks { length; z; h; } ->
+        hunks src t length z h
       | Next { length; count; kind; } -> next src t length count kind
       | Exception exn -> error t exn
     in
