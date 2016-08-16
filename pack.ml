@@ -531,7 +531,7 @@ struct
     ; write : int
     ; state : ('i, 'o) state }
   and ('i, 'o) state =
-    | Header
+    | Header     of ('i B.t -> 'o B.t -> ('i, 'o) t -> ('i, 'o) res)
     | Last       of 'o Window.t
     | Block      of 'o Window.t
     | Flat       of ('i B.t -> 'o B.t -> ('i, 'o) t -> ('i, 'o) res)
@@ -584,11 +584,21 @@ struct
   let error t exn =
     Error ({ t with state = Exception exn }, exn)
 
+  module KHeader =
+  struct
+    let rec get_byte k src dst t =
+      if (t.i_len - t.i_pos) > 0
+      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+           k byte src dst
+             { t with i_pos = t.i_pos + 1 }
+      else Wait { t with state = Header (get_byte k) }
+  end
+
   (* Continuation passing-style stored in [Dictionary] *)
   module KDictionary =
   struct
     let rec get_byte k src dst t =
-      if t.i_len - t.i_pos > 0
+      if (t.i_len - t.i_pos) > 0
       then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
            k byte src dst
              { t with i_pos = t.i_pos + 1 }
@@ -634,7 +644,7 @@ struct
   module KFlat =
   struct
     let rec get_byte k src dst t =
-      if t.i_len - t.i_pos > 0
+      if (t.i_len - t.i_pos) > 0
       then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
            k byte src dst
              { t with i_pos = t.i_pos + 1 }
@@ -652,7 +662,7 @@ struct
     let rec get lookup k src dst t =
       if t.bits < lookup.Lookup.max
       then
-        if t.i_len - t.i_pos > 0
+        if (t.i_len - t.i_pos) > 0
         then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
         (get[@tailcall]) lookup k src dst
           { t with i_pos = t.i_pos + 1
@@ -732,7 +742,7 @@ struct
       let len = Array.get _extra_dbits distance in
 
       if t.bits < len
-      then if t.i_len - t.i_pos > 0
+      then if (t.i_len - t.i_pos) > 0
            then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
                 read_extra_dist
                   distance k
@@ -751,7 +761,7 @@ struct
       let len = Array.get _extra_lbits length in
 
       if t.bits < len
-      then if t.i_len - t.i_pos > 0
+      then if (t.i_len - t.i_pos) > 0
            then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
                 read_extra_length
                   length k
@@ -779,7 +789,7 @@ struct
       then let byte = t.hold land 255 in
            k byte src dst { t with hold = t.hold lsr 8
                                  ; bits = t.bits - 8 }
-      else if t.i_len - t.i_pos > 0
+      else if (t.i_len - t.i_pos) > 0
       then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
             k byte src dst
               { t with i_pos = t.i_pos + 1 }
@@ -1028,7 +1038,7 @@ struct
     let window = ref window in
 
     try
-      while t.i_len - !i_pos > 1 && t.o_len - !o_pos > 0
+      while (t.i_len - !i_pos) > 1 && t.o_len - !o_pos > 0
       do match !goto with
          | Length ->
            if !bits < lookup_chr.Lookup.max
@@ -1242,20 +1252,17 @@ struct
                      ; bits  = t.bits + 8 }
     else Wait t
 
-  let header src dst t =
-    if (t.i_len - t.i_pos) > 1
-    then let byte0 = Char.code @@ B.get src (t.i_off + t.i_pos) in
-         let _     = Char.code @@ B.get src (t.i_off + t.i_pos + 1) in
-
+  let header =
+    KHeader.get_byte
+    @@ fun byte0 -> KHeader.get_byte
+    @@ fun byte1 src dst t ->
          let window = Window.make_by ~proof:dst (1 lsl (byte0 lsr 4 + 8)) in
 
-         Cont { t with i_pos = t.i_pos + 2
-                     ; state = Last window }
-    else Wait t
+         Cont { t with state = Last window }
 
   let eval src dst t =
     let eval0 t = match t.state with
-      | Header -> header src dst t
+      | Header k -> k src dst t
       | Last window -> last src dst t window
       | Block window -> block src dst t window
       | Flat k -> k src dst t
@@ -1291,7 +1298,7 @@ struct
     ; o_pos = 0
     ; o_len = 0
     ; write = 0
-    ; state = Header }
+    ; state = Header header }
 
   let sp = Format.sprintf
 
@@ -1368,6 +1375,26 @@ struct
     | Copy (off, len) ->
       pp fmt "(Copy (%d, %d))" off len
 
+  let pp_error fmt = function
+    | Reserved_opcode byte -> pp fmt "(Reserved_opcode %02x)" byte
+    | Wrong_insert_hunk (off, len, source) ->
+      pp fmt "(Wrong_insert_hunk (off: %d, len: %d, source: %d))" off len source
+
+  let pp fmt { i_off; i_pos; i_len; read; length; backward;
+               source_length; target_length; hunks; state; } =
+    pp fmt "{@[<hov>i_off = %d;@ \
+                    i_pos = %d;@ \
+                    i_len = %d;@ \
+                    read = %d;@ \
+                    length = %d;@ \
+                    backward = %d;@ \
+                    source_length = %d;@ \
+                    target_length = %d;@ \
+                    hunks = [@[<hov>%a@]]@]}"
+      i_off i_pos i_len read length backward
+      source_length target_length
+      (pp_lst ~sep:(fun fmt () -> pp fmt ";@ ") pp_obj) hunks
+
   let await t      = Wait t
   let error t exn  = Error ({ t with state = Exception exn }, exn)
   let ok t         = Ok ({ t with state = End }, t.hunks)
@@ -1375,7 +1402,7 @@ struct
   module KHeader =
   struct
     let rec get_byte k src t =
-      if t.i_len - t.i_pos > 0
+      if (t.i_len - t.i_pos) > 0
       then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1
                              ; read = t.read + 1 }
@@ -1402,7 +1429,7 @@ struct
   module KList =
   struct
     let rec get_byte k src t =
-      if t.i_len > 0
+      if (t.i_len - t.i_pos) > 0
       then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1
                              ; read = t.read + 1 }
@@ -1413,7 +1440,7 @@ struct
     let rec get_byte flag k src t =
       if not flag
       then k 0 src t
-      else if t.i_len > 0
+      else if (t.i_len - t.i_pos) > 0
            then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
                 k byte src { t with i_pos = t.i_pos + 1
                                   ; read = t.read + 1 }
@@ -1504,11 +1531,13 @@ struct
   let refill off len t =
     if t.i_pos = t.i_len 
     then { t with i_off = off
-                ; i_len = len }
+                ; i_len = len
+                ; i_pos = 0 }
     else raise (Invalid_argument (sp "Hunks.refill: you lost something"))
 
   let available_in t = t.i_len
   let used_in t = t.i_pos
+  let read t = t.read
 end
 
 module Unpack =
@@ -1519,7 +1548,7 @@ struct
   type error += Invalid_kind of int
   type error += Inflate_error of Z.error
   type error += Hunk_error of H.error
-  type error += Hunk_input
+  type error += Hunk_input of int * int
   type error += Invalid_length of int * int
 
   let pp = Format.fprintf
@@ -1529,6 +1558,8 @@ struct
     | Invalid_kind byte              -> pp fmt "(Invalid_kind %02x)" byte
     | Inflate_error err              -> pp fmt "(Inflate_error %a)" Z.pp_error err
     | Invalid_length (expected, has) -> pp fmt "(Invalid_length (%d <> %d))" expected has
+    | Hunk_error err                 -> pp fmt "(Hunk_error %a)" H.pp_error err
+    | Hunk_input (expected, has)     -> pp fmt "(Hunk_input (%d <> %d))" expected has
 
   type ('i, 'o) t =
     { i_off   : int
@@ -1575,14 +1606,23 @@ struct
                       i_len = %d;@ \
                       version = %ld;@ \
                       objects = %ld;@ \
-                      z = %a;@]}"
+                      z = %a@]}"
         i_off i_pos i_len version objects Z.pp z
+    | Hunks { z; h; _ } ->
+      pp fmt "{@[<hov>i_off = %d;@ \
+                      i_pos = %d;@ \
+                      i_len = %d;@ \
+                      version = %ld;@ \
+                      objects = %ld;@ \
+                      z = %a;@ \
+                      h = %a@]}"
+        i_off i_pos i_len version objects Z.pp z H.pp h
     | _ ->
       pp fmt "{@[<hov>i_off = %d;@ \
                       i_pos = %d;@ \
                       i_len = %d;@ \
                       version = %ld;@ \
-                      objects = %ld;@]}"
+                      objects = %ld@]}"
         i_off i_pos i_len version objects
 
   let await t      = Wait t
@@ -1596,28 +1636,56 @@ struct
     let rec check_byte chr k src t =
       if (t.i_len - t.i_pos) > 0 && B.get src (t.i_off + t.i_pos) = chr
       then k src { t with i_pos = t.i_pos + 1 }
-      else if t.i_len = 0
+      else if (t.i_len - t.i_pos) = 0
       then await { t with state = Header ((check_byte[@tailcall]) chr k) }
       else error { t with i_pos = t.i_pos + 1 }
                  (Invalid_byte (Char.code @@ B.get src (t.i_off + t.i_pos)))
 
     let rec get_byte k src t =
-      if t.i_len > 0
+      if (t.i_len - t.i_pos) > 0
       then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
       else await { t with state = Header ((get_byte[@tailcall]) k) }
 
+    let swap n =
+      let (>>) = Int32.shift_right in
+      let (<<) = Int32.shift_left in
+      let (||) = Int32.logor in
+      let ( & ) = Int32.logand in
+
+      ((n >> 24) & 0xffl)
+      || ((n << 8) & 0xff0000l)
+      || ((n >> 8) & 0xff00l)
+      || ((n << 24) & 0xff000000l)
+
+    let to_int32 b0 b1 b2 b3 =
+      let (<<) = Int32.shift_left in
+      let (||) = Int32.logor in
+      (Int32.of_int b0 << 24)
+      || (Int32.of_int b1 << 16)
+      || (Int32.of_int b2 << 8)
+      || (Int32.of_int b3)
+
     let rec get_u32 k src t =
-      if t.i_len > 3
-      then k (B.get_u32 src (t.i_off + t.i_pos)) src
+      if (t.i_len - t.i_pos) > 3
+      then let num = B.get_u32 src (t.i_off + t.i_pos) in
+           k (swap num) src
              { t with i_pos = t.i_pos + 4 }
+      else if (t.i_len - t.i_pos) > 0
+      then (get_byte
+            @@ fun byte0 -> get_byte
+            @@ fun byte1 -> get_byte
+            @@ fun byte2 -> get_byte
+            @@ fun byte3 src t ->
+               k (to_int32 byte0 byte1 byte2 byte3) src t)
+            src t
       else await { t with state = Header ((get_u32[@tailcall]) k) }
   end
 
   module KLength =
   struct
     let rec get_byte k src t =
-      if t.i_len > 0
+      if (t.i_len - t.i_pos) > 0
       then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
       else await { t with state = Length ((get_byte[@tailcall]) k) }
@@ -1626,7 +1694,7 @@ struct
   module KObject =
   struct
     let rec get_byte k src t =
-      if t.i_len > 0
+      if (t.i_len - t.i_pos) > 0
       then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
       else await { t with state = Object ((get_byte[@tailcall]) k) }
@@ -1659,7 +1727,8 @@ struct
                                     ; count = Z.write z
                                     ; kind = Hunk lst }
                      ; i_pos = t.i_pos + Z.used_in z }
-       | `Await h -> error t Hunk_input
+       | `Await h ->
+         error t (Hunk_input (length, H.read h))
        | `Error (h, exn) -> error t (Hunk_error exn))
     | `Flush z ->
       match H.eval t.o_buf (H.refill 0 (Z.used_out z) h) with
@@ -1780,7 +1849,7 @@ struct
   let sp = Format.sprintf
 
   let refill off len t =
-    if t.i_len - t.i_pos = 0
+    if (t.i_len - t.i_pos) = 0
     then match t.state with
          | Unzip { length; kind; z; } ->
            { t with i_off = off
@@ -1915,8 +1984,8 @@ struct
             let pos' = pos + 1 in
             let c = to_char (String.get s pos) (String.get s pos') in
             let () = match c with
-              | '\t' | '\n' -> buf <= "."
-              | _ -> buf <= Printf.sprintf "%c" c
+              | '\033' .. '\126'  -> buf <= Printf.sprintf "%c" c
+              | _ -> buf <= "."
             in ();
             aux (j+1) (j+2)
           end
@@ -1937,24 +2006,26 @@ external bs_write : Unix.file_descr -> B.Bigstring.t -> int -> int -> int =
   "bigstring_write" [@@noalloc]
 
 let () =
-  let tmp     = B.Bigstring.create 4096 in
-  let buf     = Buffer.create 4096 in
+  let tmp     = B.Bigstring.create 2 in
+  let buf     = Buffer.create 2 in
+  let num     = ref 0 in
 
   let rec loop t =
     match Unpack.eval (B.from_bigstring tmp) t with
     | `Await t ->
-      let n = bs_read Unix.stdin tmp 0 4096 in
+      let n = bs_read Unix.stdin tmp 0 2 in
       loop (Unpack.refill 0 n t)
     | `Flush t ->
       let o, n = Unpack.output t in
       let () = match o with B.Bigstring v -> Buffer.add_substring buf (B.Bigstring.to_string v) 0 n in
       loop (Unpack.flush 0 n t)
     | `Object t ->
+      incr num;
+
       let kind = Unpack.kind t in
       Format.printf "%a:\n%a\n%!"
         Unpack.pp_kind kind
         Hex.hexdump (Hex.of_string_fast @@ Buffer.contents buf);
-
       let () = Buffer.clear buf in
       loop (Unpack.next_object t)
     | `End t -> ()
