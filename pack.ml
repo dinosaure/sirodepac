@@ -1458,7 +1458,7 @@ struct
     ; i_len  : int
     ; read   : int
     ; length   : int
-    ; backward : int
+    ; reference : reference
     ; source_length : int
     ; target_length : int
     ; hunks         : 'i obj list
@@ -1478,6 +1478,9 @@ struct
   and 'i obj =
     | Insert of 'i B.t
     | Copy of int * int
+  and reference =
+    | Offset of int
+    | Hash of string
 
   let pp = Format.fprintf
 
@@ -1499,18 +1502,22 @@ struct
     | Wrong_insert_hunk (off, len, source) ->
       pp fmt "(Wrong_insert_hunk (off: %d, len: %d, source: %d))" off len source
 
-  let pp fmt { i_off; i_pos; i_len; read; length; backward;
+  let pp_reference fmt = function
+    | Hash hash -> pp fmt "(Reference %s)" hash
+    | Offset off -> pp fmt "(Offset %d)" off
+
+  let pp fmt { i_off; i_pos; i_len; read; length; reference;
                source_length; target_length; hunks; state; } =
     pp fmt "{@[<hov>i_off = %d;@ \
                     i_pos = %d;@ \
                     i_len = %d;@ \
                     read = %d;@ \
                     length = %d;@ \
-                    backward = %d;@ \
+                    reference = %a;@ \
                     source_length = %d;@ \
                     target_length = %d;@ \
                     hunks = [@[<hov>%a@]]@]}"
-      i_off i_pos i_len read length backward
+      i_off i_pos i_len read length pp_reference reference
       source_length target_length
       (pp_lst ~sep:(fun fmt () -> pp fmt ";@ ") pp_obj) hunks
 
@@ -1633,13 +1640,13 @@ struct
 
     loop t
 
-  let default length backward =
+  let default length reference =
     { i_off = 0
     ; i_pos = 0
     ; i_len = 0
     ; read  = 0
     ; length
-    ; backward
+    ; reference
     ; source_length = 0
     ; target_length = 0
     ; hunks = []
@@ -1687,6 +1694,7 @@ struct
     ; o_buf   : 'o B.t
     ; version : Int32.t
     ; objects : Int32.t
+    ; counter : Int32.t
     ; state   : ('i, 'o) state }
   and ('i, 'o) state =
     | Header    of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
@@ -1695,13 +1703,15 @@ struct
     | Unzip     of { length : int; kind : 'i kind; z : ('i, 'o) Z.t; }
     | Hunks     of { length : int; z : ('i, 'o) Z.t; h : 'i H.t; }
     | Next      of { length : int; count : int; kind : 'i kind; }
+    | Checksum  of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
+    | End       of string
     | Exception of error
   and ('i, 'o) res =
     | Wait  of ('i, 'o) t
     | Flush of ('i, 'o) t
     | Error of ('i, 'o) t * error
     | Cont  of ('i, 'o) t
-    | Ok    of ('i, 'o) t
+    | Ok    of ('i, 'o) t * string
   and 'i kind =
     | Commit
     | Tree
@@ -1717,7 +1727,7 @@ struct
     | Hunk lst -> pp fmt "(Hunks [@[<hov>%a@]])"
       (H.pp_lst ~sep:(fun fmt () -> pp fmt ";@ ") H.pp_obj) lst
 
-  let pp fmt { i_off; i_pos; i_len; o_buf; version; objects; state; } =
+  let pp fmt { i_off; i_pos; i_len; o_buf; version; objects; counter; state; } =
     match state with
     | Unzip { z; _ } ->
       pp fmt "{@[<hov>i_off = %d;@ \
@@ -1725,30 +1735,33 @@ struct
                       i_len = %d;@ \
                       version = %ld;@ \
                       objects = %ld;@ \
+                      counter = %ld;@ \
                       z = %a@]}"
-        i_off i_pos i_len version objects Z.pp z
+        i_off i_pos i_len version objects counter Z.pp z
     | Hunks { z; h; _ } ->
       pp fmt "{@[<hov>i_off = %d;@ \
                       i_pos = %d;@ \
                       i_len = %d;@ \
                       version = %ld;@ \
                       objects = %ld;@ \
+                      counter = %ld;@ \
                       z = %a;@ \
                       h = %a@]}"
-        i_off i_pos i_len version objects Z.pp z H.pp h
+        i_off i_pos i_len version objects counter Z.pp z H.pp h
     | _ ->
       pp fmt "{@[<hov>i_off = %d;@ \
                       i_pos = %d;@ \
                       i_len = %d;@ \
                       version = %ld;@ \
-                      objects = %ld@]}"
-        i_off i_pos i_len version objects
+                      objects = %ld;@ \
+                      counter = %ld@]}"
+        i_off i_pos i_len version objects counter
 
   let await t      = Wait t
   let flush t      = Flush t
   let error t exn  = Error ({ t with state = Exception exn }, exn)
   let continue t   = Cont t
-  let rec ok src t = Ok { t with state = Header ok }
+  let ok t hash    = Ok ({ t with state = End hash }, hash)
 
   module KHeader =
   struct
@@ -1817,6 +1830,45 @@ struct
       then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
       else await { t with state = Object ((get_byte[@tailcall]) k) }
+
+    let get_hash k src t =
+      let buf = Buffer.create 20 in
+
+      let rec loop i src t =
+        if i = 20
+        then k (Buffer.contents buf) src t
+        else
+          get_byte (fun byte src t ->
+                     Buffer.add_char buf (Char.chr byte);
+                     (loop[@tailcall]) (i + 1) src t)
+            src t
+      in
+
+      loop 0 src t
+  end
+
+  module KChecksum =
+  struct
+    let rec get_byte k src t =
+      if (t.i_len - t.i_pos) > 0
+      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+           k byte src { t with i_pos = t.i_pos + 1 }
+      else await { t with state = Checksum ((get_byte[@tailcall]) k) }
+
+    let get_hash k src t =
+      let buf = Buffer.create 20 in
+
+      let rec loop i src t =
+        if i = 20
+        then k (Buffer.contents buf) src t
+        else
+          get_byte (fun byte src t ->
+                     Buffer.add_char buf (Char.chr byte);
+                     (loop[@tailcall]) (i + 1) src t)
+            src t
+      in
+
+      loop 0 src t
   end
 
   let rec length msb (len, bit) k src t = match msb with
@@ -1893,23 +1945,39 @@ struct
         (fun byte src t ->
            let msb = byte land 0x80 <> 0 in
            length msb (byte land 0x7F, 7)
-             (fun backward src t ->
+             (fun offset src t ->
                Cont { t with state = Hunks { length = len
                                            ; z = Z.flush 0 (B.length t.o_buf)
                                                  @@ Z.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                                  @@ Z.default
-                                           ; h = H.default len backward } })
+                                           ; h = H.default len (H.Offset offset) } })
              src t)
+        src t
+    | 0b111 ->
+      KObject.get_hash
+        (fun hash src t ->
+          Cont { t with state = Hunks { length = len
+                                      ; z = Z.flush 0 (B.length t.o_buf)
+                                            @@ Z.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                            @@ Z.default
+                                      ; h = H.default len (H.Hash hash) } })
         src t
     | _  -> error t (Invalid_kind typ)
 
-  let kind src t =
-    KObject.get_byte
-      (fun byte src t ->
-         let msb = byte land 0x80 <> 0 in
-         let typ = (byte land 0x70) lsr 4 in
-         length msb (byte land 0x0F, 4) (switch typ) src t)
+  let checksum src t =
+    KChecksum.get_hash
+      (fun hash src t -> ok t hash)
       src t
+
+  let kind src t =
+    if t.counter > 0l
+    then KObject.get_byte
+           (fun byte src t ->
+              let msb = byte land 0x80 <> 0 in
+              let typ = (byte land 0x70) lsr 4 in
+              length msb (byte land 0x0F, 4) (switch typ) src t)
+           src t
+    else Cont { t with state = Checksum checksum }
 
   let unzip src t length kind z =
     match Z.eval src t.o_buf z with
@@ -1940,6 +2008,7 @@ struct
     KHeader.get_u32
       (fun objects src t ->
          Cont { t with objects = objects
+                     ; counter = objects
                      ; state = Object kind })
       src t
 
@@ -1963,6 +2032,7 @@ struct
     ; o_buf   = B.from ~proof chunk
     ; version = 0l
     ; objects = 0l
+    ; counter = 0l
     ; state   = Header header }
 
   let sp = Format.sprintf
@@ -1997,9 +2067,11 @@ struct
 
   let next_object t = match t.state with
     | Next _ ->
-      if t.objects = 1l
-      then { t with state = Header ok }
-      else { t with state = Object kind }
+      if Int32.pred t.counter = 0l
+      then { t with state = Checksum checksum
+                  ; counter = Int32.pred t.counter }
+      else { t with state = Object kind
+                  ; counter = Int32.pred t.counter }
     | _ -> raise (Invalid_argument "next_object: bad state")
 
   let kind t = match t.state with
@@ -2016,6 +2088,8 @@ struct
       | Hunks { length; z; h; } ->
         hunks src t length z h
       | Next { length; count; kind; } -> next src t length count kind
+      | Checksum k -> k src t
+      | End hash -> ok t hash
       | Exception exn -> error t exn
     in
 
@@ -2025,7 +2099,7 @@ struct
       | Cont t -> loop t
       | Wait t -> `Await t
       | Flush t -> `Flush t
-      | Ok t -> `End t
+      | Ok (t, hash) -> `End (t, hash)
       | Error (t, exn) -> `Error (t, exn)
     in
 
@@ -2040,7 +2114,6 @@ external bs_write : Unix.file_descr -> B.Bigstring.t -> int -> int -> int =
 let () =
   let tmp     = B.Bigstring.create 16386 in
   let buf     = Buffer.create 16386 in
-  let num     = ref 0 in
 
   let rec loop t =
     match Unpack.eval (B.from_bigstring tmp) t with
@@ -2052,15 +2125,14 @@ let () =
       let () = match o with B.Bigstring v -> Buffer.add_substring buf (B.Bigstring.to_string v) 0 n in
       loop (Unpack.flush 0 n t)
     | `Object t ->
-      incr num;
-
       let kind = Unpack.kind t in
       Format.printf "%a:\n%a\n%!"
         Unpack.pp_kind kind
         Hex.hexdump (Hex.of_string_fast @@ Buffer.contents buf);
       let () = Buffer.clear buf in
       loop (Unpack.next_object t)
-    | `End t -> ()
+    | `End (t, hash) ->
+      Format.printf "End with hash: %S\n%!" hash
     | `Error (t, exn) -> Format.eprintf "%a\n%!" Unpack.pp_error exn
   in
 
