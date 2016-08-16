@@ -97,6 +97,97 @@ struct
   let pp : type a. Format.formatter -> a t -> unit = fun fmt -> function
     | Bytes v -> Format.fprintf fmt "%S" (Bytes.unsafe_to_string v)
     | Bigstring v -> Format.fprintf fmt "%S" (Bigstring.to_string v)
+
+  let to_string : type a. a t -> string = function
+    | Bytes v -> Bytes.unsafe_to_string v
+    | Bigstring v -> Bigstring.to_string v
+end
+
+(* from ocaml-hex *)
+module Hex =
+struct
+  let to_char x y =
+    let code c = match c with
+      | '0'..'9' -> Char.code c - 48 (* Char.code '0' *)
+      | 'A'..'F' -> Char.code c - 55 (* Char.code 'A' + 10 *)
+      | 'a'..'f' -> Char.code c - 87 (* Char.code 'a' + 10 *)
+      | _ -> raise (Invalid_argument (Format.sprintf "Hex.to_char: %d is an invalid char" (Char.code c)))
+    in
+    Char.chr (code x lsl 4 + code y)
+
+  let hexa = "0123456789abcdef"
+  and hexa1 =
+    "0000000000000000111111111111111122222222222222223333333333333333\
+     4444444444444444555555555555555566666666666666667777777777777777\
+     88888888888888889999999999999999aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb\
+     ccccccccccccccccddddddddddddddddeeeeeeeeeeeeeeeeffffffffffffffff"
+  and hexa2 =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+     0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+     0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+     0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+  let of_string_fast s =
+    let len = String.length s in
+    let buf = Bytes.create (len * 2) in
+    for i = 0 to len - 1 do
+      Bytes.unsafe_set buf (i * 2)
+        (String.unsafe_get hexa1 (Char.code (String.unsafe_get s i)));
+      Bytes.unsafe_set buf (succ (i * 2))
+        (String.unsafe_get hexa2 (Char.code (String.unsafe_get s i)));
+    done;
+    `Hex (Bytes.unsafe_to_string buf)
+
+  let hexdump_s ?(print_row_numbers=true) ?(print_chars=true) (`Hex s) =
+    let char_len = 16 in
+    let hex_len = char_len * 2 in
+    let buf = Buffer.create ((String.length s) * 4) in
+    let ( <= ) buf s = Buffer.add_string buf s in
+    let n = String.length s in
+    let rows = (n / hex_len) + (if n mod hex_len = 0 then 0 else 1) in
+    for row = 0 to rows-1 do
+      let last_row = row = rows-1 in
+      if print_row_numbers then
+        buf <= Printf.sprintf "%.8d: " row;
+      let row_len = if last_row then
+          (let rem = n mod hex_len in
+           if rem = 0 then hex_len else rem)
+        else hex_len in
+      for i = 0 to row_len-1 do
+        if i mod 4 = 0 && i <> 0 then buf <= Printf.sprintf " ";
+        let i = i + (row * hex_len) in
+        buf <= Printf.sprintf "%c" (String.get s i)
+      done;
+      if last_row then
+        let missed_chars = hex_len - row_len in
+        let pad = missed_chars in
+        (* Every four chars add spacing *)
+        let pad = pad + (missed_chars / 4) in
+        buf <= Printf.sprintf "%s" (String.make pad ' ')
+      else ();
+      if print_chars then begin
+        buf <= "  ";
+        let rec aux i j =
+          if i > row_len - 2 then ()
+          else begin
+            let pos = i + (row * hex_len) in
+            let pos' = pos + 1 in
+            let c = to_char (String.get s pos) (String.get s pos') in
+            let () = match c with
+              | '\033' .. '\126'  -> buf <= Printf.sprintf "%c" c
+              | _ -> buf <= "."
+            in ();
+            aux (j+1) (j+2)
+          end
+        in
+        aux 0 1;
+      end;
+      buf <= "\n";
+    done;
+    Buffer.contents buf
+
+  let hexdump fmt hex =
+    Format.fprintf fmt "%s" (hexdump_s hex)
 end
 
 module Z =
@@ -459,7 +550,7 @@ struct
   let pp = Format.fprintf
   let pp_error fmt = function
     | Invalid_kind_of_block -> pp fmt "Invalid_kind_of_block"
-    | Invalid_complement_of_length -> pp fmt "Invalid_complete_of_length"
+    | Invalid_complement_of_length -> pp fmt "Invalid_complement_of_length"
     | Invalid_dictionary -> pp fmt "Invalid_dictionary"
     | Invalid_crc -> pp fmt "Invalid_crc"
     | _ -> pp fmt "<error>"
@@ -581,6 +672,13 @@ struct
       last (bin_of_int hold) bits
       o_off o_pos o_len i_off i_pos i_len write
 
+  let pp_with_buf fmt (src, dst, t) =
+    Format.fprintf fmt
+      "src:\n%a\ndst:\n%a\nstate:\n%a\n%!"
+        Hex.hexdump (Hex.of_string_fast (B.to_string src))
+        Hex.hexdump (Hex.of_string_fast (B.to_string dst))
+        pp t
+
   let error t exn =
     Error ({ t with state = Exception exn }, exn)
 
@@ -648,6 +746,21 @@ struct
       then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
            k byte src dst
              { t with i_pos = t.i_pos + 1 }
+      else Wait { t with state = Flat (get_byte k) }
+
+    let drop_bits n k src dst t =
+      k src dst { t with hold = t.hold lsr n
+                       ; bits = t.bits - n }
+
+    let rec get_byte k src dst t =
+      if t.bits / 8 > 0
+      then let byte = t.hold land 255 in
+           k byte src dst { t with hold = t.hold lsr 8
+                                 ; bits = t.bits - 8 }
+      else if (t.i_len - t.i_pos) > 0
+      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+            k byte src dst
+              { t with i_pos = t.i_pos + 1 }
       else Wait { t with state = Flat (get_byte k) }
 
     let get_ui16 k =
@@ -980,6 +1093,9 @@ struct
     in
 
     let header window len nlen src dst t =
+      Format.printf "%a%!" pp_with_buf (src, dst, t);
+      Format.printf "%04x:%04x:%04x\n%!" len nlen (0xffff - len);
+
       if nlen <> 0xFFFF - len
       then Cont { t with state = Exception Invalid_complement_of_length }
       else Cont { t with hold  = 0
@@ -987,7 +1103,10 @@ struct
                        ; state = Flat (loop window len) }
     in
 
-    (KFlat.get_ui16
+    Format.printf "%a%!" pp_with_buf (src, dst, t);
+
+    (KFlat.drop_bits (t.bits mod 8)
+     @@ KFlat.get_ui16
      @@ fun len -> KFlat.get_ui16
      @@ fun nlen -> header window len nlen)
     src dst t
@@ -1913,107 +2032,20 @@ struct
     loop t
 end
 
-(* from ocaml-hex *)
-module Hex =
-struct
-  let to_char x y =
-    let code c = match c with
-      | '0'..'9' -> Char.code c - 48 (* Char.code '0' *)
-      | 'A'..'F' -> Char.code c - 55 (* Char.code 'A' + 10 *)
-      | 'a'..'f' -> Char.code c - 87 (* Char.code 'a' + 10 *)
-      | _ -> raise (Invalid_argument (Format.sprintf "Hex.to_char: %d is an invalid char" (Char.code c)))
-    in
-    Char.chr (code x lsl 4 + code y)
-
-  let hexa = "0123456789abcdef"
-  and hexa1 =
-    "0000000000000000111111111111111122222222222222223333333333333333\
-     4444444444444444555555555555555566666666666666667777777777777777\
-     88888888888888889999999999999999aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb\
-     ccccccccccccccccddddddddddddddddeeeeeeeeeeeeeeeeffffffffffffffff"
-  and hexa2 =
-    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
-     0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
-     0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
-     0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
-  let of_string_fast s =
-    let len = String.length s in
-    let buf = Bytes.create (len * 2) in
-    for i = 0 to len - 1 do
-      Bytes.unsafe_set buf (i * 2)
-        (String.unsafe_get hexa1 (Char.code (String.unsafe_get s i)));
-      Bytes.unsafe_set buf (succ (i * 2))
-        (String.unsafe_get hexa2 (Char.code (String.unsafe_get s i)));
-    done;
-    `Hex (Bytes.unsafe_to_string buf)
-
-  let hexdump_s ?(print_row_numbers=true) ?(print_chars=true) (`Hex s) =
-    let char_len = 16 in
-    let hex_len = char_len * 2 in
-    let buf = Buffer.create ((String.length s) * 4) in
-    let ( <= ) buf s = Buffer.add_string buf s in
-    let n = String.length s in
-    let rows = (n / hex_len) + (if n mod hex_len = 0 then 0 else 1) in
-    for row = 0 to rows-1 do
-      let last_row = row = rows-1 in
-      if print_row_numbers then
-        buf <= Printf.sprintf "%.8d: " row;
-      let row_len = if last_row then
-          (let rem = n mod hex_len in
-           if rem = 0 then hex_len else rem)
-        else hex_len in
-      for i = 0 to row_len-1 do
-        if i mod 4 = 0 && i <> 0 then buf <= Printf.sprintf " ";
-        let i = i + (row * hex_len) in
-        buf <= Printf.sprintf "%c" (String.get s i)
-      done;
-      if last_row then
-        let missed_chars = hex_len - row_len in
-        let pad = missed_chars in
-        (* Every four chars add spacing *)
-        let pad = pad + (missed_chars / 4) in
-        buf <= Printf.sprintf "%s" (String.make pad ' ')
-      else ();
-      if print_chars then begin
-        buf <= "  ";
-        let rec aux i j =
-          if i > row_len - 2 then ()
-          else begin
-            let pos = i + (row * hex_len) in
-            let pos' = pos + 1 in
-            let c = to_char (String.get s pos) (String.get s pos') in
-            let () = match c with
-              | '\033' .. '\126'  -> buf <= Printf.sprintf "%c" c
-              | _ -> buf <= "."
-            in ();
-            aux (j+1) (j+2)
-          end
-        in
-        aux 0 1;
-      end;
-      buf <= "\n";
-    done;
-    Buffer.contents buf
-
-  let hexdump fmt hex =
-    Format.fprintf fmt "%s" (hexdump_s hex)
-end
-
 external bs_read : Unix.file_descr -> B.Bigstring.t -> int -> int -> int =
   "bigstring_read" [@@noalloc]
 external bs_write : Unix.file_descr -> B.Bigstring.t -> int -> int -> int =
   "bigstring_write" [@@noalloc]
 
 let () =
-  let tmp     = B.Bigstring.create 2 in
-  let buf     = Buffer.create 2 in
+  let tmp     = B.Bigstring.create 16386 in
+  let buf     = Buffer.create 16386 in
   let num     = ref 0 in
 
   let rec loop t =
     match Unpack.eval (B.from_bigstring tmp) t with
     | `Await t ->
-      let n = bs_read Unix.stdin tmp 0 2 in
+      let n = bs_read Unix.stdin tmp 0 16386 in
       loop (Unpack.refill 0 n t)
     | `Flush t ->
       let o, n = Unpack.output t in
@@ -2032,4 +2064,4 @@ let () =
     | `Error (t, exn) -> Format.eprintf "%a\n%!" Unpack.pp_error exn
   in
 
-  loop (Unpack.default ~proof:(B.from_bigstring tmp) ~chunk:4096)
+  loop (Unpack.default ~proof:(B.from_bigstring tmp) ~chunk:16386)
