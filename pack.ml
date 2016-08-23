@@ -1,5 +1,12 @@
 let () = Printexc.record_backtrace true
 
+external swap32 : int32 -> int32 = "%bswap_int32"
+external swap64 : int64 -> int64 = "%bswap_int64"
+
+let pp_hash fmt s =
+  for i = 0 to String.length s - 1
+  do Format.fprintf fmt "%02x" (Char.code @@ String.get s i) done
+
 module T =
 struct
   type hash_compare =
@@ -1797,6 +1804,156 @@ struct
   let read t = t.read
 end
 
+module RAI =
+struct
+  type error = ..
+  type error += Invalid_header of string
+  type error += Invalid_version of Int32.t
+  type error += Invalid_index
+
+  let pp = Format.fprintf
+  let pp_error fmt = function
+    | Invalid_header header -> pp fmt "(Invalid_header %s)" header
+    | Invalid_version version -> pp fmt "(Invalid_version %ld)" version
+    | Invalid_index -> pp fmt "Invalid_index"
+
+  type 'a t =
+    { map : 'a B.t
+    ; fanout_offset : int
+    ; hashes_offset : int
+    ; crcs_offset   : int
+    ; values_offset : int
+    ; v64_offset    : int option
+    ; cache         : Int64.t LRU.t }
+
+  let has map off len =
+    if (off < 0 || len < 0 || off + len > B.length map)
+    then raise (Invalid_argument (Printf.sprintf "%d:%d:%d" off len (B.length
+    map)))
+    else true
+
+  let check_header map =
+    if has map 0 4
+    then (if B.get map 0 = '\255'
+          && B.get map 1 = '\116'
+          && B.get map 2 = '\079'
+          && B.get map 3 = '\099'
+          then Ok ()
+          else Error (Invalid_header (B.to_string @@ B.sub map 0 4)))
+    else Error Invalid_index
+
+  let check_version map =
+    if has map 4 4
+    then (if swap32 @@ B.get_u32 map 4 = 2l
+          then Ok ()
+          else Error (Invalid_version (swap32 @@ B.get_u32 map 4)))
+    else Error Invalid_index
+
+  let number_of_hashes map =
+    if has map 8 (256 * 4)
+    then let n = swap32 @@ B.get_u32 map (8 + (255 * 4)) in
+         Ok (8, n)
+    else Error Invalid_index
+
+  let bind v f = match v with Ok v -> f v | Error _ as e -> e
+  let ( >>= ) = bind
+  let ( *> ) u v = match u with Ok _ -> v | Error _ as e -> e
+
+  let make map =
+    check_header map
+    *> check_version map
+    *> number_of_hashes map
+    >>= fun (fanout_offset, number_of_hashes) ->
+      let number_of_hashes = Int32.to_int number_of_hashes in
+      let hashes_offset = 8 + (256 * 4) in
+      let crcs_offset   = 8 + (256 * 4) + (number_of_hashes * 20) in
+      let values_offset = 8 + (256 * 4) + (number_of_hashes * 20) + (number_of_hashes * 4) in
+
+      Ok { map
+         ; fanout_offset
+         ; hashes_offset
+         ; crcs_offset
+         ; values_offset
+         ; v64_offset = None
+         ; cache = LRU.make 1024 }
+
+  exception Break
+
+  let compare buf off hash =
+    try for i = 0 to 19
+        do if B.get buf (off + i) <> String.get hash i
+           then raise Break
+        done; true
+    with Break -> false
+
+  exception ReturnT
+  exception ReturnF
+
+  let lt buf off hash =
+    try for i = 0 to 19
+        do let a = Char.code @@ B.get buf (off + i) in
+           let b = Char.code @@ String.get hash i in
+
+           if a > b
+           then raise ReturnT
+           else if a <> b then raise ReturnF;
+        done; false
+    with ReturnT -> true
+       | ReturnF -> false
+
+  let binary_search buf hash =
+    let rec aux off len buf =
+      (*
+      Format.printf "binary search of %a:\n%!" pp_hash hash;
+      for i = 0 to (len / 20) - 1
+      do Format.printf "> %a\n%!" pp_hash (B.to_string @@ B.sub buf (off + i * 20) 20) done;
+      *)
+      if len = 20
+      then begin
+        (* Format.printf "hash: %a, buf: %a\n%!"
+          pp_hash hash pp_hash (B.to_string @@ B.sub buf off len); *)
+        (off / 20)
+      end else
+        let len' = ((len / 40) * 20) in
+        let off' = off + len' in
+
+        (* Format.printf "off: %d, off': %d, len': %d\n%!"
+          off off' len'; *)
+        if compare buf off' hash
+        then (off' / 20)
+        else if lt buf off' hash then aux off len' buf
+        else aux off' (len - len') buf
+    in
+
+    aux 0 (B.length buf) buf
+
+  let fanout_idx t hash =
+    let idx = Char.code @@ String.get hash 0 in
+    if has t.map (t.fanout_offset + (4 * idx)) 4
+    && has t.map (t.fanout_offset + (4 * (idx + 1))) 4
+    then let off1 = Int32.to_int @@ swap32 @@ B.get_u32 t.map (t.fanout_offset + (4 * idx)) in
+         let off0 =
+           if idx = 0 then 0
+           else Int32.to_int
+                @@ swap32
+                @@ B.get_u32 t.map (t.fanout_offset + (4 * (idx - 1))) in
+
+         if has t.map (t.hashes_offset + (off0 * 20)) ((off1 - off0) * 20)
+         then Ok (binary_search (B.sub t.map (t.hashes_offset + (off0 * 20)) ((off1 - off0) * 20)) hash + off0)
+         else Error Invalid_index
+    else Error Invalid_index
+
+  let find t hash =
+    match LRU.find t.cache hash with
+    | Some offset -> Some offset
+    | None ->
+      match fanout_idx t hash with
+      | Ok idx ->
+        let off = swap32 @@ B.get_u32 t.map (t.values_offset + (idx * 4)) in
+        Some (Int64.of_int32 off)
+      | Error _ -> None
+end
+
 module I =
 struct
   type error = ..
@@ -1817,7 +1974,7 @@ struct
     ; i_pos   : int
     ; i_len   : int
     ; fanout  : Int32.t array
-    ; hashs   : string Queue.t
+    ; hashes  : string Queue.t
     ; crcs    : Int32.t Queue.t
     ; offsets : (Int32.t * bool) Queue.t
     ; state   : 'i state }
@@ -1831,18 +1988,15 @@ struct
     | End
     | Exception of error
   and 'i res =
-    | Wait  of 'i t
-    | Error of 'i t * error
-    | Cont  of 'i t
-    | Ret   of 'i t * (string * Int32.t * Int64.t)
-    | Ok    of 'i t
+    | Wait   of 'i t
+    | Error  of 'i t * error
+    | Cont   of 'i t
+    | Result of 'i t * (string * Int32.t * Int64.t)
+    | Ok     of 'i t
 
   let await t     = Wait t
   let error t exn = Error ({ t with state = Exception exn }, exn)
   let ok t        = Ok { t with state = End }
-
-  external swap32 : int32 -> int32 = "%bswap_int32"
-  external swap64 : int64 -> int64 = "%bswap_int64"
 
   let to_int32 b0 b1 b2 b3 =
     let (<<) = Int32.shift_left in
@@ -2018,15 +2172,15 @@ struct
   end
 
   let rest ?boffsets src t =
-    match Queue.pop t.hashs, Queue.pop t.crcs, Queue.pop t.offsets with
-    | hash, crc, (offset, true) -> (Ret ({ t with state = Ret }, (hash, crc, Int64.of_int32 offset)) : 'i res)
+    match Queue.pop t.hashes, Queue.pop t.crcs, Queue.pop t.offsets with
+    | hash, crc, (offset, true) -> Result ({ t with state = Ret }, (hash, crc, Int64.of_int32 offset))
     | exception Queue.Empty -> ok t
     | hash, crc, (offset, false) -> match boffsets with
       | None -> error t (Expected_bigoffset_table)
       | Some arr ->
         let idx = Int32.to_int (Int32.logand offset 0x7FFFFFFFl) in
         if idx >= 0 && idx < Array.length arr
-        then Ret ({ t with state = Ret }, (hash, crc, Array.get arr idx))
+        then Result ({ t with state = Ret }, (hash, crc, Array.get arr idx))
         else error t (Invalid_index_of_bigoffset idx)
 
   let rec boffsets arr idx max src t =
@@ -2060,19 +2214,19 @@ struct
              (crcs[@tailcall]) (Int32.succ idx) max src t)
            src t
 
-  let rec hashs idx max src t =
+  let rec hashes idx max src t =
     if Int32.compare idx max >= 0
     then Cont { t with state = Crc (crcs 0l max) }
     else KHash.get_hash
            (fun hash src t ->
-              Queue.add hash t.hashs;
-              (hashs[@tailcall]) (Int32.succ idx) max src t)
+              Queue.add hash t.hashes;
+              (hashes[@tailcall]) (Int32.succ idx) max src t)
            src t
 
   let rec fanout idx src t =
     match idx with
     | 256 ->
-      Cont { t with state = Hash (hashs 0l (Array.fold_left max 0l t.fanout)) }
+      Cont { t with state = Hash (hashes 0l (Array.fold_left max 0l t.fanout)) }
     | n ->
       KFanoutTable.get_u32
         (fun entry src t ->
@@ -2095,7 +2249,7 @@ struct
     ; i_pos   = 0
     ; i_len   = 0
     ; fanout  = Array.make 256 0l
-    ; hashs   = Queue.create ()
+    ; hashes  = Queue.create ()
     ; crcs    = Queue.create ()
     ; offsets = Queue.create ()
     ; state   = Header header }
@@ -2126,7 +2280,7 @@ struct
       | Cont t -> loop t
       | Wait t -> `Await t
       | Ok t -> `End t
-      | Ret (t, hash) -> `Hash (t, hash)
+      | Result (t, hash) -> `Hash (t, hash)
       | Error (t, exn) -> `Error (t, exn)
     in
 
@@ -2579,10 +2733,6 @@ external bs_read : Unix.file_descr -> B.Bigstring.t -> int -> int -> int =
 external bs_write : Unix.file_descr -> B.Bigstring.t -> int -> int -> int =
   "bigstring_write" [@@noalloc]
 
-let pp_hash fmt s =
-  for i = 0 to String.length s - 1
-  do Format.fprintf fmt "%02x" (Char.code @@ String.get s i) done
-
 (* TODO: rename to idefix *)
 let unidx () =
   let tmp = B.Bigstring.create 16386 in
@@ -2629,4 +2779,16 @@ let unpack () =
 
 let () =
   let p = unidx () in
-  T.iter (fun hash offset -> Format.printf "> %a %Ld\n%!" pp_hash hash offset) p
+  let c = Unix.openfile Sys.argv.(1) [ Unix.O_RDONLY ] 0o644 in
+  let m = Bigarray.Array1.map_file c Bigarray.Char Bigarray.c_layout false (-1) in
+  match RAI.make (B.from_bigstring m) with
+  | Ok t ->
+    T.iter
+      (fun hash offset -> match RAI.find t hash with
+       | Some offset' when offset = offset' ->
+         Format.printf "ok with: %a (%Ld = %Ld)\n%!" pp_hash hash offset offset'
+       | Some offset' ->
+         Format.printf "error with: %a (%Ld <> %Ld)\n%!" pp_hash hash offset offset'
+       | None -> Format.eprintf "error with: %s\n%!" hash)
+      p
+  | Error exn -> Format.eprintf "%a\n%!" RAI.pp_error exn
