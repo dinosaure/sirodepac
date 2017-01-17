@@ -7,6 +7,17 @@ let pp_hash fmt s =
   for i = 0 to String.length s - 1
   do Format.fprintf fmt "%02x" (Char.code @@ String.get s i) done
 
+let sp = Format.sprintf
+
+let bin_of_int d =
+  if d < 0 then invalid_arg "bin_of_int" else
+  if d = 0 then "0" else
+  let rec aux acc d =
+    if d = 0 then acc else
+    aux (string_of_int (d land 1) :: acc) (d lsr 1)
+  in
+  String.concat "" (aux [] d)
+
 module T =
 struct
   type hash_compare =
@@ -159,6 +170,7 @@ struct
       do Bytes.set buf i (get v i) done;
       Bytes.unsafe_to_string buf
 
+    (** See [bs.c]. *)
     external blit : t -> int -> t -> int -> int -> unit = "bigstring_memcpy" [@@noalloc]
 
     let pp fmt ba =
@@ -177,6 +189,7 @@ struct
     external get_u32 : t -> int -> Int32.t = "%caml_string_get32u"
     external get_u64 : t -> int -> Int64.t = "%caml_string_get64u"
     external blit : t -> int -> t -> int -> int -> unit = "bytes_memcpy" [@@noalloc]
+    (** See [bs.c]. *)
 
     let pp fmt bs =
       for i = 0 to length bs - 1
@@ -184,6 +197,12 @@ struct
          | '\000' .. '\031' | '\127' -> Format.pp_print_char fmt '.'
          | chr -> Format.pp_print_char fmt chr
       done
+
+    let blit src src_off dst dst_off len =
+      if len < 0 || src_off < 0 || src_off > Bytes.length src - len
+                 || dst_off < 0 || dst_off > Bytes.length dst - len
+      then raise (Invalid_argument (sp "Bytes.blit (src: %d:%d, dst: %d:%d, len: %d)" src_off (Bytes.length src) dst_off (Bytes.length dst) len))
+      else blit src src_off dst dst_off len
   end
 
   type st = St
@@ -334,6 +353,7 @@ struct
     Format.fprintf fmt "%s" (hexdump_s hex)
 end
 
+(** This module implements Zlib (only Inflate). *)
 module Z =
 struct
   let _extra_lbits =
@@ -645,8 +665,9 @@ struct
       if extra > 0 then begin
         B.blit buf off t.buffer t.wpos pre;
         B.blit buf (off + pre) t.buffer 0 extra;
-      end else
+      end else begin
         B.blit buf off t.buffer t.wpos len;
+      end;
 
       move len t
 
@@ -790,14 +811,25 @@ struct
     | ExtDist   of int * int
     | Write     of int * int
 
-  let bin_of_int d =
-    if d < 0 then invalid_arg "bin_of_int" else
-    if d = 0 then "0" else
-    let rec aux acc d =
-      if d = 0 then acc else
-      aux (string_of_int (d land 1) :: acc) (d lsr 1)
-    in
-    String.concat "" (aux [] d)
+  let pp_code fmt = function
+    | Length         -> pp fmt "Length"
+    | ExtLength c    -> pp fmt "(ExtLength %d)" c
+    | Dist c         -> pp fmt "(Dist %d)" c
+    | ExtDist (a, b) -> pp fmt "(ExtDist (%d, %d))" a b
+    | Write (a, b)   -> pp fmt "(Write (%d, %d))" a b
+
+  let pp_state fmt = function
+    | Header k             -> pp fmt "Header"
+    | Last w               -> pp fmt "Last"
+    | Block w              -> pp fmt "Block"
+    | Flat k               -> pp fmt "Flat"
+    | Fixed w              -> pp fmt "Fixed"
+    | Dictionary k         -> pp fmt "Dictionary"
+    | Inffast (w, l, d, c) -> pp fmt "(Inffast %a)" pp_code c
+    | Inflate k            -> pp fmt "Inflate"
+    | Switch w             -> pp fmt "Switch"
+    | Crc w                -> pp fmt "Crc"
+    | Exception e          -> pp fmt "(Exception %a)" pp_error e
 
   let pp fmt { last; hold; bits
              ; o_off; o_pos; o_len
@@ -812,9 +844,11 @@ struct
                     i_off = %d;@ \
                     i_pos = %d;@ \
                     i_len = %d;@ \
-                    write = %d;@]}"
+                    write = %d;
+                    state = %a@]}"
       last (bin_of_int hold) bits
       o_off o_pos o_len i_off i_pos i_len write
+      pp_state state
 
   let error t exn =
     Error ({ t with state = Exception exn }, exn)
@@ -1503,13 +1537,14 @@ struct
                      ; bits  = t.bits + 8 }
     else Wait t
 
-  let header =
-    KHeader.get_byte
-    @@ fun byte0 -> KHeader.get_byte
-    @@ fun byte1 src dst t ->
-         let window = Window.make_by ~proof:dst (1 lsl (byte0 lsr 4 + 8)) in
+  let header src dst t =
+    (KHeader.get_byte
+     @@ fun byte0 -> KHeader.get_byte
+     @@ fun byte1 src dst t ->
+          let window = Window.make_by ~proof:dst (1 lsl (byte0 lsr 4 + 8)) in
 
-         Cont { t with state = Last window }
+          Cont { t with state = Last window })
+    src dst t
 
   let eval src dst t =
     let eval0 t = match t.state with
@@ -1551,8 +1586,6 @@ struct
     ; write = 0
     ; state = Header header }
 
-  let sp = Format.sprintf
-
   let refill off len t =
     if t.i_pos = t.i_len
     then { t with i_off = off
@@ -1578,6 +1611,7 @@ struct
     | _ -> None
 end
 
+(** This module deserialize a list of hunks (from a PACK file). *)
 module H =
 struct
   type error = ..
@@ -1693,7 +1727,7 @@ struct
         get_byte
           (fun byte src t ->
              let msb = byte land 0x80 <> 0 in
-             (length[@tailcall]) msb (len lor ((byte land 0x7F) lsl bit), bit + 7)
+             (length[@tailcall]) msb (((byte land 0x7F) lsl bit) lor len, bit + 7)
              k src t)
           src t
       | false -> k len src t
@@ -1738,7 +1772,12 @@ struct
     @@ fun l1 -> get_byte ((opcode lsr 6) land 1 <> 0)
     @@ fun l2 src t ->
       let dst = o0 lor (o1 lsl 8) lor (o2 lsl 16) lor (o3 lsl 24) in
-      let len = l0 lor (l1 lsl 8) lor (l2 lsl 16) in
+      let len =
+        let len0 = l0 lor (l1 lsl 8) lor (l2 lsl 16) in
+        if len0 = 0 then 0x10000 else len0
+        (* XXX: see git@07c92928f2b782330df6e78dd9d019e984d820a7
+           patch-delta.c:l. 50 *)
+      in
 
       if dst + len > t.source_length
       then error t (Wrong_insert_hunk (dst, len, t.source_length))
@@ -1768,13 +1807,14 @@ struct
                       ; read = t.read + n
                       ; state = Is_insert (buffer, off + n, rest - n) }
 
-  let header =
-    KHeader.length
-    @@ fun source_length -> KHeader.length
-    @@ fun target_length src t ->
-       Cont ({ t with state = List list
-                    ; source_length
-                    ; target_length })
+  let header src t =
+    (KHeader.length
+     @@ fun source_length -> KHeader.length
+     @@ fun target_length src t ->
+        Cont ({ t with state = List list
+                     ; source_length
+                     ; target_length }))
+    src t
 
   let eval src t =
     let eval0 t = match t.state with
@@ -1822,6 +1862,10 @@ struct
   let read t = t.read
 end
 
+(** This module  provides a  Random Access  Memory from  an IDX  file.  From any
+    hashes,  the function [find] get the offset  of the git object.  We keep the
+    IDX file with a ['a B.t] as long as you use [find].
+*)
 module RAI =
 struct
   type error = ..
@@ -1921,22 +1965,13 @@ struct
 
   let binary_search buf hash =
     let rec aux off len buf =
-      (*
-      Format.printf "binary search of %a:\n%!" pp_hash hash;
-      for i = 0 to (len / 20) - 1
-      do Format.printf "> %a\n%!" pp_hash (B.to_string @@ B.sub buf (off + i * 20) 20) done;
-      *)
       if len = 20
       then begin
-        (* Format.printf "hash: %a, buf: %a\n%!"
-          pp_hash hash pp_hash (B.to_string @@ B.sub buf off len); *)
         (off / 20)
       end else
         let len' = ((len / 40) * 20) in
         let off' = off + len' in
 
-        (* Format.printf "off: %d, off': %d, len': %d\n%!"
-          off off' len'; *)
         if compare buf off' hash
         then (off' / 20)
         else if lt buf off' hash then aux off len' buf
@@ -1972,6 +2007,10 @@ struct
       | Error _ -> None
 end
 
+(** This module deserialize an IDX file  and provides a binding between hash and
+    offset.  After,  you can  make  with  theses  bindings  a Patricia-tree (for
+    example) and close the IDX file.
+*)
 module I =
 struct
   type error = ..
@@ -2251,16 +2290,17 @@ struct
          Array.set t.fanout idx entry; (fanout[@tailcall]) (idx + 1) src t)
         src t
 
-  let header =
-    KHeader.check_byte '\255'
-    @@ KHeader.check_byte '\116'
-    @@ KHeader.check_byte '\079'
-    @@ KHeader.check_byte '\099'
-    @@ KHeader.get_u32
-    @@ fun version src t ->
-       if version = 2l
-       then Cont { t with state = Fanout (fanout 0) }
-       else error t (Invalid_version version)
+  let header src t =
+    (KHeader.check_byte '\255'
+     @@ KHeader.check_byte '\116'
+     @@ KHeader.check_byte '\079'
+     @@ KHeader.check_byte '\099'
+     @@ KHeader.get_u32
+     @@ fun version src t ->
+        if version = 2l
+        then Cont { t with state = Fanout (fanout 0) }
+        else error t (Invalid_version version))
+    src t
 
   let make () =
     { i_off   = 0
@@ -2305,6 +2345,7 @@ struct
     loop t
 end
 
+(** This module deserialize a PACK file. *)
 module P =
 struct
   type error = ..
@@ -2686,12 +2727,13 @@ struct
          number src { t with version = version })
       src t
 
-  let header =
-       KHeader.check_byte 'P'
-    @@ KHeader.check_byte 'A'
-    @@ KHeader.check_byte 'C'
-    @@ KHeader.check_byte 'K'
-    @@ version
+  let header src t =
+    (KHeader.check_byte 'P'
+     @@ KHeader.check_byte 'A'
+     @@ KHeader.check_byte 'C'
+     @@ KHeader.check_byte 'K'
+     @@ version)
+    src t
 
   let default ~proof ?(chunk = 4096) =
     { i_off   = 0
@@ -2706,10 +2748,17 @@ struct
     ; counter = 0l
     ; state   = Header header }
 
-  let from_hunks ~proof hunks offset =
+  let size_of_vl vl =
+    let rec loop acc = function
+      | 0 -> acc
+      | n -> loop (acc + 1) (n lsr 7)
+    in
+    loop 1 (vl lsr 4) (* avoid type and msb *)
+
+  let from_hunks (type a) ~(proof:a B.t) hunks offset =
     { i_off   = offset
     ; i_pos   = 0
-    ; i_len   = hunks.H.source_length
+    ; i_len   = 0
     ; local   = true
     ; o_z     = B.from ~proof hunks.H.target_length
     ; o_h     = B.from ~proof hunks.H.target_length
@@ -2801,14 +2850,17 @@ module D =
 struct
   type error = ..
   type error += Invalid_hash of string
-  type error += Invalid_chunk of int * int
+  type error += Invalid_source of int
+  type error += Invalid_target of (int * int)
   type error += Unpack_error of P.error
 
   let pp = Format.fprintf
 
   let pp_error fmt = function
     | Invalid_hash hash -> pp fmt "(Invalid_hash %a)" pp_hash hash
-    | Invalid_chunk (off, len) -> pp fmt "(Invalid_chunk (%d, %d))" off len
+    | Invalid_source off -> pp fmt "(Invalid_chunk %d)" off
+    | Invalid_target (has, expected) -> pp fmt "(Invalid_target (%d, %d))"
+      has expected
     | Unpack_error exn -> pp fmt "(Unpack_error %a)" P.pp_error exn
 
   type 'a t =
@@ -2818,137 +2870,147 @@ struct
   let delta { map_pck; fun_idx; } hunks offset =
     match hunks.H.reference with
     | H.Offset off ->
-      let offset = offset - off in
-      let length = hunks.H.source_length in
-      let t      = P.from_hunks ~proof:map_pck hunks offset in
-      let result = B.from ~proof:map_pck hunks.H.target_length in
+      let offset   = offset - off in
+      let length   = 4096 in
+      let t        = P.from_hunks ~proof:map_pck hunks offset in
+      let unpacked = B.from ~proof:map_pck hunks.H.source_length in
+      let res      = B.from ~proof:map_pck hunks.H.target_length in
 
-      let rec loop t result_offset =
+      let rec loop offset' result kind t =
         match P.eval map_pck t with
-        | `Await t -> Error (Invalid_chunk (offset, length))
+        | `Await t ->
+          let length = min (B.length map_pck - offset') length in
+          if length > 0
+          then loop (offset' + length) result kind (P.refill offset' length t)
+          else Error (Invalid_source offset)
         | `Flush t ->
           let o, n = P.output t in
-          B.blit o 0 result result_offset n;
-          loop (P.flush 0 n t) (result_offset + n)
+          B.blit o 0 unpacked result n;
+          loop offset' (result + n) kind (P.flush 0 n t)
         | `Object t ->
-          loop (P.next_object t) 0
-        | `End (t, hash) -> Ok ()
+          loop offset' result (Some (P.kind t, P.offset t)) (P.next_object t) (* XXX *)
         | `Error (t, exn) ->
-          Format.eprintf "%a\n%!" P.pp_error exn;
           Error (Unpack_error exn)
+        | `End (t, _) -> match kind with
+          | Some (kind, offset) -> Ok (kind, offset)
+          | None -> assert false
+          (** XXX: This is not possible, the [`End] state comes only after the
+           *  [`Object] state and this state changes [kind] to [Some x].
+           *)
       in
 
-      (match loop t 0 with
-       | Ok () ->
-         List.iter
-          (function
-           | H.Insert raw -> Format.printf "> Insert %S\n%!" (B.to_string raw)
-           | H.Copy (off, len) -> Format.printf "> Copy %S\n%!" (B.to_string @@ B.sub result off len))
-          hunks.H.hunks;
-         Ok ()
-       | Error exn -> Format.eprintf "%a\n%!" pp_error exn; Error exn)
+      (match loop offset 0 None t with
+       | Ok (kind, offset) ->
+         let target_length = List.fold_left
+          (fun acc -> function
+           | H.Insert raw ->
+             B.blit raw 0 res acc (B.length raw); acc + B.length raw
+           | H.Copy (off, len) ->
+             B.blit unpacked off res acc len; acc + len)
+          0 hunks.H.hunks
+         in
+
+         if (target_length = hunks.H.target_length)
+         then Ok (kind, res, offset)
+         else Error (Invalid_target (target_length, hunks.H.target_length))
+       | Error exn -> Error exn)
 
     | H.Hash hash -> match fun_idx hash with
-      | Some off -> Ok ()
+      | Some off -> assert false (* TODO *)
       | None -> Error (Invalid_hash hash)
 
-  let make map_pck fun_idx =
-    Ok { map_pck; fun_idx; }
+  let make map_pck fun_idx = { map_pck; fun_idx; }
 end
 
+(** See [bs.c]. *)
 external bs_read : Unix.file_descr -> B.Bigstring.t -> int -> int -> int =
   "bigstring_read" [@@noalloc]
 external bs_write : Unix.file_descr -> B.Bigstring.t -> int -> int -> int =
   "bigstring_write" [@@noalloc]
 
-let size = 4096
+(** Abstract [Unix.read] with ['a B.t]. *)
+let unix_read (type a) ch (tmp : a B.t) off len = match tmp with
+  | B.Bytes v -> Unix.read ch v off len
+  | B.Bigstring v -> bs_read ch v off len
 
-(* TODO: rename to idefix *)
-let unidx () =
-  let tmp = B.Bigstring.create size in
+(** Abstract [Buffer.add_substring] with ['a B.t]. *)
+let buffer_add_substring (type a) buf (tmp : a B.t) off len = match tmp with
+  | B.Bytes v -> Buffer.add_substring buf (Bytes.unsafe_to_string v) off len
+  | B.Bigstring v ->
+    let v = B.Bigstring.sub v off len in
+    Buffer.add_substring buf (B.Bigstring.to_string v) 0 len
 
-  let rec loop p t =
-    match I.eval (B.from_bigstring tmp) t with
+let unpack ?(chunk = 4096) map idx =
+  let buf = Buffer.create chunk in
+  let rap = D.make map idx in
+
+  let rec loop offset (t : ('a, 'a) P.t) =
+    match P.eval map t with
     | `Await t ->
-      let n = bs_read Unix.stdin tmp 0 size in
-      loop p (I.refill 0 n t)
-    | `Hash (t, (hash, crc, offset)) ->
-      loop (T.bind p hash offset) t
-    | `End t -> p
-    | `Error (t, exn) -> Format.eprintf "%a\n%!" I.pp_error exn; p
-  in
-
-  loop T.empty (I.make ())
-
-let unpack map idx =
-  let tmp     = B.Bigstring.create size in
-  let buf     = Buffer.create size in
-  let rap     = match D.make map idx with
-    | Ok rap -> rap
-    | Error exn ->
-      Format.eprintf "%a\n%!" D.pp_error exn;
-      assert false
-  in
-
-  let rec loop t =
-    match P.eval (B.from_bigstring tmp) t with
-    | `Await t ->
-      let n = bs_read Unix.stdin tmp 0 size in
-      loop (P.refill 0 n t)
+      let chunk = min (B.length map - offset) chunk in
+      if chunk > 0
+      then loop (offset + chunk) (P.refill offset chunk t)
+      else raise End_of_file
     | `Flush t ->
       let o, n = P.output t in
-      let () = match o with B.Bigstring v -> Buffer.add_substring buf (B.Bigstring.to_string v) 0 n in
-      loop (P.flush 0 n t)
-    | `End (t, hash) ->
-      Format.printf "End with hash: %S\n%!" hash
+      let () = buffer_add_substring buf o 0 n in
+      loop offset (P.flush 0 n t)
+    | `End (t, hash) -> ()
     | `Error (t, exn) ->
-      Format.eprintf "%a\n%!" P.pp_error exn;
+      Format.eprintf "Pack error: %a\n%!" P.pp_error exn;
       assert false
     | `Object t ->
       match P.kind t with
       | P.Hunk hunks ->
-        (match D.delta rap hunks (P.offset t) with
-         | Ok () -> loop (P.next_object t)
-         | Error exn ->
-           Format.eprintf "%a\n%!" D.pp_error exn;
-           assert false)
+        let rec undelta hunks offset' =
+          match D.delta rap hunks offset' with
+          | Ok (P.Hunk hunks, _, offset') ->
+            undelta hunks offset'
+          | Ok (kind, raw, offset') ->
+            Format.printf "%a\n%!" P.pp_kind kind;
+            Format.printf "%a\n%!" Hex.hexdump (Hex.of_string_fast (B.to_string raw));
+
+            loop offset (P.next_object t)
+          | Error exn ->
+            Format.printf "Delta error: %a\n%!" D.pp_error exn;
+            assert false
+        in
+
+        undelta hunks (P.offset t)
       | kind ->
         Format.printf "%a\n%!" P.pp_kind kind;
-        Buffer.clear buf;
-        loop (P.next_object t)
+        Format.printf "%a\n%!" Hex.hexdump (Hex.of_string_fast @@ Buffer.contents buf);
+        Buffer.clear buf; (* clean buffer *)
+
+        loop offset (P.next_object t)
   in
 
-  loop (P.default ~proof:(B.from_bigstring tmp) ~chunk:size)
+  loop 0 (P.default ~proof:map ~chunk:chunk)
+
+(** Bytes map. *)
+let st_map filename =
+  let i = open_in filename in
+  let n = in_channel_length i in
+  let m = Bytes.create n in
+  really_input i m 0 n;
+  B.from_bytes m
+
+(** Bigstring map. *)
+let bs_map filename =
+  let i = Unix.openfile filename [ Unix.O_RDONLY ] 0o644 in
+  let m = Bigarray.Array1.map_file i Bigarray.Char Bigarray.c_layout false (-1) in
+  B.from_bigstring m
 
 let () =
-  let cp = Unix.openfile Sys.argv.(1) [ Unix.O_RDONLY ] 0o644 in
-  let mp = Bigarray.Array1.map_file cp Bigarray.Char Bigarray.c_layout false (-1) in
-  let ci = Unix.openfile Sys.argv.(2) [ Unix.O_RDONLY ] 0o644 in
-  let mi = Bigarray.Array1.map_file ci Bigarray.Char Bigarray.c_layout false (-1) in
+  let pp = bs_map Sys.argv.(1) in
+  let ii = bs_map Sys.argv.(2) in
 
   let () =
-    match RAI.make (B.from_bigstring mi) with
+    match RAI.make ii with
     | Ok t ->
-      unpack (B.from_bigstring mp) (fun hash -> RAI.find t hash)
+      unpack pp (fun hash -> RAI.find t hash)
     | Error exn ->
       Format.eprintf "%a\n%!" RAI.pp_error exn
   in
 
   Format.printf "End of parsing\n%!"
-
-(*
-  let p = unidx () in
-  let c = Unix.openfile Sys.argv.(1) [ Unix.O_RDONLY ] 0o644 in
-  let m = Bigarray.Array1.map_file c Bigarray.Char Bigarray.c_layout false (-1) in
-  match RAI.make (B.from_bigstring m) with
-  | Ok t ->
-    T.iter
-      (fun hash offset -> match RAI.find t hash with
-       | Some offset' when offset = offset' ->
-         Format.printf "ok with: %a (%Ld = %Ld)\n%!" pp_hash hash offset offset'
-       | Some offset' ->
-         Format.printf "error with: %a (%Ld <> %Ld)\n%!" pp_hash hash offset offset'
-       | None -> Format.eprintf "error with: %s\n%!" hash)
-      p
-  | Error exn -> Format.eprintf "%a\n%!" RAI.pp_error exn
-*)
