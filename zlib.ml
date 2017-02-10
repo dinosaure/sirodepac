@@ -1101,7 +1101,7 @@ sig
   val pp              : Format.formatter -> ('i, 'o) t -> unit
 
   val get_frequencies : ('i, 'o) t -> F.t
-  val set_frequencies : F.t -> ('i, 'o) t -> ('i, 'o) t
+  val set_frequencies : ?paranoid:bool -> F.t -> ('i, 'o) t -> ('i, 'o) t
 
   val finish          : ('i, 'o) t -> ('i, 'o) t
   val no_flush        : int -> int -> ('i, 'o) t -> ('i, 'o) t
@@ -1767,12 +1767,29 @@ struct
     | MakeBlock (Static { frequencies; _ }) -> frequencies
     | _ -> raise (Invalid_argument "Z.frequencies: bad state")
 
-  let set_frequencies (lit, dst) t =
+  let set_frequencies ?(paranoid = false) (lit, dst) t =
+    let check =
+      Seq.iter
+        (function Hunk.Literal chr ->
+                    if lit.(Char.code chr) > 0
+                    then ()
+                    else raise (Invalid_argument "Z.set_frequencies: invalid frequencies")
+                | Hunk.Match (len, dist) ->
+                    if lit.(Table._length.(len) + 256 + 1) > 0
+                       && dst.(Table._distance dist) > 0
+                    then ()
+                    else raise (Invalid_argument "Z.set_frequencies: invalid frequencies"))
+    in
+
     if lit.(256) > 0
     then match t.state with
          | MakeBlock (Dynamic x) ->
+           if paranoid then check x.deflate;
+
            { t with state = MakeBlock (Dynamic { x with frequencies = (lit, dst) }) }
          | MakeBlock (Static x) ->
+           if paranoid then check x.deflate;
+
            { t with state = MakeBlock (Static { x with frequencies = (lit, dst) }) }
          | _ -> raise (Invalid_argument "Z.set_frequencies: bad state")
     else raise (Invalid_argument "Z.set_frequencies: invalid frequencies")
