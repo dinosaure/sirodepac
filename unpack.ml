@@ -143,7 +143,7 @@ end
 
 module B = Zlib.B
 
-(** This module deserialize a list of hunks (from a PACK file). *)
+(** Implementation of deserialization of a list of hunks (from a PACK file) *)
 module H =
 struct
   type error = ..
@@ -155,11 +155,11 @@ struct
     ; i_pos         : int
     ; i_len         : int
     ; read          : int
-    ; length        : int
-    ; reference     : reference
-    ; source_length : int
-    ; target_length : int
-    ; hunks         : 'i hunk list
+    ; _length        : int
+    ; _reference     : reference
+    ; _source_length : int
+    ; _target_length : int
+    ; _hunks         : 'i hunk list
     ; state         : 'i state }
   and 'i state =
     | Header    of ('i B.t -> 'i t -> 'i res)
@@ -220,8 +220,8 @@ struct
       (pp_lst ~sep:(fun fmt () -> pp fmt ";@ ") pp_obj) hunks
       length source_length target_length
 
-  let pp fmt { i_off; i_pos; i_len; read; length; reference;
-               source_length; target_length; hunks; state; } =
+  let pp fmt { i_off; i_pos; i_len; read; _length; _reference;
+               _source_length; _target_length; _hunks; state; } =
     pp fmt "{@[<hov>i_off = %d;@ \
                     i_pos = %d;@ \
                     i_len = %d;@ \
@@ -231,18 +231,18 @@ struct
                     source_length = %d;@ \
                     target_length = %d;@ \
                     hunks = [@[<hov>%a@]]@]}"
-      i_off i_pos i_len read length pp_reference reference
-      source_length target_length
-      (pp_lst ~sep:(fun fmt () -> pp fmt ";@ ") pp_obj) hunks
+      i_off i_pos i_len read _length pp_reference _reference
+      _source_length _target_length
+      (pp_lst ~sep:(fun fmt () -> pp fmt ";@ ") pp_obj) _hunks
 
   let await t     = Wait t
   let error t exn = Error ({ t with state = Exception exn }, exn)
   let ok t        = Ok ({ t with state = End },
-                          { reference     = t.reference
-                          ; hunks         = t.hunks
-                          ; length        = t.length
-                          ; source_length = t.source_length
-                          ; target_length = t.target_length })
+                          { reference     = t._reference
+                          ; hunks         = t._hunks
+                          ; length        = t._length
+                          ; source_length = t._source_length
+                          ; target_length = t._target_length })
 
   module KHeader =
   struct
@@ -311,13 +311,13 @@ struct
            patch-delta.c:l. 50 *)
       in
 
-      if dst + len > t.source_length
-      then error t (Wrong_insert_hunk (dst, len, t.source_length))
-      else Cont { t with hunks = (Copy (dst, len)) :: t.hunks
+      if dst + len > t._source_length
+      then error t (Wrong_insert_hunk (dst, len, t._source_length))
+      else Cont { t with _hunks = (Copy (dst, len)) :: t._hunks
                        ; state = List list }
 
   and list src t =
-    if t.read < t.length
+    if t.read < t._length
     then KList.get_byte
            (fun opcode src t ->
              if opcode = 0 then error t (Reserved_opcode opcode)
@@ -325,13 +325,13 @@ struct
              | 0 -> Cont { t with state = Is_insert (B.from ~proof:src opcode, 0, opcode) }
              | _ -> Cont { t with state = Is_copy (copy opcode) })
            src t
-    else ok { t with hunks = List.rev t.hunks }
+    else ok { t with _hunks = List.rev t._hunks }
 
   let insert src t buffer (off, rest) =
     let n = min (t.i_len - t.i_pos) rest in
     B.blit src (t.i_off + t.i_pos) buffer off n;
     if rest - n = 0
-    then Cont ({ t with hunks = (Insert buffer) :: t.hunks
+    then Cont ({ t with _hunks = (Insert buffer) :: t._hunks
                       ; i_pos = t.i_pos + n
                       ; read = t.read + n
                       ; state = List list })
@@ -341,11 +341,11 @@ struct
 
   let header src t =
     (KHeader.length
-     @@ fun source_length -> KHeader.length
-     @@ fun target_length src t ->
+     @@ fun _source_length -> KHeader.length
+     @@ fun _target_length src t ->
         Cont ({ t with state = List list
-                     ; source_length
-                     ; target_length }))
+                     ; _source_length
+                     ; _target_length }))
     src t
 
   let eval src t =
@@ -368,16 +368,16 @@ struct
 
     loop t
 
-  let default length reference =
+  let default _length _reference =
     { i_off = 0
     ; i_pos = 0
     ; i_len = 0
     ; read  = 0
-    ; length
-    ; reference
-    ; source_length = 0
-    ; target_length = 0
-    ; hunks = []
+    ; _length
+    ; _reference
+    ; _source_length = 0
+    ; _target_length = 0
+    ; _hunks = []
     ; state = Header header }
 
   let sp = Format.sprintf
@@ -539,9 +539,11 @@ struct
       | Error _ -> None
 end
 
-(** This module deserialize an IDX file  and provides a binding between hash and
-    offset.  After,  you can  make  with  theses  bindings  a Patricia-tree (for
-    example) and close the IDX file.
+(** Implementation of deserialization of an IDX file
+
+    Provides a binding between hash and offset. You can use theses bindings as a
+    Patricia-tree (see {module T}) and close (and free) the IDX file. Otherwise,
+    you need to keep the IDX file.
 *)
 module I =
 struct
@@ -877,7 +879,7 @@ struct
     loop t
 end
 
-(** This module deserialize a PACK file. *)
+(** Implementatioon of deserialization of a PACK file *)
 module P =
 struct
   type error = ..
@@ -1267,7 +1269,7 @@ struct
      @@ version)
     src t
 
-  let default ~proof ?(chunk = 4096) =
+  let default ~proof ?(chunk = 4096) () =
     { i_off   = 0
     ; i_pos   = 0
     ; i_len   = 0
@@ -1517,7 +1519,7 @@ let unpack ?(chunk = 4096) map idx =
         loop offset (P.next_object t)
   in
 
-  loop 0 (P.default ~proof:map ~chunk:chunk)
+  loop 0 (P.default ~proof:map ~chunk:chunk ())
 
 (** Bytes map. *)
 let st_map filename =

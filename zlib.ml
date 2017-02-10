@@ -242,7 +242,7 @@ struct
   let proof     = fun x -> x
 end
 
-(* (imperative) Heap implementation *)
+(** (imperative) Heap implementation *)
 module Heap =
 struct
   type t =
@@ -528,7 +528,19 @@ struct
     codes
 end
 
-(* non-blocking and functionnal implementation of Lz77 *)
+(** definition of [Hunk] *)
+module Hunk =
+struct
+  type t =
+    | Match   of (int * int)
+    | Literal of char
+
+  let pp fmt = function
+    | Match (len, dist) -> Format.fprintf fmt "Match (%d + 3, %d + 1)" len dist
+    | Literal chr -> Format.fprintf fmt "Literal %s" (to_chr_or_hex @@ Char.code chr)
+end
+
+(** non-blocking and functionnal implementation of Lz77 *)
 module L =
 struct
   type error = ..
@@ -540,67 +552,6 @@ struct
   exception Match   of int * int
   exception Literal of char
   exception Break
-
-  module Hunk =
-  struct
-    type t =
-      | Match   of (int * int)
-      | Literal of char
-
-    let pp fmt = function
-      | Match (len, dist) -> Format.fprintf fmt "Match (%d + 3, %d + 1)" len dist
-      | Literal chr -> Format.fprintf fmt "Literal %s" (to_chr_or_hex @@ Char.code chr)
-
-    let size lst =
-      List.fold_left
-        (fun acc -> function Match (len, _) -> acc + len + 3
-                           | Literal _ -> acc + 1)
-        0 lst
-
-    let flat_of_seq ~proof seq =
-      let size = Seq.fold (fun acc -> function Match (len, _) -> acc + len + 3
-                                             | Literal _ -> acc + 1)
-                          0 seq
-      in
-
-      let map = B.from ~proof size in
-
-      let rec aux idx queue = match Q.take_front_exn queue with
-        | (Match (len, dist), tl) ->
-          for i = 0 to len + 3
-          do let chr = B.get map (idx - (dist + 1) + i) in
-             B.set map (idx + i) chr done;
-
-          aux (idx + len + 3) tl
-        | (Literal chr, tl) ->
-          B.set map idx chr;
-
-          aux (idx + 1) tl
-        | exception Q.Empty -> ()
-      in
-
-      aux 0 (Q.of_seq seq); map
-
-    let flat ~proof lst =
-      let map = B.from ~proof (size lst) in
-
-      let rec aux idx = function
-        | Match (len, dist) ->
-          for i = 0 to len + 3
-          do let chr = B.get map (idx - (dist + 1) + i) in
-             B.set map (idx + i) chr done;
-
-          (idx + len + 3)
-        | Literal chr ->
-          B.set map idx chr;
-
-          (idx + 1)
-      in
-
-      let m = List.fold_left aux 0 lst in
-      assert (m = B.length map);
-      map
-  end
 
   type 'i t =
     { i_off      : int
@@ -742,7 +693,7 @@ struct
 
     Seq.of_queue results
 
-  let _hlog= [| 11; 11; 11; 12; 13; 13; 13; 13; 13 |]
+  let _hlog = [| 11; 11; 11; 12; 13; 13; 13; 13; 13 |]
 
   let _max_distance    = 8191
   let _max_length      = 256
@@ -1217,7 +1168,7 @@ struct
     | Header        of ((S.read, 'i) S.t -> (S.write, 'o) S.t -> ('i, 'o) t -> ('i, 'o) res)
     | MakeBlock     of ('i, 'o) block
     | WriteBlock    of ((S.read, 'i) S.t -> (S.write, 'o) S.t -> ('i, 'o) t -> ('i, 'o) res)
-    | FastBlock     of (int * int) array * (int * int) array * L.Hunk.t Q.t * code * flush
+    | FastBlock     of (int * int) array * (int * int) array * Hunk.t Q.t * code * flush
     | AlignBlock    of F.t option * bool
     | FixedBlock    of F.t
     | DynamicHeader of ((S.read, 'i) S.t -> (S.write, 'o) S.t -> ('i, 'o) t -> ('i, 'o) res)
@@ -1234,10 +1185,10 @@ struct
   and ('i, 'o) block =
     | Static  of { lz : 'i L.t
                  ; frequencies : F.t
-                 ; deflate : L.Hunk.t Seq.t }
+                 ; deflate : Hunk.t Seq.t }
     | Dynamic of { lz : 'i L.t
                  ; frequencies : F.t
-                 ; deflate : L.Hunk.t Seq.t }
+                 ; deflate : Hunk.t Seq.t }
     | Flat    of { tmp : ([ S.read | S.write ], 'o) S.t
                  ; idx : int
                  ; max : int }
@@ -1531,9 +1482,9 @@ struct
         | None -> F.make ()
       in
       let on = function
-        | L.Hunk.Literal chr ->
+        | Hunk.Literal chr ->
           F.add_literal frequencies chr
-        | L.Hunk.Match (len, dist) ->
+        | Hunk.Match (len, dist) ->
           F.add_distance frequencies (len, dist)
       in
       match n with
@@ -1571,11 +1522,11 @@ struct
 
   let rec write_block ltree dtree queue flush src dst t =
     match Q.take_front_exn queue with
-    | L.Hunk.Literal chr, tl ->
+    | Hunk.Literal chr, tl ->
       (KWriteBlock.put_bits ltree.(Char.code chr)
        @@ fun src dst t -> Cont { t with state = FastBlock (ltree, dtree, tl, Length, flush) })
       src dst t
-    | L.Hunk.Match (len, dist), tl ->
+    | Hunk.Match (len, dist), tl ->
       (KWriteBlock.put_bits ltree.(Table._length.(len) + 256 + 1)
        @@ KWriteBlock.put_bits (len - Table._base_length.(Table._length.(len)),
                                 Table._extra_lbits.(Table._length.(len)))
@@ -1591,10 +1542,10 @@ struct
 
   let static frequencies queue flush src dst t =
     let flush = flush frequencies in
-    (KWriteBlock.put_bit false (** XXX: when the user expect a final block, zlib
-                                        put an empty block to align the output
-                                        in byte - this last block has the final
-                                        flag.
+    (KWriteBlock.put_bit false (* XXX: when the user expect a final block, zlib
+                                       put an empty block to align the output
+                                       in byte - this last block has the final
+                                       flag.
                                 *)
      @@ KWriteBlock.put_bits (1, 2)
      @@ fun src dst t -> Cont { t with state = FastBlock (Table._static_ltree, Table._static_dtree, queue, Length, flush) })
@@ -1628,10 +1579,10 @@ struct
     let hclen           = !hclen in
     let flush           = flush frequencies in
 
-    (KWriteBlock.put_bit false (** XXX: when the user expect a final block,
-                                        zlib put an empty block to align the
-                                        output in byte - this last block has the
-                                        final flag.
+    (KWriteBlock.put_bit false (* XXX: when the user expect a final block,
+                                       zlib put an empty block to align the
+                                       output in byte - this last block has the
+                                       final flag.
                                 *)
      @@ KWriteBlock.put_bits (2, 2)
      @@ KWriteBlock.put_bits (hlit - 257, 5)
@@ -1663,7 +1614,7 @@ struct
        | `Await (lz, seq) ->
 
          (* XXX: paranoid mode
-            assert ((B.to_string @@ (L.Hunk.flat ~proof:(S.proof src) (Seq.to_list seq))) = (S.to_string @@ S.sub src lz.L.i_off lz.L.i_pos)); *)
+            assert ((B.to_string @@ (Hunk.flat ~proof:(S.proof src) (Seq.to_list seq))) = (S.to_string @@ S.sub src lz.L.i_off lz.L.i_pos)); *)
 
          await { t with state = MakeBlock
                           (Dynamic { lz
@@ -1717,18 +1668,18 @@ struct
     do let (hd, tl) = Q.take_front_exn !q in
 
        let (code, len), new_goto, new_q = match !goto, hd with
-         | Length, L.Hunk.Literal chr ->
+         | Length, Hunk.Literal chr ->
            ltree.(Char.code chr), Length, tl
-         | Length, L.Hunk.Match (len, dist) ->
+         | Length, Hunk.Match (len, dist) ->
            ltree.(Table._length.(len) + 256 + 1), ExtLength, !q
-         | ExtLength, L.Hunk.Match (len, dist) ->
+         | ExtLength, Hunk.Match (len, dist) ->
            let code = Table._length.(len) in
            (len - Table._base_length.(code),
             Table._extra_lbits.(code)),
            Dist, !q
-         | Dist, L.Hunk.Match (len, dist) ->
+         | Dist, Hunk.Match (len, dist) ->
            dtree.(Table._distance dist), ExtDist, !q
-         | ExtDist, L.Hunk.Match (len, dist) ->
+         | ExtDist, Hunk.Match (len, dist) ->
            let code = Table._distance dist in
            (dist - Table._base_dist.(code),
             Table._extra_dbits.(code)),
@@ -1758,7 +1709,7 @@ struct
      let state = match Q.take_front_exn !q, !goto with
        | _, Length ->
          WriteBlock (write_block ltree dtree !q flush)
-       | (L.Hunk.Match (len, dist), tl), ExtLength ->
+       | (Hunk.Match (len, dist), tl), ExtLength ->
          let fn =
            KWriteBlock.put_bits (len - Table._base_length.(Table._length.(len)),
                                  Table._extra_lbits.(Table._length.(len)))
@@ -1769,7 +1720,7 @@ struct
          in
 
          WriteBlock fn
-       | (L.Hunk.Match (len, dist), tl), Dist ->
+       | (Hunk.Match (len, dist), tl), Dist ->
          let fn =
            KWriteBlock.put_bits dtree.(Table._distance dist)
            @@ KWriteBlock.put_bits (dist - Table._base_dist.(Table._distance dist),
@@ -1778,7 +1729,7 @@ struct
          in
 
          WriteBlock fn
-       | (L.Hunk.Match (len, dist), tl), ExtDist ->
+       | (Hunk.Match (len, dist), tl), ExtDist ->
          let fn =
            KWriteBlock.put_bits (dist - Table._base_dist.(Table._distance dist),
                                     Table._extra_dbits.(Table._distance dist))
@@ -1908,8 +1859,8 @@ struct
   let header wbits mode src dst t =
     let header = (8 + ((wbits - 8) lsl 4)) lsl 8 in
     let header = header lor (0x4 lsl 5) in
-      (** XXX: FDICT = 0 and FLEVEL = 2,
-        *      we use a default algorithm. *)
+      (* XXX: FDICT = 0 and FLEVEL = 2,
+              we use a default algorithm. *)
     let header = header + (31 - (header mod 31)) in
 
     (KHeader.put_byte (header lsr 8)
@@ -1918,9 +1869,8 @@ struct
         Cont { t with hold = 0
                     ; bits = 0
                     ; state = MakeBlock mode })
-                    (** XXX: not necessary to update [hold] and [bits] but to
-                     *       be clear.
-                     *)
+                    (* XXX: not necessary to update [hold] and [bits] but to
+                            be clear. *)
     src dst t
 
   let eval src dst t =
@@ -1972,6 +1922,7 @@ struct
     ; state = Header (header wbits (block_of_level ~proof ~wbits level))}
 end
 
+(** non-blocking and functionnal implementation of Inflate *)
 module type INFLATE =
 sig
   type error = ..
@@ -3171,29 +3122,3 @@ let rec inflate_to_result src dst refiller flusher t =
     else let n = flusher dst (Inflate.used_out t) in
          Ok (Inflate.flush 0 n t)
   | `Error (t, exn) -> Error exn
-
-(*
-
-let chunk = 0xFFF
-
-let () =
-  let src = B.from_bigstring @@ B.Bigstring.create chunk in
-  let dst = B.from_bigstring @@ B.Bigstring.create chunk in
-
-  if Array.length Sys.argv = 1
-  then let r = deflate_to_result src dst
-         (fun _ -> unix_read Unix.stdin src 0 chunk)
-         (fun _ len -> Format.printf "%a%!" B.tpp (B.sub dst 0 len); chunk)
-         (Deflate.default ~proof:dst ~wbits:15 4)
-       in match r with
-         | Ok t -> ()
-         | Error exn -> Format.eprintf "%a\n%!" Deflate.pp_error exn
-  else let r = inflate_to_result src dst
-         (fun _ -> unix_read Unix.stdin src 0 chunk)
-         (fun _ len -> Format.printf "%a%!" B.tpp (B.sub dst 0 len); chunk)
-         Inflate.default
-       in match r with
-         | Ok t -> ()
-         | Error exn -> Format.eprintf "%a\n%!" Inflate.pp_error exn
-
-*)
