@@ -1,6 +1,6 @@
 open Ocamlbuild_plugin
 
 let () = dispatch @@ function
-  | After_hygiene as x ->
+  | After_hygiene ->
     pdep [ "link" ] "linkdep" (fun param -> [ param ])
   | _ -> ()
