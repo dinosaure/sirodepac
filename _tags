@@ -2,4 +2,6 @@ true: safe_string, bin_annot, debug
 <*/*>: warn(@32@20@25@26@34@33@37@39)
 
 <unpack.{ml,mli,byte,native}>: use_unix, use_bigarray, linkdep(bs.o), linkdep(adler32.o)
-<zlib.{ml,mli,byte,native}>: use_unix, use_bigarray, linkdep(bs.o), linkdep(adler32.o)
+<decompress.{ml,mli,byte,native}>: use_bigarray, linkdep(bs.o), linkdep(adler32.o)
+<dpipe.{ml,mli,byte,native}>: use_unix, use_bigarray, linkdep(bs.o), linkdep(adler32.o)
+<test.{ml,mli,byte,native}>: use_bigarray, package(re.str), package(camlzip), package(alcotest), linkdep(bs.o), linkdep(adler32.o)
