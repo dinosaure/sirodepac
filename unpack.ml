@@ -141,8 +141,6 @@ struct
       lookup t s sl
 end
 
-module B = Zlib.B
-
 (** Implementation of deserialization of a list of hunks (from a PACK file) *)
 module H =
 struct
@@ -412,7 +410,7 @@ struct
     | Invalid_index -> pp fmt "Invalid_index"
 
   type 'a t =
-    { map : 'a B.t
+    { map           : 'a B.t
     ; fanout_offset : int
     ; hashes_offset : int
     ; crcs_offset   : int
@@ -886,7 +884,7 @@ struct
   type error += Invalid_byte of int
   type error += Reserved_kind of int
   type error += Invalid_kind of int
-  type error += Inflate_error of Zlib.Inflate.error
+  type error += Inflate_error of Decompress.Inflate.error
   type error += Hunk_error of H.error
   type error += Hunk_input of int * int
   type error += Invalid_length of int * int
@@ -897,7 +895,7 @@ struct
     | Invalid_byte byte              -> pp fmt "(Invalid_byte %02x)" byte
     | Reserved_kind byte             -> pp fmt "(Reserved_byte %02x)" byte
     | Invalid_kind byte              -> pp fmt "(Invalid_kind %02x)" byte
-    | Inflate_error err              -> pp fmt "(Inflate_error %a)" Zlib.Inflate.pp_error err
+    | Inflate_error err              -> pp fmt "(Inflate_error %a)" Decompress.Inflate.pp_error err
     | Invalid_length (expected, has) -> pp fmt "(Invalid_length (%d <> %d))" expected has
     | Hunk_error err                 -> pp fmt "(Hunk_error %a)" H.pp_error err
     | Hunk_input (expected, has)     -> pp fmt "(Hunk_input (%d <> %d))" expected has
@@ -919,8 +917,8 @@ struct
     | Header    of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
     | Object    of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
     | VariableLength of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
-    | Unzip     of { offset : int; length : int; kind : 'i kind; z : ('i, 'o) Zlib.Inflate.t; }
-    | Hunks     of { offset : int; length : int; z : ('i, 'o) Zlib.Inflate.t; h : 'i H.t; }
+    | Unzip     of { offset : int; length : int; kind : 'i kind; z : ('i, 'o) Decompress.Inflate.t; }
+    | Hunks     of { offset : int; length : int; z : ('i, 'o) Decompress.Inflate.t; h : 'i H.t; }
     | Next      of { offset : int; length : int; count : int; kind : 'i kind; }
     | Checksum  of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
     | End       of string
@@ -955,7 +953,7 @@ struct
                       objects = %ld;@ \
                       counter = %ld;@ \
                       z = %a@]}"
-        i_off i_pos i_len version objects counter Zlib.Inflate.pp z
+        i_off i_pos i_len version objects counter Decompress.Inflate.pp z
     | Hunks { z; h; _ } ->
       pp fmt "{@[<hov>i_off = %d;@ \
                       i_pos = %d;@ \
@@ -965,7 +963,7 @@ struct
                       counter = %ld;@ \
                       z = %a;@ \
                       h = %a@]}"
-        i_off i_pos i_len version objects counter Zlib.Inflate.pp z H.pp h
+        i_off i_pos i_len version objects counter Decompress.Inflate.pp z H.pp h
     | _ ->
       pp fmt "{@[<hov>i_off = %d;@ \
                       i_pos = %d;@ \
@@ -1117,38 +1115,38 @@ struct
     | false -> k off src t
 
   let hunks src t offset length z h =
-    match Zlib.Inflate.eval src t.o_z z with
+    match Decompress.Inflate.eval src t.o_z z with
     | `Await z ->
       await { t with state = Hunks { offset; length; z; h; }
-                   ; i_pos = t.i_pos + Zlib.Inflate.used_in z
-                   ; read = t.read + Zlib.Inflate.used_in z }
+                   ; i_pos = t.i_pos + Decompress.Inflate.used_in z
+                   ; read = t.read + Decompress.Inflate.used_in z }
     | `Error (z, exn) -> error t (Inflate_error exn)
     | `End z ->
-      let ret = if Zlib.Inflate.used_out z <> 0
-                then H.eval t.o_z (H.refill 0 (Zlib.Inflate.used_out z) h)
+      let ret = if Decompress.Inflate.used_out z <> 0
+                then H.eval t.o_z (H.refill 0 (Decompress.Inflate.used_out z) h)
                 else H.eval t.o_z h
       in
       (match ret with
        | `Ok (h, hunks) ->
          Cont { t with state = Next { length
-                                    ; count = Zlib.Inflate.write z
+                                    ; count = Decompress.Inflate.write z
                                     ; offset
                                     ; kind = Hunk hunks }
-                     ; i_pos = t.i_pos + Zlib.Inflate.used_in z
-                     ; read = t.read + Zlib.Inflate.used_in z }
+                     ; i_pos = t.i_pos + Decompress.Inflate.used_in z
+                     ; read = t.read + Decompress.Inflate.used_in z }
        | `Await h ->
          error t (Hunk_input (length, H.read h))
        | `Error (h, exn) -> error t (Hunk_error exn))
     | `Flush z ->
-      match H.eval t.o_z (H.refill 0 (Zlib.Inflate.used_out z) h) with
+      match H.eval t.o_z (H.refill 0 (Decompress.Inflate.used_out z) h) with
       | `Await h ->
         Cont { t with state = Hunks { offset; length
-                                    ; z = (Zlib.Inflate.flush 0 (B.length t.o_z) z)
+                                    ; z = (Decompress.Inflate.flush 0 (B.length t.o_z) z)
                                     ; h } }
       | `Error (h, exn) -> error t (Hunk_error exn)
       | `Ok (h, objs) ->
         Cont { t with state = Hunks { offset; length
-                                    ; z = (Zlib.Inflate.flush 0 (B.length t.o_z) z)
+                                    ; z = (Decompress.Inflate.flush 0 (B.length t.o_z) z)
                                     ; h } }
 
   let switch typ off len src t =
@@ -1157,27 +1155,27 @@ struct
     | 0b001 ->
       Cont { t with state = Unzip { offset = off; length = len
                                   ; kind = Commit
-                                  ; z = Zlib.Inflate.flush 0 (B.length t.o_z)
-                                        @@ Zlib.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Zlib.Inflate.default; } }
+                                  ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
+                                        @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                        @@ Decompress.Inflate.default; } }
     | 0b010 ->
       Cont { t with state = Unzip { offset = off; length = len
                                   ; kind = Tree
-                                  ; z = Zlib.Inflate.flush 0 (B.length t.o_z)
-                                        @@ Zlib.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Zlib.Inflate.default; } }
+                                  ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
+                                        @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                        @@ Decompress.Inflate.default; } }
     | 0b011 ->
       Cont { t with state = Unzip { offset = off; length = len
                                   ; kind = Blob
-                                  ; z = Zlib.Inflate.flush 0 (B.length t.o_z)
-                                        @@ Zlib.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Zlib.Inflate.default; } }
+                                  ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
+                                        @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                        @@ Decompress.Inflate.default; } }
     | 0b100 ->
       Cont { t with state = Unzip { offset = off; length = len
                                   ; kind = Tag
-                                  ; z = Zlib.Inflate.flush 0 (B.length t.o_z)
-                                        @@ Zlib.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Zlib.Inflate.default; } }
+                                  ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
+                                        @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                        @@ Decompress.Inflate.default; } }
     | 0b110 ->
       KObject.get_byte
         (fun byte src t ->
@@ -1185,9 +1183,9 @@ struct
            offset msb (byte land 0x7F)
              (fun offset src t ->
                Cont { t with state = Hunks { offset = off; length = len
-                                           ; z = Zlib.Inflate.flush 0 (B.length t.o_z)
-                                                 @@ Zlib.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                                 @@ Zlib.Inflate.default
+                                           ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
+                                                 @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                                 @@ Decompress.Inflate.default
                                            ; h = H.default len (H.Offset offset) } })
              src t)
         src t
@@ -1195,9 +1193,9 @@ struct
       KObject.get_hash
         (fun hash src t ->
           Cont { t with state = Hunks { offset = off; length = len
-                                      ; z = Zlib.Inflate.flush 0 (B.length t.o_z)
-                                            @@ Zlib.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                            @@ Zlib.Inflate.default
+                                      ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
+                                            @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                            @@ Decompress.Inflate.default
                                       ; h = H.default len (H.Hash hash) } })
         src t
     | _  -> error t (Invalid_kind typ)
@@ -1218,28 +1216,28 @@ struct
       src t
 
   let unzip src t offset length kind z =
-    match Zlib.Inflate.eval src t.o_z z with
+    match Decompress.Inflate.eval src t.o_z z with
     | `Await z ->
       await { t with state = Unzip { offset; length
                                    ; kind
                                    ; z }
-                   ; i_pos = t.i_pos + Zlib.Inflate.used_in z
-                   ; read = t.read + Zlib.Inflate.used_in z }
+                   ; i_pos = t.i_pos + Decompress.Inflate.used_in z
+                   ; read = t.read + Decompress.Inflate.used_in z }
     | `Flush z ->
       flush { t with state = Unzip { offset; length
                                    ; kind
                                    ; z } }
     | `End z ->
-      if Zlib.Inflate.used_out z <> 0
+      if Decompress.Inflate.used_out z <> 0
       then flush { t with state = Unzip { offset; length
                                         ; kind
                                         ; z } }
       else Cont { t with state = Next { length
-                                      ; count = Zlib.Inflate.write z
+                                      ; count = Decompress.Inflate.write z
                                       ; offset
                                       ; kind; }
-                       ; i_pos = t.i_pos + Zlib.Inflate.used_in z
-                       ; read = t.read + Zlib.Inflate.used_in z }
+                       ; i_pos = t.i_pos + Decompress.Inflate.used_in z
+                       ; read = t.read + Decompress.Inflate.used_in z }
     | `Error (z, exn) -> error t (Inflate_error exn)
 
   let next src t length count kind =
@@ -1311,12 +1309,12 @@ struct
            { t with i_off = off
                   ; i_len = len
                   ; i_pos = 0
-                  ; state = Unzip { offset; length; kind; z = Zlib.Inflate.refill off len z; } }
+                  ; state = Unzip { offset; length; kind; z = Decompress.Inflate.refill off len z; } }
          | Hunks { offset; length; z; h; } ->
            { t with i_off = off
                   ; i_len = len
                   ; i_pos = 0
-                  ; state = Hunks { offset; length; z = Zlib.Inflate.refill off len z; h; } }
+                  ; state = Hunks { offset; length; z = Decompress.Inflate.refill off len z; h; } }
          | _ -> { t with i_off = off
                        ; i_len = len
                        ; i_pos = 0 }
@@ -1324,12 +1322,12 @@ struct
 
   let flush off len t = match t.state with
     | Unzip { offset; length; kind; z; } ->
-      { t with state = Unzip { offset; length; kind; z = Zlib.Inflate.flush off len z; } }
+      { t with state = Unzip { offset; length; kind; z = Decompress.Inflate.flush off len z; } }
     | _ -> raise (Invalid_argument "P.flush: bad state")
 
   let output t = match t.state with
     | Unzip { z; _ } ->
-      t.o_z, Zlib.Inflate.used_out z
+      t.o_z, Decompress.Inflate.used_out z
     | Hunks { h; _ } ->
       t.o_h, 0
     | _ -> raise (Invalid_argument "P.output: bad state")
@@ -1391,11 +1389,15 @@ struct
   let pp = Format.fprintf
 
   let pp_error fmt = function
-    | Invalid_hash hash -> pp fmt "(Invalid_hash %a)" pp_hash hash
-    | Invalid_source off -> pp fmt "(Invalid_chunk %d)" off
-    | Invalid_target (has, expected) -> pp fmt "(Invalid_target (%d, %d))"
-      has expected
-    | Unpack_error exn -> pp fmt "(Unpack_error %a)" P.pp_error exn
+    | Invalid_hash hash ->
+      Format.fprintf fmt "(Invalid_hash %a)" pp_hash hash
+    | Invalid_source off ->
+      Format.fprintf fmt "(Invalid_chunk %d)" off
+    | Invalid_target (has, expected) ->
+      Format.fprintf fmt "(Invalid_target (%d, %d))"
+        has expected
+    | Unpack_error exn ->
+      Format.fprintf fmt "(Unpack_error %a)" P.pp_error exn
 
   type 'a t =
     { map_pck : 'a B.t
@@ -1429,8 +1431,8 @@ struct
           | Some (kind, offset) -> Ok (kind, offset)
           | None -> assert false
           (** XXX: This is not possible, the [`End] state comes only after the
-           *  [`Object] state and this state changes [kind] to [Some x].
-           *)
+              [`Object] state and this state changes [kind] to [Some x].
+            *)
       in
 
       (match loop offset 0 None t with
@@ -1474,6 +1476,27 @@ let buffer_add_substring (type a) buf (tmp : a B.t) off len = match tmp with
     let v = B.Bigstring.sub v off len in
     Buffer.add_substring buf (B.Bigstring.to_string v) 0 len
 
+let pp_object fmt (kind, raw) = match kind with
+  | P.Commit ->
+    (match Minigit.Commit.Decoder.to_result raw with
+     | Ok commit ->
+       Format.printf "commit: %a" Minigit.Commit.pp commit
+     | Error exn -> Format.eprintf "Invalid commit\n%!")
+  | P.Tree ->
+    (match Minigit.Tree.Decoder.to_result raw with
+     | Ok tree ->
+       Format.printf "tree:   %a" Minigit.Tree.pp tree
+     | Error exn -> Format.eprintf "Invalid tree\n%!")
+  | P.Blob ->
+    Format.printf "blob"
+  | P.Tag ->
+    (match Minigit.Tag.Decoder.to_result raw with
+     | Ok tag ->
+       Format.printf "tag:    %a" Minigit.Tag.pp tag
+     | Error exn -> Format.eprintf "Invalid tag\n%!")
+  | P.Hunk _ ->
+    raise (Invalid_argument "pp_object")
+
 let unpack ?(chunk = 4096) map idx =
   let buf = Buffer.create chunk in
   let rap = D.make map idx in
@@ -1501,8 +1524,9 @@ let unpack ?(chunk = 4096) map idx =
           | Ok (P.Hunk hunks, _, offset') ->
             undelta hunks offset'
           | Ok (kind, raw, offset') ->
-            Format.printf "%a\n%!" P.pp_kind kind;
-            Format.printf "%a\n%!" Hex.hexdump (Hex.of_string_fast (B.to_string raw));
+            let raw = B.from_bytes @@ Bytes.of_string @@ B.to_string raw in
+
+            Format.printf "%a\n%!" pp_object (kind, raw);
 
             loop offset (P.next_object t)
           | Error exn ->
@@ -1512,9 +1536,9 @@ let unpack ?(chunk = 4096) map idx =
 
         undelta hunks (P.offset t)
       | kind ->
-        Format.printf "%a\n%!" P.pp_kind kind;
-        Format.printf "%a\n%!" Hex.hexdump (Hex.of_string_fast @@ Buffer.contents buf);
-        Buffer.clear buf; (* clean buffer *)
+        let raw = B.from_bytes @@ Bytes.of_string @@ Buffer.contents buf in
+        Format.printf "%a\n%!" pp_object (kind, raw);
+        Buffer.clear buf;
 
         loop offset (P.next_object t)
   in

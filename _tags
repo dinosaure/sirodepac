@@ -5,3 +5,4 @@ true: safe_string, bin_annot, debug
 <decompress.{ml,mli,byte,native}>: use_bigarray, linkdep(bs.o), linkdep(adler32.o)
 <dpipe.{ml,mli,byte,native}>: use_unix, use_bigarray, linkdep(bs.o), linkdep(adler32.o)
 <test.{ml,mli,byte,native}>: use_bigarray, package(re.str), package(camlzip), package(alcotest), linkdep(bs.o), linkdep(adler32.o)
+<minigit.{ml,mli,byte,native}>: use_bigarray, use_unix, linkdep(bs.o), linkdep(adler32.o)

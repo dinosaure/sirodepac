@@ -11,228 +11,6 @@ let repeat atm =
   lor (atm lsl 48)
   lor (atm lsl 56)
 
-(* Abstraction between Bytes and Bigstring *)
-module B =
-struct
-  module Bigstring =
-  struct
-    open Bigarray
-
-    type t = (char, int8_unsigned_elt, c_layout) Array1.t
-
-    let length = Array1.dim
-    let create = Array1.create Char c_layout
-    let get    = Array1.get
-    let set    = Array1.set
-    let sub    = Array1.sub
-    let fill   = Array1.fill
-    let blit   = Array1.blit
-    let copy v =
-      let v' = create (length v) in
-      Array1.blit v v'; v'
-
-    external get_u16 : t -> int -> int     = "%caml_bigstring_get16u"
-    external get_u32 : t -> int -> Int32.t = "%caml_bigstring_get32u"
-    external get_u64 : t -> int -> Int64.t = "%caml_bigstring_get64u"
-
-    let to_string v =
-      let buf = Bytes.create (length v) in
-      for i = 0 to length v - 1
-      do Bytes.set buf i (get v i) done;
-      Bytes.unsafe_to_string buf
-
-    (** See [bs.c]. *)
-    external blit
-      : t -> int -> t -> int -> int -> unit
-      = "bigstring_memcpy" [@@noalloc]
-
-    let pp fmt ba =
-      for i = 0 to length ba - 1
-      do match get ba i with
-         | '\000' .. '\031' | '\127' -> Format.pp_print_char fmt '.'
-         | chr -> Format.pp_print_char fmt chr
-      done
-
-    let tpp fmt ba =
-      for i = 0 to length ba - 1
-      do Format.pp_print_char fmt (get ba i) done
-  end
-
-  module Bytes =
-  struct
-    include Bytes
-
-    external get_u16 : t -> int -> int     = "%caml_string_get16u"
-    external get_u32 : t -> int -> Int32.t = "%caml_string_get32u"
-    external get_u64 : t -> int -> Int64.t = "%caml_string_get64u"
-
-    external blit
-      : t -> int -> t -> int -> int -> unit
-      = "bytes_memcpy" [@@noalloc]
-    (** See [bs.c]. *)
-
-    let pp fmt bs =
-      for i = 0 to length bs - 1
-      do match get bs i with
-         | '\000' .. '\031' | '\127' -> Format.pp_print_char fmt '.'
-         | chr -> Format.pp_print_char fmt chr
-      done
-
-    let tpp fmt bs =
-      for i = 0 to length bs - 1
-      do Format.pp_print_char fmt (get bs i) done
-
-    let blit src src_off dst dst_off len =
-      if len < 0 || src_off < 0 || src_off > Bytes.length src - len
-                 || dst_off < 0 || dst_off > Bytes.length dst - len
-      then raise (Invalid_argument (Format.sprintf "Bytes.blit (src: %d:%d, \
-                                                                dst: %d:%d, \
-                                                                len: %d)"
-                                      src_off (Bytes.length src)
-                                      dst_off (Bytes.length dst)
-                                      len))
-      else blit src src_off dst dst_off len
-  end
-
-  (* mandatory for a GADT *)
-  type st = St
-  type bs = Bs
-
-  type 'a t =
-    | Bytes : Bytes.t -> st t
-    | Bigstring : Bigstring.t -> bs t
-
-  let from_bytes v = Bytes v
-  let from_bigstring v = Bigstring v
-  let from
-    : type a. proof:a t -> int -> a t
-    = fun ~proof len -> match proof with
-    | Bytes v -> Bytes (Bytes.create len)
-    | Bigstring v -> Bigstring (Bigstring.create len)
-
-  let length : type a. a t -> int = function
-    | Bytes v -> Bytes.length v
-    | Bigstring v -> Bigstring.length v
-
-  let get : type a. a t -> int -> char = fun v idx -> match v with
-    | Bytes v -> Bytes.get v idx
-    | Bigstring v -> Bigstring.get v idx
-
-  let set : type a. a t -> int -> char -> unit = fun v idx chr -> match v with
-    | Bytes v -> Bytes.set v idx chr
-    | Bigstring v -> Bigstring.set v idx chr
-
-  let get_u16 : type a. a t -> int -> int = fun v idx -> match v with
-    | Bytes v -> Bytes.get_u16 v idx
-    | Bigstring v -> Bigstring.get_u16 v idx
-
-  let get_u32 : type a. a t -> int -> Int32.t = fun v idx -> match v with
-    | Bytes v -> Bytes.get_u32 v idx
-    | Bigstring v -> Bigstring.get_u32 v idx
-
-  let get_u64 : type a. a t -> int -> Int64.t = fun v idx -> match v with
-    | Bytes v -> Bytes.get_u64 v idx
-    | Bigstring v -> Bigstring.get_u64 v idx
-
-  let sub : type a. a t -> int -> int -> a t = fun v off len -> match v with
-    | Bytes v -> Bytes.sub v off len |> from_bytes
-    | Bigstring v -> Bigstring.sub v off len |> from_bigstring
-
-  let fill
-    : type a. a t -> int -> int -> char -> unit
-    = fun v off len chr -> match v with
-    | Bytes v -> Bytes.fill v off len chr
-    | Bigstring v -> Bigstring.fill (Bigstring.sub v off len) chr
-
-  let blit : type a. a t -> int -> a t -> int -> int -> unit =
-    fun src src_idx dst dst_idx len -> match src, dst with
-    | Bytes src, Bytes dst ->
-      Bytes.blit src src_idx dst dst_idx len
-    | Bigstring src, Bigstring dst ->
-      Bigstring.blit src src_idx dst dst_idx len
-
-  let pp : type a. Format.formatter -> a t -> unit = fun fmt -> function
-    | Bytes v -> Format.fprintf fmt "%a" Bytes.pp v
-    | Bigstring v -> Format.fprintf fmt "%a" Bigstring.pp v
-
-  let tpp : type a. Format.formatter -> a t -> unit = fun fmt -> function
-    | Bytes v -> Format.fprintf fmt "%a" Bytes.tpp v
-    | Bigstring v -> Format.fprintf fmt "%a" Bigstring.tpp v
-
-  let to_string : type a. a t -> string = function
-    | Bytes v -> Bytes.unsafe_to_string v
-    | Bigstring v -> Bigstring.to_string v
-
-  external st_adler32 : int32 -> Bytes.t -> int -> int -> int32 =
-    "bytes_adler32"
-  external bs_adler32 : int32 -> Bigstring.t -> int -> int -> int32 =
-    "bigstring_adler32"
-
-  let adler32 : type a. a t -> int32 -> int -> int -> int32 = function
-    | Bytes v -> fun i off len -> st_adler32 i v off len
-    | Bigstring v -> fun i off len -> bs_adler32 i v off len
-
-  let empty : type a. a t -> a t = function
-    | Bytes v -> Bytes Bytes.empty
-    | Bigstring v -> Bigstring (Bigstring.create 0)
-end
-
-(* Abstraction between read-and-write and read-only buffer *)
-module type S =
-sig
-  type read  = [ `Read ]
-  type write = [ `Write ]
-
-  type ('a, 'i) t constraint 'a = [< `Read | `Write ]
-
-  val read_and_write : 'i B.t -> ([ read | write ], 'i) t
-  val read_only      : 'i B.t -> (read, 'i) t
-  val write_only     : 'i B.t -> (write, 'i) t
-
-  val length    : ('a, 'i) t -> int
-  val get       : ([> read ], 'i) t -> int -> char
-  val set       : ([> write ], 'i) t -> int -> char -> unit
-  val get_u16   : ([> read ], 'i) t -> int -> int
-  val get_u32   : ([> read ], 'i) t -> int -> int32
-  val get_u64   : ([> read ], 'i) t -> int -> int64
-  val sub       : ([> read ] as 'a, 'i) t -> int -> int -> ('a, 'i) t
-  val fill      : ([> write ], 'i) t -> int -> int -> char -> unit
-  val blit      : ([> read ], 'i) t -> int ->
-                  ([> write ], 'i) t -> int -> int -> unit
-  val pp        : Format.formatter ->  ([> read ], 'i) t -> unit
-  val tpp       : Format.formatter ->  ([> read ], 'i) t -> unit
-  val to_string : ([> read ], 'i) t -> string
-  val adler32   : ([> read ], 'i) t -> int32 -> int -> int -> int32
-  val proof     : ('a, 'i) t -> 'i B.t
-end
-
-module S : S =
-struct
-  type read  = [ `Read ]
-  type write = [ `Write ]
-
-  type ('a, 'i) t = 'i B.t constraint 'a = [< `Read | `Write ]
-
-  let read_and_write : 'i B.t -> ([ read | write ], 'i) t = fun x -> x
-  let read_only      : 'i B.t -> (read, 'i) t             = fun x -> x
-  let write_only     : 'i B.t -> (write, 'i) t            = fun x -> x
-
-  let length    = B.length
-  let get       = B.get
-  let set       = B.set
-  let get_u16   = B.get_u16
-  let get_u32   = B.get_u32
-  let get_u64   = B.get_u64
-  let sub       = B.sub
-  let fill      = B.fill
-  let blit      = B.blit
-  let pp        = B.pp
-  let tpp       = B.tpp
-  let to_string = B.to_string
-  let adler32   = B.adler32
-  let proof     = fun x -> x
-end
-
 (** (imperative) Heap implementation *)
 module Heap =
 struct
@@ -588,7 +366,7 @@ struct
 
   let key src idx len : key =
     if idx < len - 3
-    then Some (S.get_u32 src idx)
+    then Some (Safe.get_u32 src idx)
     else None
 
   module T =
@@ -608,7 +386,7 @@ struct
     let rec aux acc len =
       if x + len < y
       && y + len < len
-      && S.get src (x + len) = S.get src (y + len)
+      && Safe.get src (x + len) = Safe.get src (y + len)
       then aux (Some (len + 1)) (len + 1)
       else acc
     in
@@ -625,9 +403,9 @@ struct
     let flush_last () =
       if !last <> 0 then begin
         for i = 0 to !last - 1
-        do t.on (Hunk.Literal (S.get src (t.i_off + t.i_pos + i)));
+        do t.on (Hunk.Literal (Safe.get src (t.i_off + t.i_pos + i)));
            Queue.push
-             (Hunk.Literal (S.get src (t.i_off + t.i_pos + i)))
+             (Hunk.Literal (Safe.get src (t.i_off + t.i_pos + i)))
              results;
         done;
 
@@ -695,7 +473,7 @@ struct
     : type a.
       ?accel:int ->
       ?max_fardistance:int ->
-      (S.read, a) S.t -> a t -> Hunk.t Seq.t
+      (Safe.read, a) Safe.t -> a t -> Hunk.t Seq.t
     = fun ?(accel = 1) ?(max_fardistance = (1 lsl 15) - 1) src t ->
     let src_idx    = ref (t.i_off + t.i_pos) in
     let hash_log   = Array.get _hlog t.level in
@@ -705,17 +483,17 @@ struct
     let results    = Queue.create () in
     let accel      = if accel < 1 then 0 else accel - 1 in
 
-    t.on (Hunk.Literal (S.get src !src_idx));
-    Queue.push (Hunk.Literal (S.get src !src_idx)) results;
+    t.on (Hunk.Literal (Safe.get src !src_idx));
+    Queue.push (Hunk.Literal (Safe.get src !src_idx)) results;
     incr src_idx;
 
-    t.on (Hunk.Literal (S.get src !src_idx));
-    Queue.push (Hunk.Literal (S.get src !src_idx)) results;
+    t.on (Hunk.Literal (Safe.get src !src_idx));
+    Queue.push (Hunk.Literal (Safe.get src !src_idx)) results;
     incr src_idx;
 
     let c ref idx =
       try
-        if S.get src !ref = S.get src !idx
+        if Safe.get src !ref = Safe.get src !idx
         then begin incr ref;
                    incr idx;
                    true
@@ -729,13 +507,13 @@ struct
       let src_ref = ref !src_idx in
 
       try
-        if S.get src !src_idx = S.get src (!src_idx - 1)
-           && S.get_u16 src (!src_idx - 1) = S.get_u16 src (!src_idx + 1)
+        if Safe.get src !src_idx = Safe.get src (!src_idx - 1)
+           && Safe.get_u16 src (!src_idx - 1) = Safe.get_u16 src (!src_idx + 1)
         then raise (Match (0, 0)) (* (+3, +1) *);
 
         let hval =
-          let v = S.get_u16 src !src_idx in
-          let v = (S.get_u16 src (!src_idx + 1)
+          let v = Safe.get_u16 src !src_idx in
+          let v = (Safe.get_u16 src (!src_idx + 1)
                    lxor (v lsr (16 - hash_log))) lxor v in
           v land ((1 lsl hash_log) - 1)
         in
@@ -750,7 +528,7 @@ struct
            || c src_ref src_idx = false
            || c src_ref src_idx = false
            || c src_ref src_idx = false
-        then raise (Literal (S.get src anchor));
+        then raise (Literal (Safe.get src anchor));
 
         (* TODO: fix that! bug with
                  deflate ~(level >= 5) -> inflate
@@ -759,14 +537,14 @@ struct
         if t.level >= 5 && distance >= _max_distance
         then if c src_ref src_idx = false
              || c src_ref src_idx = false
-             then raise (Literal (S.get src anchor))
+             then raise (Literal (Safe.get src anchor))
              else raise (Match (2, distance - 1)) (* (+3, +1) *);
         *)
 
         raise (Match (!src_idx - anchor - 3, distance - 1))
       with Match (len, 0) ->
            begin
-             let pattern = S.get src (anchor + len - 1) in
+             let pattern = Safe.get src (anchor + len - 1) in
              let v1 = repeat pattern in
 
              (*  _ _ _ _
@@ -789,14 +567,14 @@ struct
                                 - (2 * _idx_boundary)
                      && !src_idx - 3 - anchor < _max_length - _size_of_int64
                do
-                 let v2 = S.get_u64 src !src_ref in
+                 let v2 = Safe.get_u64 src !src_ref in
 
                  if v1 <> v2
                  then begin
                    while !src_idx < (t.i_off + t.i_len) - _idx_boundary
                          && !src_idx - 3 - anchor < _max_length
                    do
-                      if S.get src !src_ref <> pattern
+                      if Safe.get src !src_ref <> pattern
                       then raise Break
                       else begin incr src_ref; incr src_idx; end
                    done;
@@ -832,7 +610,7 @@ struct
                                 - _size_of_int64
                                 - (2 * _idx_boundary)
                      && !src_idx - 3 - anchor < _max_length - _size_of_int64
-               do if S.get_u64 src !src_idx <> S.get_u64 src !src_ref
+               do if Safe.get_u64 src !src_idx <> Safe.get_u64 src !src_ref
                   then begin
                     while !src_idx < (t.i_off + t.i_len) - _idx_boundary
                           && !src_idx - 3 - anchor < _max_length
@@ -870,8 +648,8 @@ struct
     done;
 
     while !src_idx < t.i_off + t.i_len
-    do t.on (Hunk.Literal (S.get src !src_idx));
-       Queue.push (Hunk.Literal (S.get src !src_idx)) results;
+    do t.on (Hunk.Literal (Safe.get src !src_idx));
+       Queue.push (Hunk.Literal (Safe.get src !src_idx)) results;
        incr src_idx
     done;
 
@@ -1097,12 +875,11 @@ sig
   type error = ..
   type error += Lz77_error of L.error
 
-  val pp_error : Format.formatter -> error -> unit
-
   module F : sig type t = int array * int array end
 
   type ('i, 'o) t
 
+  val pp_error : Format.formatter -> error -> unit
   val pp              : Format.formatter -> ('i, 'o) t -> unit
 
   val get_frequencies : ('i, 'o) t -> F.t
@@ -1174,7 +951,7 @@ struct
   type ('i, 'o) t =
     { hold        : int
     ; bits        : int
-    ; temp        : ([ S.read | S.write ], 'o) S.t
+    ; temp        : ([ Safe.read | Safe.write ], 'o) Safe.t
     ; o_off       : int
     ; o_pos       : int
     ; o_len       : int
@@ -1185,8 +962,8 @@ struct
     ; wbits       : int
     ; adler       : Int32.t
     ; state       : ('i, 'o) state }
-  and ('i, 'o) k = (S.read, 'i) S.t ->
-                   (S.write, 'o) S.t ->
+  and ('i, 'o) k = (Safe.read, 'i) Safe.t ->
+                   (Safe.write, 'o) Safe.t ->
                    ('i, 'o) t ->
                    ('i, 'o) res
   and ('i, 'o) state =
@@ -1315,7 +1092,7 @@ struct
     let rec put_byte chr k src dst t =
       if (t.o_len - t.o_pos) > 0
       then begin
-        S.set dst (t.o_off + t.o_pos) (Char.chr chr);
+        Safe.set dst (t.o_off + t.o_pos) (Char.chr chr);
         k src dst { t with o_pos = t.o_pos + 1 }
       end else Flush { t with state = Header (put_byte chr k) }
   end
@@ -1325,7 +1102,7 @@ struct
     let rec put_byte chr k src dst t =
       if (t.o_len - t.o_pos) > 0
       then begin
-        S.set dst (t.o_off + t.o_pos) (Char.chr chr);
+        Safe.set dst (t.o_off + t.o_pos) (Char.chr chr);
         k src dst { t with o_pos = t.o_pos + 1 }
       end else Flush { t with state = WriteBlock (put_byte chr k) }
 
@@ -1658,7 +1435,7 @@ struct
           else Cont { t with state = MakeBlock (Flat 0) })
     else begin
       let n = min (len - pos) (t.o_len - t.o_pos) in
-      S.blit t.temp (off + pos) dst (t.o_off + t.o_pos) n;
+      Safe.blit t.temp (off + pos) dst (t.o_off + t.o_pos) n;
 
       if t.o_len - (t.o_pos + n) = 0
       then Flush { t with state = WriteBlock (write_flat 0 (pos + n) len final)
@@ -1685,7 +1462,7 @@ struct
                                   ; frequencies
                                   ; deflate = Seq.append deflate seq })
                       ; i_pos = t.i_pos + L.used_in lz
-                      ; adler = S.adler32
+                      ; adler = Safe.adler32
                                   src
                                   t.adler
                                   (t.i_off + t.i_pos)
@@ -1700,7 +1477,7 @@ struct
                                    ; frequencies
                                    ; deflate = Seq.append deflate seq })
                       ; i_pos = t.i_pos + L.used_in lz
-                      ; adler = S.adler32
+                      ; adler = Safe.adler32
                                   src
                                   t.adler
                                   (t.i_off + t.i_pos)
@@ -1710,19 +1487,19 @@ struct
     | Flat pos ->
       let len = min (t.i_len - t.i_pos) (0x8000 - pos) in
 
-      S.blit src (t.i_off + t.i_pos) t.temp pos len;
+      Safe.blit src (t.i_off + t.i_pos) t.temp pos len;
 
       if pos + len = 0x8000 (* End of block *)
       then Cont { t with state = WriteBlock (flat 0 0 0x8000 false)
                        ; i_pos = t.i_pos + len
-                       ; adler = S.adler32
+                       ; adler = Safe.adler32
                                    src
                                    t.adler
                                    (t.i_off + t.i_pos)
                                    len }
       else await { t with state = MakeBlock (Flat (pos + len))
                         ; i_pos = t.i_pos + len
-                        ; adler = S.adler32
+                        ; adler = Safe.adler32
                                     src
                                     t.adler
                                     (t.i_off + t.i_pos)
@@ -1784,9 +1561,9 @@ struct
 
        if !bits + len > 16
        then begin
-         S.set dst (t.o_off + !o_pos)
+         Safe.set dst (t.o_off + !o_pos)
            (Char.chr ((!hold lor (code lsl !bits)) land 0xFF));
-         S.set dst (t.o_off + !o_pos + 1)
+         Safe.set dst (t.o_off + !o_pos + 1)
            (Char.chr ((!hold lor (code lsl !bits)) lsr 8 land 0xFF));
 
          hold  := code lsr (16 - !bits);
@@ -2047,8 +1824,8 @@ struct
     src dst t
 
   let eval src dst t =
-    let safe_src = S.read_only src in
-    let safe_dst = S.write_only dst in
+    let safe_src = Safe.read_only src in
+    let safe_dst = Safe.write_only dst in
 
     let eval0 t =
       match t.state with
@@ -2083,7 +1860,7 @@ struct
   let default ~proof ?(wbits = 15) level =
     { hold  = 0
     ; bits  = 0
-    ; temp  = S.read_and_write @@ B.from ~proof 0x8000
+    ; temp  = Safe.read_and_write @@ B.from ~proof 0x8000
     ; o_off = 0
     ; o_pos = 0
     ; o_len = 0
@@ -2299,14 +2076,14 @@ struct
       { rpos   : int
       ; wpos   : int
       ; size   : int
-      ; buffer : ([ S.read | S.write ], 'a) S.t
+      ; buffer : ([ Safe.read | Safe.write ], 'a) Safe.t
       ; crc    : Adler32.t }
 
     let make_by ~proof size =
       { rpos   = 0
       ; wpos   = 0
       ; size   = size + 1
-      ; buffer = S.read_and_write @@ B.from ~proof:(S.proof proof) (size + 1)
+      ; buffer = Safe.read_and_write @@ B.from ~proof (size + 1)
       ; crc    = Adler32.default }
 
     let available_to_write { wpos; rpos; size; _ } =
@@ -2330,10 +2107,10 @@ struct
       let extra = len - pre in
 
       if extra > 0 then begin
-        S.blit buf off t.buffer t.wpos pre;
-        S.blit buf (off + pre) t.buffer 0 extra;
+        Safe.blit buf off t.buffer t.wpos pre;
+        Safe.blit buf (off + pre) t.buffer 0 extra;
       end else
-        S.blit buf off t.buffer t.wpos len;
+        Safe.blit buf off t.buffer t.wpos len;
 
       move len { t with crc = Adler32.update buf off len t.crc }
 
@@ -2346,10 +2123,10 @@ struct
       let extra = len - pre in
 
       if extra > 0 then begin
-        S.blit buf off t.buffer t.wpos pre;
-        S.blit buf (off + pre) t.buffer 0 extra;
+        Safe.blit buf off t.buffer t.wpos pre;
+        Safe.blit buf (off + pre) t.buffer 0 extra;
       end else begin
-        S.blit buf off t.buffer t.wpos len;
+        Safe.blit buf off t.buffer t.wpos len;
       end;
 
       move len t
@@ -2359,7 +2136,7 @@ struct
               then drop (1 - (available_to_write t)) t
               else t in
 
-      S.set t.buffer t.wpos chr;
+      Safe.set t.buffer t.wpos chr;
 
       move 1 { t with crc = Adler32.atom chr t.crc }
 
@@ -2372,10 +2149,10 @@ struct
       let extra = len - pre in
 
       if extra > 0 then begin
-        S.fill t.buffer t.wpos pre chr;
-        S.fill t.buffer 0 extra chr;
+        Safe.fill t.buffer t.wpos pre chr;
+        Safe.fill t.buffer 0 extra chr;
       end else
-        S.fill t.buffer t.wpos len chr;
+        Safe.fill t.buffer t.wpos len chr;
 
       move len { t with crc = Adler32.fill chr len t.crc }
 
@@ -2473,8 +2250,8 @@ struct
     ; i_len : int
     ; write : int
     ; state : ('i, 'o) state }
-  and ('i, 'o) k = (S.read, 'i) S.t ->
-                   (S.write, 'o) S.t ->
+  and ('i, 'o) k = (Safe.read, 'i) Safe.t ->
+                   (Safe.write, 'o) Safe.t ->
                    ('i, 'o) t ->
                    ('i, 'o) res
   and ('i, 'o) state =
@@ -2548,7 +2325,7 @@ struct
   struct
     let rec get_byte k src dst t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ S.get src (t.i_off + t.i_pos) in
+      then let byte = Char.code @@ Safe.get src (t.i_off + t.i_pos) in
            k byte src dst
              { t with i_pos = t.i_pos + 1 }
       else Wait { t with state = Header (get_byte k) }
@@ -2559,7 +2336,7 @@ struct
   struct
     let rec get_byte k src dst t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ S.get src (t.i_off + t.i_pos) in
+      then let byte = Char.code @@ Safe.get src (t.i_off + t.i_pos) in
            k byte src dst
              { t with i_pos = t.i_pos + 1 }
       else Wait { t with state = Dictionary (get_byte k) }
@@ -2605,7 +2382,7 @@ struct
   struct
     let rec get_byte k src dst t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ S.get src (t.i_off + t.i_pos) in
+      then let byte = Char.code @@ Safe.get src (t.i_off + t.i_pos) in
            k byte src dst
              { t with i_pos = t.i_pos + 1 }
       else Wait { t with state = Flat (get_byte k) }
@@ -2620,7 +2397,7 @@ struct
            k byte src dst { t with hold = t.hold lsr 8
                                  ; bits = t.bits - 8 }
       else if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ S.get src (t.i_off + t.i_pos) in
+      then let byte = Char.code @@ Safe.get src (t.i_off + t.i_pos) in
             k byte src dst
               { t with i_pos = t.i_pos + 1 }
       else Wait { t with state = Flat (get_byte k) }
@@ -2638,7 +2415,7 @@ struct
       if t.bits < lookup.Lookup.max
       then
         if (t.i_len - t.i_pos) > 0
-        then let byte = Char.code @@ S.get src (t.i_off + t.i_pos) in
+        then let byte = Char.code @@ Safe.get src (t.i_off + t.i_pos) in
              (get[@tailcall]) lookup k src dst
                { t with i_pos = t.i_pos + 1
                       ; hold  = t.hold lor (byte lsl t.bits)
@@ -2653,7 +2430,7 @@ struct
       if t.o_len - t.o_pos > 0
       then begin
         let window = Window.write_char chr window in
-        S.set dst (t.o_off + t.o_pos) chr;
+        Safe.set dst (t.o_off + t.o_pos) chr;
 
         k window src dst { t with o_pos = t.o_pos + 1 }
       end else Flush { t with state = Inflate (put_chr window chr k) }
@@ -2664,7 +2441,7 @@ struct
         let len = min length (t.o_len - t.o_pos) in
 
         let window = Window.fill_char chr len window in
-        S.fill dst (t.o_off + t.o_pos) len chr;
+        Safe.fill dst (t.o_off + t.o_pos) len chr;
 
         if length - len > 0
         then Flush
@@ -2676,7 +2453,7 @@ struct
     let rec write window lookup_chr lookup_dst length distance k src dst t =
       match distance with
       | 1 ->
-        let chr = S.get window.Window.buffer
+        let chr = Safe.get window.Window.buffer
           Window.((window.wpos - 1) % window) in
 
         fill_chr window length chr k src dst t
@@ -2693,15 +2470,15 @@ struct
           then begin
             let window0 =
               Window.write_rw window.Window.buffer off pre window in
-            S.blit window0.Window.buffer off dst (t.o_off + t.o_pos) pre;
+            Safe.blit window0.Window.buffer off dst (t.o_off + t.o_pos) pre;
             let window1 =
               Window.write_rw window0.Window.buffer 0 ext window0 in
-            S.blit window1.Window.buffer 0 dst (t.o_off + t.o_pos + pre) ext;
+            Safe.blit window1.Window.buffer 0 dst (t.o_off + t.o_pos + pre) ext;
             window1
           end else begin
             let window0 =
               Window.write_rw window.Window.buffer off len window in
-            S.blit window0.Window.buffer off dst (t.o_off + t.o_pos) len;
+            Safe.blit window0.Window.buffer off dst (t.o_off + t.o_pos) len;
             window0
           end
         in
@@ -2727,7 +2504,7 @@ struct
 
       if t.bits < len
       then if (t.i_len - t.i_pos) > 0
-           then let byte = Char.code @@ S.get src (t.i_off + t.i_pos) in
+           then let byte = Char.code @@ Safe.get src (t.i_off + t.i_pos) in
                 read_extra_dist
                   distance k
                   src dst
@@ -2746,7 +2523,7 @@ struct
 
       if t.bits < len
       then if (t.i_len - t.i_pos) > 0
-           then let byte = Char.code @@ S.get src (t.i_off + t.i_pos) in
+           then let byte = Char.code @@ Safe.get src (t.i_off + t.i_pos) in
                 read_extra_length
                   length k
                   src dst
@@ -2774,7 +2551,7 @@ struct
            k byte src dst { t with hold = t.hold lsr 8
                                  ; bits = t.bits - 8 }
       else if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ S.get src (t.i_off + t.i_pos) in
+      then let byte = Char.code @@ Safe.get src (t.i_off + t.i_pos) in
             k byte src dst
               { t with i_pos = t.i_pos + 1 }
       else Wait { t with state = Crc (get_byte k) }
@@ -2947,7 +2724,7 @@ struct
       let n = min length (min (t.i_len - t.i_pos) (t.o_len - t.o_pos)) in
 
       let window = Window.write_ro src (t.i_off + t.i_pos) n window in
-      S.blit src (t.i_off + t.i_pos) dst (t.o_off + t.o_pos) n;
+      Safe.blit src (t.i_off + t.i_pos) dst (t.o_off + t.o_pos) n;
 
       if length - n = 0
       then Cont  { t with i_pos = t.i_pos + n
@@ -3034,11 +2811,11 @@ struct
            if !bits < lookup_chr.Lookup.max
            then begin
              hold := !hold lor ((Char.code
-                                 @@ S.get src (t.i_off + !i_pos)) lsl !bits);
+                                 @@ Safe.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
              hold := !hold lor ((Char.code
-                                 @@ S.get src (t.i_off + !i_pos)) lsl !bits);
+                                 @@ Safe.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
            end;
@@ -3053,7 +2830,7 @@ struct
 
            if value < 256
            then begin
-             S.set dst (t.o_off + !o_pos) (Char.chr value);
+             Safe.set dst (t.o_off + !o_pos) (Char.chr value);
              window := Window.write_char (Char.chr value) !window;
              incr o_pos;
              incr write;
@@ -3069,7 +2846,7 @@ struct
            if !bits < len
            then begin
              hold := !hold lor ((Char.code
-                                 @@ S.get src (t.i_off + !i_pos)) lsl !bits);
+                                 @@ Safe.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
            end;
@@ -3083,11 +2860,11 @@ struct
            if !bits < lookup_dst.Lookup.max
            then begin
              hold := !hold lor ((Char.code
-                                 @@ S.get src (t.i_off + !i_pos)) lsl !bits);
+                                 @@ Safe.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
              hold := !hold lor ((Char.code
-                                 @@ S.get src (t.i_off + !i_pos)) lsl !bits);
+                                 @@ Safe.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
            end;
@@ -3106,11 +2883,11 @@ struct
            if !bits < len
            then begin
              hold := !hold lor ((Char.code
-                                 @@ S.get src (t.i_off + !i_pos)) lsl !bits);
+                                 @@ Safe.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
              hold := !hold lor ((Char.code
-                                 @@ S.get src (t.i_off + !i_pos)) lsl !bits);
+                                 @@ Safe.get src (t.i_off + !i_pos)) lsl !bits);
              bits := !bits + 8;
              incr i_pos;
            end;
@@ -3122,13 +2899,13 @@ struct
            goto := Write (length,
                           (Array.get Table._base_dist dist) + 1 + extra)
          | Write (length, 1) ->
-           let chr = S.get !window.Window.buffer
+           let chr = Safe.get !window.Window.buffer
              Window.((!window.wpos - 1) % !window) in
 
            let n = min length (t.o_len - !o_pos) in
 
            window := Window.fill_char chr n !window;
-           S.fill dst (t.o_off + !o_pos) n chr;
+           Safe.fill dst (t.o_off + !o_pos) n chr;
 
            o_pos := !o_pos + n;
            write := !write + n;
@@ -3146,15 +2923,15 @@ struct
              then begin
                let window0 =
                  Window.write_rw !window.Window.buffer off pre !window in
-               S.blit window0.Window.buffer off dst (t.o_off + !o_pos) pre;
+               Safe.blit window0.Window.buffer off dst (t.o_off + !o_pos) pre;
                let window1 =
                  Window.write_rw window0.Window.buffer 0 ext window0 in
-               S.blit window1.Window.buffer 0 dst (t.o_off + !o_pos + pre) ext;
+               Safe.blit window1.Window.buffer 0 dst (t.o_off + !o_pos + pre) ext;
                window1
              end else begin
                let window0 =
                  Window.write_rw !window.Window.buffer off n !window in
-               S.blit window0.Window.buffer off dst (t.o_off + !o_pos) n;
+               Safe.blit window0.Window.buffer off dst (t.o_off + !o_pos) n;
                window0
              end;
 
@@ -3238,7 +3015,7 @@ struct
                      ; bits = t.bits - 2
                      ; state }
     else if (t.i_len - t.i_pos) > 0
-    then let byte = Char.code @@ S.get src (t.i_off + t.i_pos) in
+    then let byte = Char.code @@ Safe.get src (t.i_off + t.i_pos) in
 
          Cont { t with i_pos = t.i_pos + 1
                      ; hold  = (t.hold lor (byte lsl t.bits))
@@ -3254,7 +3031,7 @@ struct
                      ; bits  = t.bits - 1
                      ; state = Block window }
     else if (t.i_len - t.i_pos) > 0
-    then let byte = Char.code @@ S.get src (t.i_off + t.i_pos) in
+    then let byte = Char.code @@ Safe.get src (t.i_off + t.i_pos) in
 
          Cont { t with i_pos = t.i_pos + 1
                      ; hold  = (t.hold lor (byte lsl t.bits))
@@ -3265,14 +3042,14 @@ struct
     (KHeader.get_byte
      @@ fun byte0 -> KHeader.get_byte
      @@ fun byte1 src dst t ->
-          let window = Window.make_by ~proof:dst (1 lsl (byte0 lsr 4 + 8)) in
+          let window = Window.make_by ~proof:(Safe.proof dst) (1 lsl (byte0 lsr 4 + 8)) in
 
           Cont { t with state = Last window })
     src dst t
 
   let eval src dst t =
-    let safe_src = S.read_only src in
-    let safe_dst = S.write_only dst in
+    let safe_src = Safe.read_only src in
+    let safe_dst = Safe.write_only dst in
 
     let eval0 t =
       match t.state with
