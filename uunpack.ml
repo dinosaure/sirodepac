@@ -95,7 +95,38 @@ let filename_of_sha1 sha1 =
 
   [ ".git"; "objects"; prefix; suffix ]
 
-let store ~sha1 encoder (kind, raw) = match kind with
+let write_header encoder kind length =
+  let hdr = Format.sprintf "%s %d\000"
+    (match kind with
+     | P.Commit -> "commit"
+     | P.Blob -> "blob"
+     | P.Tree -> "tree"
+     | P.Tag -> "tag"
+     | P.Hunk _ -> raise (Invalid_argument "hash_of_object"))
+    length
+  in
+  Minienc.write_string encoder hdr
+
+let hash_of_object kind length =
+  let hdr = Format.sprintf "%s %d\000"
+    (match kind with
+     | P.Commit -> "commit"
+     | P.Blob -> "blob"
+     | P.Tree -> "tree"
+     | P.Tag -> "tag"
+     | P.Hunk _ -> raise (Invalid_argument "hash_of_object"))
+    length
+  in
+  fun raw ->
+    Nocrypto.Hash.SHA1.digestv
+      [ Cstruct.of_string hdr
+      ; B.to_cstruct raw ]
+    |> Cstruct.to_string
+
+let store ~sha1 encoder (kind, length, raw) =
+  write_header encoder kind length;
+
+  match kind with
   | P.Commit ->
     (match Minigit.Commit.Decoder.to_result raw with
      | Ok commit ->
@@ -121,22 +152,6 @@ let store ~sha1 encoder (kind, raw) = match kind with
        to_file ~path:(filename_of_sha1 sha1) encoder
      | Error exn -> Format.eprintf "Invalid tag: %a\n%!" Minidec.pp_error exn)
   | P.Hunk _ -> assert false
-
-let hash_of_object kind length =
-  let hdr = Format.sprintf "%s %d\000"
-    (match kind with
-     | P.Commit -> "commit"
-     | P.Blob -> "blob"
-     | P.Tree -> "tree"
-     | P.Tag -> "tag"
-     | P.Hunk _ -> raise (Invalid_argument "hash_of_object"))
-    length
-  in
-  fun raw ->
-    Nocrypto.Hash.SHA1.digestv
-      [ Cstruct.of_string hdr
-      ; B.to_cstruct raw ]
-    |> Cstruct.to_string
 
 let unpack ?(chunk = 0x8000) map idx get =
   let buf = BBuffer.create ~proof:(B.from_bigstring B.Bigstring.empty) chunk in
@@ -166,7 +181,7 @@ let unpack ?(chunk = 0x8000) map idx get =
           | Ok (P.Hunk hunks, _, offset', _) ->
             undelta hunks offset'
           | Ok (kind, raw, offset', length) ->
-            store ~sha1:(hash_of_object kind length raw) enc (kind, raw);
+            store ~sha1:(hash_of_object kind length raw) enc (kind, length, raw);
             loop offset (P.next_object t)
           | Error exn ->
             Format.eprintf "Delta error: %a\n%!" D.pp_error exn;
@@ -176,7 +191,7 @@ let unpack ?(chunk = 0x8000) map idx get =
         undelta hunks (P.offset t)
       | kind ->
         let raw = BBuffer.contents buf in
-        store ~sha1:(hash_of_object kind (P.length t) raw) enc (kind, raw);
+        store ~sha1:(hash_of_object kind (P.length t) raw) enc (kind, (P.length t), raw);
 
         BBuffer.clear buf;
         loop offset (P.next_object t)
