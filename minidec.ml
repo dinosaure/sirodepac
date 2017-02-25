@@ -1,3 +1,55 @@
+(* Copyright (c) 2016 Inhabited Type LLC.
+
+   All rights reserved.
+
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions
+   are met:
+
+   1. Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+
+   2. Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+
+   3. Neither the name of the author nor the names of his contributors
+      may be used to endorse or promote products derived from this software
+      without specific prior written permission.
+
+   THIS SOFTWARE IS PROVIDED BY THE CONTRIBUTORS ``AS IS'' AND ANY EXPRESS
+   OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+   WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+   DISCLAIMED.  IN NO EVENT SHALL THE AUTHORS OR CONTRIBUTORS BE LIABLE FOR
+   ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+   DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+   OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+   STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+   ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+   POSSIBILITY OF SUCH DAMAGE.
+
+   XXX(dinosaure): This module is most inspired by the angstrom project but I
+   update the core to have a pure functionnal approach of the parser
+   combinator (specifically about the `commit` function) and use a more
+   simplified API about the input (provided by decompress).
+
+   However, the design and the most of this API was thinked by Inhabited Type.
+*)
+
+module B =
+struct
+  include Decompress.B
+
+  let count_while v ?(init = 0) predicate =
+    let i = ref init in
+    let l = length v in
+
+    while !i < l && predicate (get v !i) do incr i done;
+
+    !i - init
+end
+
 module I =
 struct
   type t = { init : int
@@ -26,15 +78,33 @@ type statut =
   | Incomplete
 
 type error = ..
-type error += Not_enough_input
-type error += Invalid_character
+type error += End
+type error += Expected_character of (char list * char)
 type error += Expected_string of (string * string)
+
+let pp_list ?(sep = "") pp_data fmt lst =
+  let rec aux = function
+    | [] -> ()
+    | [ x ] -> pp_data fmt x
+    | x :: r -> Format.fprintf fmt "%a%s" pp_data x sep; aux r
+  in aux lst
+
+let pp_error fmt = function
+  | End -> Format.fprintf fmt "End"
+  | Expected_character (chrs, chr) ->
+    Format.fprintf fmt "(Expected_character (%a, %c))"
+      (pp_list ~sep:"; " Format.pp_print_char) chrs
+      chr
+  | Expected_string (has, expect) ->
+    Format.fprintf fmt "(Expected_string (%s, %s))"
+      has expect
+  | exn ->
+    Format.fprintf fmt "<Minidec.exn>"
 
 type ('a, 'i) state =
   | Read of { committed : int; k : 'i B.t -> statut -> ('a, 'i) state }
   | Done of ('a * int)
   | Fail of error
-
 
 type ('a, 'i) k = 'i B.t -> int -> I.t -> statut -> 'a
 type ('a, 'i) fail = (error -> ('a, 'i) state, 'i) k
@@ -99,17 +169,17 @@ let parse, only =
   (fun i p -> p.f i 0 I.{ init = 0; commit = 0; } Complete fail_k success_k)
 
 let to_result ?refiller i p =
-  let rec aux refiller state = match state, refiller with
+  let rec aux committed refiller state = match state, refiller with
     | Done (v, p), _ -> Ok (v, p)
     | Read { committed
            ; k }, Some refiller ->
       let (i, s) = refiller committed i in
-      k i s |> aux (Some refiller)
-    | Read _, None -> Error Not_enough_input
-    | Fail exn, _ -> Error exn
+      k i s |> aux committed (Some refiller)
+    | Read _, None -> Error (End, committed)
+    | Fail exn, _ -> Error (exn, committed)
   in match refiller with
-     | Some refiller -> aux (Some refiller) (parse i p)
-     | None -> aux None (only i p)
+     | Some refiller -> aux 0 (Some refiller) (parse i p)
+     | None -> aux 0 None (only i p)
 
 let rec prompt i p c fail succ =
   let uncommitted = I.length i c - c.I.commit in
@@ -138,10 +208,10 @@ let commit =
 let await =
   { f = fun i p c s fail succ ->
     match s with
-    | Complete -> fail i p c s Not_enough_input
+    | Complete -> fail i p c s End
     | Incomplete ->
       let succ' i' p' c' s' = succ i' p' c' s' ()
-      and fail' i' p' c' s' = fail i' p' c' s' Not_enough_input in
+      and fail' i' p' c' s' = fail i' p' c' s' End in
       prompt i p c fail' succ' }
 
 let ensure n i p c s fail succ =
@@ -153,22 +223,22 @@ let ensure n i p c s fail succ =
   in
   (await *> go).f i p c s fail succ
 
-let char' predicate =
+let char' ~expected predicate =
   { f = fun i p c s fail succ ->
     if p < I.length i c
     then match predicate (I.get i c p) with
-         | None -> fail i p c s Invalid_character
+         | None -> fail i p c s (Expected_character (expected, I.get i c p))
          | Some v -> succ i (p + 1) c s v
     else let succ' i' p' c' s' () =
            match predicate (I.get i' c' p') with
-           | None -> fail i' p' c' s' Invalid_character
+           | None -> fail i' p' c' s' (Expected_character (expected, I.get i' c' p'))
            | Some v -> succ i' (p' + 1) c' s' v
          in
 
          ensure 1 i p c s fail succ' }
 
-let satisfy predicate =
-  char' (fun c -> if predicate c then Some c else None)
+let satisfy ~expected predicate =
+  char' ~expected (fun c -> if predicate c then Some c else None)
 
 let skip n =
   { f = fun i p c s fail succ ->
@@ -185,7 +255,7 @@ let count n p =
   in aux n
 
 let char chr =
-  satisfy (fun chr' -> chr' = chr)
+  satisfy ~expected:[ chr ] (fun chr' -> chr' = chr)
 
 let substring n =
   { f = fun i p c s fail succ ->

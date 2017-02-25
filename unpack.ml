@@ -1,5 +1,126 @@
 let () = Printexc.record_backtrace true
 
+module B : sig
+  include module type of Decompress.B
+    with type st = Decompress.B.st
+     and type bs = Decompress.B.bs
+     and type 'a t = 'a Decompress.B.t
+
+  val to_cstruct : 'a t -> Cstruct.t
+end = struct
+  include Decompress.B
+
+  let to_cstruct
+    : type a. a t -> Cstruct.t
+    = function
+    | Bytes v -> Cstruct.of_bytes v
+    | Bigstring v -> Cstruct.of_bigarray v
+end
+
+module BBuffer =
+struct
+  type 'i t =
+    { mutable buf : 'i B.t
+    ; mutable pos : int
+    ; mutable len : int
+    ; init        : 'i B.t }
+
+  let create ~proof n =
+    let n = if n < 1 then 1 else n in
+    let n = if n > Sys.max_string_length then Sys.max_string_length else n in
+    let s = B.from ~proof n in
+
+    { buf  = s
+    ; pos  = 0
+    ; len  = n
+    ; init = s }
+
+  let contents b =
+    B.sub b.buf 0 b.pos
+
+  let length b = b.pos
+
+  let resize ({ len; pos; buf; } as b) m =
+    let len' = ref len in
+
+    while pos + m > !len' do len' := 2 * !len' done;
+
+    if !len' > Sys.max_string_length
+    then if pos + m <= Sys.max_string_length
+         then len' := Sys.max_string_length
+         else raise (Failure "BBuffer.add: cannot grow buffer");
+
+    let buf' = B.from buf !len' in
+
+    B.blit buf 0 buf' 0 pos;
+    b.buf <- buf';
+    b.len <- !len'
+
+  let blit_string src src_off dst dst_off len =
+    for i = 0 to len - 1
+    do B.set dst (dst_off + i) (String.get src (src_off + i)) done
+
+  let blit_bytes src src_off dst dst_off len =
+    for i = 0 to len - 1
+    do B.set dst (dst_off + i) (Bytes.get src (src_off + i)) done
+
+  let blit_bigstring src src_off dst dst_off len =
+    for i = 0 to len - 1
+    do B.set dst (dst_off + i) (B.Bigstring.get src (src_off + i)) done
+
+  (* XXX(dinosaure): we can factorize by a first module, but too big to be
+                     useful. *)
+  let add tmp ?(off = 0) ?(len = B.length tmp) buf =
+    if off < 0 || len < 0 || off + len > B.length tmp
+    then raise (Invalid_argument "BBuffer.add");
+
+    let pos' = buf.pos + len in
+
+    if pos' > buf.len
+    then resize buf len;
+
+    B.blit tmp off buf.buf buf.pos len;
+    buf.pos <- pos'
+
+  let add_string tmp ?(off = 0) ?(len = String.length tmp) buf =
+    if off < 0 || len < 0 || off + len > String.length tmp
+    then raise (Invalid_argument "BBuffer.add_string");
+
+    let pos' = buf.pos + len in
+
+    if pos' > buf.len
+    then resize buf len;
+
+    blit_string tmp off buf.buf buf.pos len;
+    buf.pos <- pos'
+
+  let add_bytes tmp ?(off = 0) ?(len = Bytes.length tmp) buf =
+    if off < 0 || len < 0 || off + len > Bytes.length tmp
+    then raise (Invalid_argument "BBuffer.add_bytes");
+
+    let pos' = buf.pos + len in
+
+    if pos' > buf.len
+    then resize buf len;
+
+    blit_bytes tmp off buf.buf buf.pos len;
+    buf.pos <- pos'
+
+  let add_bigstring tmp ?(off = 0) ?(len = B.Bigstring.length tmp) buf =
+    if off < 0 || len < 0 || off + len > B.Bigstring.length tmp
+    then raise (Invalid_argument "BBuffer.add_bigstring");
+
+    let pos' = buf.pos + len in
+
+    if pos' > buf.len
+    then resize buf len;
+
+    blit_bigstring tmp off buf.buf buf.pos len;
+    buf.pos <- pos'
+
+  let clear b = b.pos <- 0
+end
+
 external swap32 : int32 -> int32 = "%bswap_int32"
 external swap64 : int64 -> int64 = "%bswap_int64"
 
@@ -141,7 +262,7 @@ struct
       lookup t s sl
 end
 
-(** Implementation of deserialization of a list of hunks (from a PACK file) *)
+(* Implementation of deserialization of a list of hunks (from a PACK file) *)
 module H =
 struct
   type error = ..
@@ -392,9 +513,9 @@ struct
   let read t = t.read
 end
 
-(** This module  provides a  Random Access  Memory from  an IDX  file.  From any
-    hashes,  the function [find] get the offset  of the git object.  We keep the
-    IDX file with a ['a B.t] as long as you use [find].
+(* This module  provides a  Random Access  Memory from  an IDX  file.  From any
+   hashes,  the function [find] get the offset  of the git object.  We keep the
+   IDX file with a ['a B.t] as long as you use [find].
 *)
 module RAI =
 struct
@@ -526,6 +647,11 @@ struct
          else Error Invalid_index
     else Error Invalid_index
 
+  let nth t n =
+    let off = Int32.to_int @@ Int32.mul 20l n in
+
+    B.sub t.map (t.hashes_offset + off) 20
+
   let find t hash =
     match LRU.find t.cache hash with
     | Some offset -> Some offset
@@ -537,11 +663,11 @@ struct
       | Error _ -> None
 end
 
-(** Implementation of deserialization of an IDX file
+(* Implementation of deserialization of an IDX file
 
-    Provides a binding between hash and offset. You can use theses bindings as a
-    Patricia-tree (see {module T}) and close (and free) the IDX file. Otherwise,
-    you need to keep the IDX file.
+   Provides a binding between hash and offset. You can use theses bindings as a
+   Patricia-tree (see {module T}) and close (and free) the IDX file. Otherwise,
+   you need to keep the IDX file.
 *)
 module I =
 struct
@@ -877,7 +1003,7 @@ struct
     loop t
 end
 
-(** Implementatioon of deserialization of a PACK file *)
+(* Implementatioon of deserialization of a PACK file *)
 module P =
 struct
   type error = ..
@@ -917,9 +1043,18 @@ struct
     | Header    of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
     | Object    of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
     | VariableLength of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
-    | Unzip     of { offset : int; length : int; kind : 'i kind; z : ('i, 'o) Decompress.Inflate.t; }
-    | Hunks     of { offset : int; length : int; z : ('i, 'o) Decompress.Inflate.t; h : 'i H.t; }
-    | Next      of { offset : int; length : int; count : int; kind : 'i kind; }
+    | Unzip     of { offset : int
+                   ; length : int
+                   ; kind : 'i kind
+                   ; z : ('i, 'o) Decompress.Inflate.t }
+    | Hunks     of { offset : int
+                   ; length : int
+                   ; z : ('i, 'o) Decompress.Inflate.t
+                   ; h : 'i H.t }
+    | Next      of { offset : int
+                   ; length : int
+                   ; count : int
+                   ; kind : 'i kind }
     | Checksum  of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
     | End       of string
     | Exception of error
@@ -1157,25 +1292,25 @@ struct
                                   ; kind = Commit
                                   ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
                                         @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Decompress.Inflate.default; } }
+                                        @@ Decompress.Inflate.default } }
     | 0b010 ->
       Cont { t with state = Unzip { offset = off; length = len
                                   ; kind = Tree
                                   ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
                                         @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Decompress.Inflate.default; } }
+                                        @@ Decompress.Inflate.default } }
     | 0b011 ->
       Cont { t with state = Unzip { offset = off; length = len
                                   ; kind = Blob
                                   ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
                                         @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Decompress.Inflate.default; } }
+                                        @@ Decompress.Inflate.default } }
     | 0b100 ->
       Cont { t with state = Unzip { offset = off; length = len
                                   ; kind = Tag
                                   ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
                                         @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Decompress.Inflate.default; } }
+                                        @@ Decompress.Inflate.default } }
     | 0b110 ->
       KObject.get_byte
         (fun byte src t ->
@@ -1235,7 +1370,7 @@ struct
       else Cont { t with state = Next { length
                                       ; count = Decompress.Inflate.write z
                                       ; offset
-                                      ; kind; }
+                                      ; kind }
                        ; i_pos = t.i_pos + Decompress.Inflate.used_in z
                        ; read = t.read + Decompress.Inflate.used_in z }
     | `Error (z, exn) -> error t (Inflate_error exn)
@@ -1309,7 +1444,10 @@ struct
            { t with i_off = off
                   ; i_len = len
                   ; i_pos = 0
-                  ; state = Unzip { offset; length; kind; z = Decompress.Inflate.refill off len z; } }
+                  ; state = Unzip { offset
+                                  ; length
+                                  ; kind
+                                  ; z = Decompress.Inflate.refill off len z } }
          | Hunks { offset; length; z; h; } ->
            { t with i_off = off
                   ; i_len = len
@@ -1321,8 +1459,11 @@ struct
     else raise (Invalid_argument (sp "P.refill: you lost something (pos: %d, len: %d)" t.i_pos t.i_len))
 
   let flush off len t = match t.state with
-    | Unzip { offset; length; kind; z; } ->
-      { t with state = Unzip { offset; length; kind; z = Decompress.Inflate.flush off len z; } }
+    | Unzip { offset; length; kind; z } ->
+      { t with state = Unzip { offset
+                             ; length
+                             ; kind
+                             ; z = Decompress.Inflate.flush off len z } }
     | _ -> raise (Invalid_argument "P.flush: bad state")
 
   let output t = match t.state with
@@ -1346,6 +1487,10 @@ struct
     | Next { kind; _ } -> kind
     | _ -> raise (Invalid_argument "P.kind: bad state")
 
+  let length t = match t.state with
+    | Next { length; _ } -> length
+    | _ -> raise (Invalid_argument "P.length: bad state")
+
   let offset t = match t.state with
     | Next { offset; _ } -> offset
     | _ -> raise (Invalid_argument "P.offset: bad state")
@@ -1356,7 +1501,7 @@ struct
       | Object k -> k src t
       | VariableLength k -> k src t
       | Unzip { offset; length; kind; z; } ->
-        unzip src t offset length kind  z
+        unzip src t offset length kind z
       | Hunks { offset; length; z; h; } ->
         hunks src t offset length z h
       | Next { length; count; kind; } -> next src t length count kind
@@ -1403,6 +1548,10 @@ struct
     { map_pck : 'a B.t
     ; fun_idx : (string -> Int64.t option) }
 
+  let is_hunk t = match P.kind t with
+    | P.Hunk _ -> true
+    | _ -> false
+
   let delta { map_pck; fun_idx; } hunks offset =
     match hunks.H.reference with
     | H.Offset off ->
@@ -1424,19 +1573,19 @@ struct
           B.blit o 0 unpacked result n;
           loop offset' (result + n) kind (P.flush 0 n t)
         | `Object t ->
-          loop offset' result (Some (P.kind t, P.offset t)) (P.next_object t) (* XXX *)
+          loop offset' result (Some (P.kind t, P.offset t, P.length t)) (P.next_object t) (* XXX *)
         | `Error (t, exn) ->
           Error (Unpack_error exn)
         | `End (t, _) -> match kind with
-          | Some (kind, offset) -> Ok (kind, offset)
+          | Some (kind, offset, length) -> Ok (kind, offset, length)
           | None -> assert false
-          (** XXX: This is not possible, the [`End] state comes only after the
-              [`Object] state and this state changes [kind] to [Some x].
-            *)
+          (* XXX: This is not possible, the [`End] state comes only after the
+                  [`Object] state and this state changes [kind] to [Some x].
+           *)
       in
 
       (match loop offset 0 None t with
-       | Ok (kind, offset) ->
+       | Ok (kind, offset, hash) ->
          let target_length = List.fold_left
           (fun acc -> function
            | H.Insert raw ->
@@ -1447,7 +1596,7 @@ struct
          in
 
          if (target_length = hunks.H.target_length)
-         then Ok (kind, res, offset)
+         then Ok (kind, res, offset, hash)
          else Error (Invalid_target (target_length, hunks.H.target_length))
        | Error exn -> Error exn)
 
@@ -1457,118 +1606,3 @@ struct
 
   let make map_pck fun_idx = { map_pck; fun_idx; }
 end
-
-(** See [bs.c]. *)
-external bs_read : Unix.file_descr -> B.Bigstring.t -> int -> int -> int =
-  "bigstring_read" [@@noalloc]
-external bs_write : Unix.file_descr -> B.Bigstring.t -> int -> int -> int =
-  "bigstring_write" [@@noalloc]
-
-(** Abstract [Unix.read] with ['a B.t]. *)
-let unix_read (type a) ch (tmp : a B.t) off len = match tmp with
-  | B.Bytes v -> Unix.read ch v off len
-  | B.Bigstring v -> bs_read ch v off len
-
-(** Abstract [Buffer.add_substring] with ['a B.t]. *)
-let buffer_add_substring (type a) buf (tmp : a B.t) off len = match tmp with
-  | B.Bytes v -> Buffer.add_substring buf (Bytes.unsafe_to_string v) off len
-  | B.Bigstring v ->
-    let v = B.Bigstring.sub v off len in
-    Buffer.add_substring buf (B.Bigstring.to_string v) 0 len
-
-let pp_object fmt (kind, raw) = match kind with
-  | P.Commit ->
-    (match Minigit.Commit.Decoder.to_result raw with
-     | Ok commit ->
-       Format.printf "commit: %a" Minigit.Commit.pp commit
-     | Error exn -> Format.eprintf "Invalid commit\n%!")
-  | P.Tree ->
-    (match Minigit.Tree.Decoder.to_result raw with
-     | Ok tree ->
-       Format.printf "tree:   %a" Minigit.Tree.pp tree
-     | Error exn -> Format.eprintf "Invalid tree\n%!")
-  | P.Blob ->
-    Format.printf "blob"
-  | P.Tag ->
-    (match Minigit.Tag.Decoder.to_result raw with
-     | Ok tag ->
-       Format.printf "tag:    %a" Minigit.Tag.pp tag
-     | Error exn -> Format.eprintf "Invalid tag\n%!")
-  | P.Hunk _ ->
-    raise (Invalid_argument "pp_object")
-
-let unpack ?(chunk = 4096) map idx =
-  let buf = Buffer.create chunk in
-  let rap = D.make map idx in
-
-  let rec loop offset (t : ('a, 'a) P.t) =
-    match P.eval map t with
-    | `Await t ->
-      let chunk = min (B.length map - offset) chunk in
-      if chunk > 0
-      then loop (offset + chunk) (P.refill offset chunk t)
-      else raise End_of_file
-    | `Flush t ->
-      let o, n = P.output t in
-      let () = buffer_add_substring buf o 0 n in
-      loop offset (P.flush 0 n t)
-    | `End (t, hash) -> ()
-    | `Error (t, exn) ->
-      Format.eprintf "Pack error: %a\n%!" P.pp_error exn;
-      assert false
-    | `Object t ->
-      match P.kind t with
-      | P.Hunk hunks ->
-        let rec undelta hunks offset' =
-          match D.delta rap hunks offset' with
-          | Ok (P.Hunk hunks, _, offset') ->
-            undelta hunks offset'
-          | Ok (kind, raw, offset') ->
-            let raw = B.from_bytes @@ Bytes.of_string @@ B.to_string raw in
-
-            Format.printf "%a\n%!" pp_object (kind, raw);
-
-            loop offset (P.next_object t)
-          | Error exn ->
-            Format.printf "Delta error: %a\n%!" D.pp_error exn;
-            assert false
-        in
-
-        undelta hunks (P.offset t)
-      | kind ->
-        let raw = B.from_bytes @@ Bytes.of_string @@ Buffer.contents buf in
-        Format.printf "%a\n%!" pp_object (kind, raw);
-        Buffer.clear buf;
-
-        loop offset (P.next_object t)
-  in
-
-  loop 0 (P.default ~proof:map ~chunk:chunk ())
-
-(** Bytes map. *)
-let st_map filename =
-  let i = open_in filename in
-  let n = in_channel_length i in
-  let m = Bytes.create n in
-  really_input i m 0 n;
-  B.from_bytes m
-
-(** Bigstring map. *)
-let bs_map filename =
-  let i = Unix.openfile filename [ Unix.O_RDONLY ] 0o644 in
-  let m = Bigarray.Array1.map_file i Bigarray.Char Bigarray.c_layout false (-1) in
-  B.from_bigstring m
-
-let () =
-  let pp = bs_map Sys.argv.(1) in
-  let ii = bs_map Sys.argv.(2) in
-
-  let () =
-    match RAI.make ii with
-    | Ok t ->
-      unpack pp (fun hash -> RAI.find t hash)
-    | Error exn ->
-      Format.eprintf "%a\n%!" RAI.pp_error exn
-  in
-
-  Format.printf "End of parsing\n%!"

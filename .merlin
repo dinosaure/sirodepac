@@ -1,4 +1,4 @@
 B _build
 S .
 
-PKG alcotest re camlzip
+PKG decompress nocrypto cstruct

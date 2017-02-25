@@ -1,17 +1,83 @@
-type 'a hash = string constraint 'a = [>]
+module B =
+struct
+  include Decompress.B
 
-external hash_tree   : string -> [ `Tree ] hash   = "%identity"
-external hash_commit : string -> [ `Commit ] hash = "%identity"
-external hash_blob   : string -> [ `Blob ] hash   = "%identity"
-external hash_tag    : string -> [ `Tag ] hash    = "%identity"
+  let blit_string src src_off dst dst_off len =
+    for i = 0 to len - 1
+    do set dst (dst_off + i) (String.get src (src_off + i)) done
 
-let pp_hash fmt hash =
-  for i = 0 to String.length hash - 1
-  do Format.fprintf fmt "%02x" (Char.code @@ String.get hash i) done
+  let blit_bytes src src_off dst dst_off len =
+    for i = 0 to len - 1
+    do set dst (dst_off + i) (Bytes.get src (src_off + i)) done
+
+  let blit_bigstring src src_off dst dst_off len =
+    for i = 0 to len - 1
+    do set dst (dst_off + i) (Bigstring.get src (src_off + i)) done
+end
+
+module Option =
+struct
+  let ( >>= ) x f = match x with Some x -> Some (f x) | None -> None
+end
 
 module Result =
 struct
   let ( >>| ) a f = match a with Ok a -> Ok (f a) | Error exn -> Error exn
+end
+
+module Hash =
+struct
+  type 'a t = string constraint 'a = [>]
+
+  external tree   : string -> [ `Tree ]   t = "%identity"
+  external commit : string -> [ `Commit ] t = "%identity"
+  external blob   : string -> [ `Blob ]   t = "%identity"
+  external tag    : string -> [ `Tag ]    t = "%identity"
+
+  (* XXX(dinosaure): from ocaml-hex *)
+  let to_char x y =
+    let code c = match c with
+      | '0'..'9' -> Char.code c - 48 (* Char.code '0' *)
+      | 'A'..'F' -> Char.code c - 55 (* Char.code 'A' + 10 *)
+      | 'a'..'f' -> Char.code c - 87 (* Char.code 'a' + 10 *)
+      | _ -> 
+        raise (Invalid_argument (Format.sprintf "Hash.to_char: %d is an invalid char" (Char.code c)))
+    in
+  Char.chr (code x lsl 4 + code y)
+
+  let from_pp
+    : sentinel:'sentinel -> string -> 'sentinel t
+    = fun ~sentinel x ->
+      let tmp = Bytes.create 20 in
+      let buf = if String.length x mod 2 = 1
+                then x ^ "0" else x
+      in
+
+      let rec aux i j =
+        if i >= 40 then ()
+        else if j >= 40
+        then raise (Invalid_argument "Hash.from_pp")
+             (* XXX(dinosaure): this case is impossible because
+                                if j is odd and we only add (+) 2,
+                                j stay odd as long as we compute.
+
+                                So j <> 40, in any case.
+              *)
+        else begin
+          Bytes.set tmp (i / 2) (to_char buf.[i] buf.[j]);
+          aux (j + 1) (j + 2)
+        end
+      in aux 0 1; Bytes.unsafe_to_string tmp
+
+  let pp fmt hash =
+    for i = 0 to String.length hash - 1
+    do Format.fprintf fmt "%02x" (Char.code @@ String.get hash i) done
+
+  let to_pp hash =
+    let buf = Buffer.create 40 in
+    let fmt = Format.formatter_of_buffer buf in
+    Format.fprintf fmt "%a%!" pp hash;
+    Buffer.contents buf
 end
 
 let pp_list ?(sep = "") pp_data fmt lst =
@@ -56,22 +122,27 @@ struct
 
   module Decoder =
   struct
-    let lt = '<'
-    let gt = '>'
-    let is_not_lt chr = chr <> lt
-    let is_not_gt chr = chr <> gt
+    let lt = Minidec.char '<'
+    let gt = Minidec.char '>'
+    let sp = Minidec.char ' '
+    let pl = Minidec.char '+'
+    let mn = Minidec.char '-'
+
+    let is_not_lt chr = chr <> '<'
+    let is_not_gt chr = chr <> '>'
 
     let user =
       let open Minidec in
 
-      count_while is_not_lt
-      >>= fun n       -> substring (n - 1) <* skip 2
-      >>= fun name    -> take_while is_not_gt
-      >>= fun email   -> skip 2 *> int64
-      >>= fun second  -> char ' ' *> ((char '+' *> return `Plus)
-                                      <|> (char '-' *> return `Minus))
-      >>= fun sign    -> take 2 >>| int_of_string
-      >>= fun hours   -> take 2 >>| int_of_string
+      count_while is_not_lt <* commit
+      >>= fun n       -> substring (n - 1) <* skip 2 <* commit
+      >>= fun name    -> take_while is_not_gt <* commit
+      >>= fun email   -> skip 2 *> int64 <* commit
+      >>= fun second  -> sp *> ((pl *> return `Plus)
+                                 <|> (mn *> return `Minus))
+                         <* commit
+      >>= fun sign    -> take 2 >>| int_of_string <* commit
+      >>= fun hours   -> take 2 >>| int_of_string <* commit
       >>= fun minutes ->
         let tz_offset =
           if sign = `Plus
@@ -84,18 +155,58 @@ struct
         return { name
                ; email
                ; date = (second, tz_offset) }
+      <* commit
 
     let to_result i =
       let open Result in
       Minidec.to_result i user >>| fst
+  end
+
+  module Encoder =
+  struct
+    let lt = Minifor.Const.char '<'
+    let gt = Minifor.Const.char '>'
+    let sp = Minifor.Const.char ' '
+
+    let bint64 =
+      let open Minifor.Blitter in
+      let blit src = B.blit_string (Int64.to_string src) in
+      let length x = String.length @@ Int64.to_string x in
+      { blit; length }
+
+    let write_date encoder = function
+      | None -> Minienc.write_string encoder "+0000"
+      | Some { sign; hours; minutes } ->
+        let open Minifor in
+        let open Minifor.Infix in
+        let date = char **! string **! nil in
+        let fmt  = finalize (make date) in
+
+        eval encoder fmt
+          (match sign with | `Plus -> '+' | `Minus -> '-')
+          (Format.sprintf "%02d%02d" hours minutes)
+
+    let write_user encoder t =
+      let open Minifor in
+      let open Minifor.Infix in
+
+      let user = string **! sp ** lt ** string **! gt ** sp ** int64 **? sp ** write_date **= nil in
+
+      let fmt  = finalize (make user) bint64 in
+
+      eval encoder fmt
+        t.name
+        t.email
+        None (fst t.date)
+        (snd t.date)
   end
 end
 
 module Commit =
 struct
   type t =
-    { tree      : [ `Tree ] hash
-    ; parents   : [ `Commit ] hash list
+    { tree      : [ `Tree ] Hash.t
+    ; parents   : [ `Commit ] Hash.t list
     ; author    : User.t
     ; committer : User.t
     ; message   : string  }
@@ -105,49 +216,99 @@ struct
              ; author
              ; committer
              ; message } =
-    Format.fprintf fmt "{ @[<hov>tree = %s;@ \
+    Format.fprintf fmt "{ @[<hov>tree = %a;@ \
                                  parents = [ @[<hov>%a@] ];@ \
                                  author = %a;@ \
                                  committer = %a;@ \
                                  message = @[<hov>%a@];@] }"
-      tree
-      (pp_list ~sep:"; " Format.pp_print_string) parents
+      Hash.pp tree
+      (pp_list ~sep:"; " Hash.pp) parents
       User.pp author User.pp committer
       Format.pp_print_text message;
 
   module Decoder =
   struct
-    let sp = '\x20'
-    let lf = '\x0a'
-    let is_not_lf chr = chr <> lf
+    let sp = Minidec.char ' '
+    let lf = Minidec.char '\x0a'
+    let is_not_lf chr = chr <> '\x0a'
 
     let binding
       : type a. key:string -> value:a Minidec.t -> a Minidec.t
       = fun ~key ~value ->
       let open Minidec in
 
-      string key *> char sp *> value <* char lf
+      string key *> sp *> value <* lf <* commit
 
     let commit =
       let open Minidec in
 
-      binding ~key:"tree" ~value:(take_while is_not_lf)
-      >>= fun tree      -> many (binding ~key:"parent" ~value:(take_while is_not_lf))
+      binding ~key:"tree" ~value:(take_while is_not_lf) <* commit
+      >>= fun tree      -> many (binding ~key:"parent"
+                                         ~value:(take_while is_not_lf))
+                           <* commit
       >>= fun parents   -> binding ~key:"author" ~value:User.Decoder.user
+                           <* commit
       >>= fun author    -> binding ~key:"committer" ~value:User.Decoder.user
-      >>= fun committer -> char lf
-      *>  return { tree = hash_tree tree
-                 ; parents = List.map hash_commit parents
+                           <* commit
+      >>= fun committer -> commit
+      *>  return { tree = Hash.from_pp ~sentinel:`Tree tree
+                 ; parents = List.map (Hash.from_pp ~sentinel:`Commit) parents
                  ; author
                  ; committer
                  ; message = "" }
+      <* commit
 
     let to_result i =
       match Minidec.to_result i commit with
       | Ok (v, p) ->
-        let msg = B.to_string @@ B.sub i p (B.length i - p - 1) in
-        Ok { v with message = msg }
-      | Error exn -> Error exn
+        if B.length i - p > 0
+        then let msg = B.to_string @@ B.sub i p (B.length i - p) in
+             Ok { v with message = msg }
+        else Ok v
+      | Error (exn, _) -> Error exn
+  end
+
+  module Encoder =
+  struct
+    let sp = Minifor.Const.char ' '
+    let lf = Minifor.Const.char '\x0a'
+
+    let bparents =
+      let open Minifor.Blitter in
+      let blit src _ dst dst_off len =
+        let len' = List.fold_left
+          (fun off x ->
+            B.blit_string "parent " 0 dst off 7;
+            B.blit_string (Hash.to_pp x) 0 dst (off + 7) 40;
+            B.set dst (off + 7 + 40) '\x0a';
+            off + 7 + 40 + 1)
+          dst_off src
+        in
+        assert (len' = dst_off + len)
+      in
+      let length l = List.fold_left (fun a x -> a + 7 + 40 + 1) 0 l in
+      { blit; length; }
+
+    let write_commit encoder t =
+      let open Minifor in
+      let open Minifor.Infix in
+
+      let commit =
+        (Const.string "tree") ** sp ** string **! lf **
+        (list string) **?
+        (Const.string "author") ** sp ** User.Encoder.write_user **= lf **
+        (Const.string "committer") ** sp ** User.Encoder.write_user **= lf **
+        lf ** string **! nil
+      in
+
+      let fmt = finalize (make commit) bparents in
+
+      eval encoder fmt
+        (Hash.to_pp t.tree)
+        None t.parents
+        t.author
+        t.committer
+        t.message
   end
 end
 
@@ -156,7 +317,7 @@ struct
   type entry =
     { perm : perm
     ; name : string
-    ; node : 'a. 'a hash }
+    ; node : 'a. 'a Hash.t }
   and perm =
     [ `Normal | `Exec | `Link | `Dir | `Commit ]
   and t = entry list
@@ -173,7 +334,7 @@ struct
        | `Link -> "link"
        | `Dir -> "dir"
        | `Commit -> "commit")
-      name pp_hash node
+      name Hash.pp node
 
   let pp fmt tree =
     Format.fprintf fmt "[ @[<hov>%a@] ]"
@@ -181,15 +342,16 @@ struct
 
   module Decoder =
   struct
-    let sp = '\x20'
-    let nl = '\x00'
-    let is_not_sp chr = chr <> sp
-    let is_not_nl chr = chr <> nl
+    let sp = Minidec.char ' '
+    let nl = Minidec.char '\x00'
+    let is_not_sp chr = chr <> ' '
+    let is_not_nl chr = chr <> '\x00'
 
     let escape = '\042'
 
     let perm_of_string = function
-      | "44" | "100644" -> `Normal
+      | "44"
+      | "100644" -> `Normal
       | "100755" -> `Exec
       | "120000" -> `Link
       | "40000"  -> `Dir
@@ -229,35 +391,103 @@ struct
       take_while is_not_sp >>= fun perm ->
         (try return (perm_of_string perm)
          with _ -> fail (Invalid_perm perm))
-      >>= fun perm -> skip 1 *> take_while is_not_nl >>| decode
-      >>= fun name -> skip 1 *> hash
+        <* commit
+      >>= fun perm -> skip 1 *> take_while is_not_nl >>| decode <* commit
+      >>= fun name -> skip 1 *> hash <* commit
       >>= fun hash ->
         return { perm
                ; name
-               ; node = (hash : [ `Unknow ] hash) }
+               ; node = (hash : [ `Unknow ] Hash.t) }
+      <* commit
 
     let tree = Minidec.many entry
 
     let to_result i =
-      let open Result in
-      Minidec.to_result i tree >>| fst
+      match Minidec.to_result i tree with
+      | Ok (tree, _) -> Ok tree
+      | Error (exn, _) -> Error exn
+  end
+
+  module Encoder =
+  struct
+    let sp = Minifor.Const.char ' '
+    let nl = Minifor.Const.char '\x00'
+
+    let string_of_perm = function
+      | `Normal -> "100644"
+      | `Exec   -> "100755"
+      | `Link   -> "120000"
+      | `Dir    -> "40000"
+      | `Commit -> "160000"
+
+    let escaped_characters =
+      [ '\x42'; '\x00'; '\x2f' ]
+
+    let has s l =
+      List.fold_left
+        (||)
+        false
+        (List.map (String.contains s) l)
+
+    let encode path =
+      if not (has path escaped_characters)
+      then path
+      else
+        let n = String.length path in
+        let b = Buffer.create n in
+        let last = ref 0 in
+        for i = 0 to n - 1
+        do if List.mem path.[i] escaped_characters
+           then begin
+             let c = Char.chr (Char.code path.[i] + 1) in
+             if i - !last > 0
+             then Buffer.add_substring b path !last (i - !last);
+             Buffer.add_char b '\x42';
+             Buffer.add_char b c;
+             last := i + 1;
+           end
+        done;
+        if n - !last > 0
+        then Buffer.add_substring b path !last (n - !last);
+        Buffer.contents b
+
+    let write_entry encoder t =
+      let open Minifor in
+      let open Minifor.Infix in
+
+      let entry = string **! sp ** string **! nl ** string **! nil in
+      let fmt   = finalize (make entry) in
+
+      eval encoder fmt
+        (string_of_perm t.perm)
+        (encode t.name)
+        t.node
+
+    let write_tree encoder t =
+      List.iter (write_entry encoder) t
   end
 end
 
 module Blob =
 struct
-  type t = { content : string }
+  type 'i t = { content : 'i B.t }
 
   module Decoder =
   struct
-    let to_result i = { content = i }
+    let to_result i = Ok { content = i }
+  end
+
+  module Encoder =
+  struct
+    let write_blob encoder { content } =
+      Minienc.schedule encoder content
   end
 end
 
 module Tag =
 struct
   type t =
-    { obj     : 'a. 'a hash
+    { obj     : 'a. 'a Hash.t
     ; kind    : kind
     ; tag     : string
     ; tagger  : User.t
@@ -280,7 +510,7 @@ struct
                                  tag = %s;@ \
                                  tagger = %a;@ \
                                  message = @[<hov>%a@]@] }"
-      pp_hash obj
+      Hash.pp obj
       pp_kind kind
       tag
       User.pp tagger
@@ -288,52 +518,91 @@ struct
 
   module Decoder =
   struct
-    let sp = '\x20'
-    let lf = '\x0a'
-    let is_not_lf chr = chr <> lf
+    let sp = Minidec.char ' '
+    let lf = Minidec.char '\x0a'
+    let is_not_lf chr = chr <> '\x0a'
 
     let obj = Minidec.take 40
 
     let kind =
       let open Minidec in
 
-      (string "blob" *> return Blob)
+      (string "blob"       *> return Blob)
       <|> (string "commit" *> return Commit)
-      <|> (string "tag" *> return Tag)
-      <|> (string "tree" *> return Tree)
+      <|> (string "tag"    *> return Tag)
+      <|> (string "tree"   *> return Tree)
 
     let binding
       : type a. key:string -> value:a Minidec.t -> a Minidec.t
       = fun ~key ~value ->
       let open Minidec in
 
-      string key *> char sp *> value <* char lf
+      string key *> sp *> value <* lf
 
-    let hash_from_kind = function
-      | Blob -> hash_blob
-      | Commit -> hash_commit
-      | Tree -> hash_tree
-      | Tag -> hash_tag
+    let sentinel_from_kind = function
+      | Blob   -> `Blob
+      | Commit -> `Commit
+      | Tree   -> `Tree
+      | Tag    -> `Tag
 
     let tag =
       let open Minidec in
 
-      binding ~key:"object" ~value:obj
-      >>= fun obj    -> binding ~key:"type"   ~value:kind
-      >>= fun kind   -> binding ~key:"tag"    ~value:(take_while is_not_lf)
+      binding ~key:"object" ~value:obj <* commit
+      >>= fun obj    -> binding ~key:"type" ~value:kind
+                        <* commit
+      >>= fun kind   -> binding ~key:"tag" ~value:(take_while is_not_lf)
+                        <* commit
       >>= fun tag    -> binding ~key:"tagger" ~value:User.Decoder.user
-      >>= fun tagger -> skip 1 *>
-        return { obj = hash_from_kind kind obj
+                        <* commit
+      >>= fun tagger -> skip 1 *> commit *>
+        return { obj = Hash.from_pp ~sentinel:(sentinel_from_kind kind) obj
                ; kind
                ; tag
                ; tagger
                ; message = "" }
+      <* commit
 
     let to_result i =
       match Minidec.to_result i tag with
       | Ok (v, p) ->
-        let msg = B.to_string @@ B.sub i p (B.length i - p - 1) in
-        Ok { v with message = msg }
-      | Error exn -> Error exn
+        if B.length i - p > 0
+        then let msg = B.to_string @@ B.sub i p (B.length i - p - 1) in
+             Ok { v with message = msg }
+        else Ok v
+      | Error (exn, _) -> Error exn
+  end
+
+  module Encoder =
+  struct
+    let sp = Minifor.Const.char ' '
+    let lf = Minifor.Const.char '\x0a'
+
+    let string_of_kind = function
+      | Blob   -> "blob"
+      | Commit -> "commit"
+      | Tree   -> "tree"
+      | Tag    -> "tag"
+
+    let write_tag encoder t =
+      let open Minifor in
+      let open Minifor.Infix in
+
+      let tag =
+        (Const.string "object") ** sp ** string **! lf **
+        (Const.string "type") ** sp ** string **! lf **
+        (Const.string "tag") ** sp ** string **! lf **
+        (Const.string "tagger") ** sp ** User.Encoder.write_user **= lf **
+        string **! nil
+      in
+
+      let fmt = finalize (make tag) in
+
+      eval encoder fmt
+        (Hash.to_pp t.obj)
+        (string_of_kind t.kind)
+        t.tag
+        t.tagger
+        t.message
   end
 end
