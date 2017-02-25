@@ -298,7 +298,7 @@ struct
         (list string) **?
         (Const.string "author") ** sp ** User.Encoder.write_user **= lf **
         (Const.string "committer") ** sp ** User.Encoder.write_user **= lf **
-        lf ** string **! nil
+        string **! nil
       in
 
       let fmt = finalize (make commit) bparents in
