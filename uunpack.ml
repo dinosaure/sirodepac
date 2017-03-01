@@ -53,15 +53,21 @@ let to_file ~path ec =
   let rec loop src dst dc =
     match Decompress.Deflate.eval src (B.from_bigstring dst) dc,
           Minienc.operation ec with
-    | `Await dc, `Write ({ Minienc.Vec.buf = `Bigstring s; off; len } :: _) ->
+    | `Await dc, `Write ({ Minienc.Vec.buf = `Bigstring s
+                         ; off
+                         ; len } :: _) ->
       Minienc.shift ec len;
       loop (Decompress.B.from_bigstring s) dst (Decompress.Deflate.no_flush off len dc)
-    | `Await dc, `Write ({ Minienc.Vec.buf = `String s; off; len } :: _) ->
+    | `Await dc, `Write ({ Minienc.Vec.buf = `String s
+                         ; off
+                         ; len } :: _) ->
       BBuffer.clear dft_src;
       BBuffer.add_string s ~off ~len dft_src;
       Minienc.shift ec len;
       loop (BBuffer.contents dft_src) dst (Decompress.Deflate.no_flush 0 (BBuffer.length dft_src) dc)
-    | `Await dc, `Write ({ Minienc.Vec.buf = `Bytes s; off; len } :: _) ->
+    | `Await dc, `Write ({ Minienc.Vec.buf = `Bytes s
+                         ; off
+                         ; len } :: _) ->
       BBuffer.clear dft_src;
       BBuffer.add_bytes s ~off ~len dft_src;
       Minienc.shift ec len;
@@ -164,15 +170,14 @@ let unpack ?(chunk = 0x8000) map idx get =
       let chunk = min (B.length map - offset) chunk in
       if chunk > 0
       then loop (offset + chunk) (P.refill offset chunk t)
-      else raise End_of_file
+      else Error (`File_error End_of_file)
     | `Flush t ->
       let o, n = P.output t in
       let () = BBuffer.add o ~len:n buf in
       loop offset (P.flush 0 n t)
-    | `End (t, hash) -> ()
+    | `End (t, hash) -> Ok hash
     | `Error (t, exn) ->
-      Format.eprintf "Pack error: %a\n%!" P.pp_error exn;
-      assert false
+      Error (`Pack_error exn)
     | `Object t ->
       match P.kind t with
       | P.Hunk hunks ->
@@ -184,8 +189,7 @@ let unpack ?(chunk = 0x8000) map idx get =
             store ~sha1:(hash_of_object kind length raw) enc (kind, length, raw);
             loop offset (P.next_object t)
           | Error exn ->
-            Format.eprintf "Delta error: %a\n%!" D.pp_error exn;
-            assert false
+            Error (`Delta_error exn)
         in
 
         undelta hunks (P.offset t)
@@ -205,16 +209,35 @@ let bs_map filename =
   let m = Bigarray.Array1.map_file i Bigarray.Char Bigarray.c_layout false (-1) in
   B.from_bigstring m
 
+module Result =
+struct
+  let ( >>| ) x f =
+    match x with Ok x -> Ok (f x) | Error exn -> Error exn
+
+  let ( >>! ) x f =
+    match x with Ok x -> Ok x | Error exn -> Error (f exn)
+end
+
+type error = [ `Pack_error of P.error
+             | `Delta_error of D.error
+             | `Index_error of RAI.error
+             | `File_error of exn ]
+
+let index_err exn = `Index_error exn
+
 let () =
   let pp = bs_map Sys.argv.(1) in
   let ii = bs_map Sys.argv.(2) in
 
-  let () =
-    match RAI.make ii with
-    | Ok t ->
-      unpack pp t (fun hash -> RAI.find t hash)
-    | Error exn ->
-      Format.eprintf "%a\n%!" RAI.pp_error exn
-  in
-
-  Format.printf "End of parsing\n%!"
+  match Result.(RAI.make ii
+                >>! index_err
+                >>| fun t -> unpack pp (fun hash -> RAI.find t hash)) with
+  | Ok hash -> ()
+  | Error (`Pack_error exn) ->
+    Format.eprintf "pack error: %a\n%!" P.pp_error exn
+  | Error (`Delta_error exn) ->
+    Format.eprintf "delta error: %a\n%!" D.pp_error exn
+  | Error (`Index_error exn) ->
+    Format.eprintf "index error: %a\n%!" RAI.pp_error exn
+  | Error (`File_error exn) ->
+    Format.eprintf "file error: %s\n%!" (Printexc.to_string exn)
