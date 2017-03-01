@@ -142,13 +142,14 @@ let schedule_vector t ?(off = 0) ~len buf =
   Dequeue.push_back t.sched Vec.{ off; len; buf; }
 
 let flush_buffer t =
-  let len = t.write_pos - t.sched_pos in
+  let len = t.write_pos in
 
   if len > 0
   then begin
-    let off = t.sched_pos in
-    t.sched_pos <- t.write_pos;
-    schedule_vector t ~off ~len (B.to_poly t.buffer);
+    schedule_vector t ~off:0 ~len (B.to_poly t.buffer);
+
+    t.write_pos <- 0;
+    t.buffer <- B.from ~proof:t.buffer (B.length t.buffer);
   end
 
 let flush t f =
@@ -199,11 +200,7 @@ let schedule =
 
 let ensure t len =
   if available t < len
-  then begin
-    flush_buffer t;
-    t.buffer <- B.from ~proof:t.buffer (B.length t.buffer);
-    t.write_pos <- 0
-  end
+  then flush_buffer t
 
 let write_gen t ~blit ~length ?(off = 0) ?len a =
   writable t;
