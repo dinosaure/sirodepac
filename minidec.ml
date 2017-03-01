@@ -309,7 +309,7 @@ let fix f =
     Lazy.(force o).f i p c s fail succ }
   in r
 
-let option x p = p <|> x
+let option p x = p <|> x
 
 let many p =
   fix (fun m -> (lift2 (fun x r -> x :: r) p m) <|> return [])
