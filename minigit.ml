@@ -319,7 +319,7 @@ struct
     ; name : string
     ; node : 'a. 'a Hash.t }
   and perm =
-    [ `Normal | `Exec | `Link | `Dir | `Commit ]
+    [ `Normal | `Everybody | `Exec | `Link | `Dir | `Commit ]
   and t = entry list
 
   let pp_entry fmt { perm
@@ -330,6 +330,7 @@ struct
                                  node = %a;@] }"
       (match perm with
        | `Normal -> "normal"
+       | `Everybody -> "everybody"
        | `Exec -> "exec"
        | `Link -> "link"
        | `Dir -> "dir"
@@ -352,6 +353,7 @@ struct
     let perm_of_string = function
       | "44"
       | "100644" -> `Normal
+      | "100664" -> `Everybody
       | "100755" -> `Exec
       | "120000" -> `Link
       | "40000"  -> `Dir
@@ -392,7 +394,7 @@ struct
         (try return (perm_of_string perm)
          with _ -> fail (Invalid_perm perm))
         <* commit
-      >>= fun perm -> skip 1 *> take_while is_not_nl >>| decode <* commit
+      >>= fun perm -> skip 1 *> take_while is_not_nl <* commit
       >>= fun name -> skip 1 *> hash <* commit
       >>= fun hash ->
         return { perm
@@ -414,11 +416,12 @@ struct
     let nl = Minifor.Const.char '\x00'
 
     let string_of_perm = function
-      | `Normal -> "100644"
-      | `Exec   -> "100755"
-      | `Link   -> "120000"
-      | `Dir    -> "40000"
-      | `Commit -> "160000"
+      | `Normal    -> "100644"
+      | `Everybody -> "100664"
+      | `Exec      -> "100755"
+      | `Link      -> "120000"
+      | `Dir       -> "40000"
+      | `Commit    -> "160000"
 
     let escaped_characters =
       [ '\x42'; '\x00'; '\x2f' ]
@@ -460,7 +463,11 @@ struct
 
       eval encoder fmt
         (string_of_perm t.perm)
-        (encode t.name)
+        t.name (* XXX(dinosaure): in ocaml-git, we need to escape the byte
+                                  '\x42' but I don't find any process like that
+                                  in git and if I escape like ocaml-git, the
+                                  SHA1 is different.
+                *)
         t.node
 
     let write_tree encoder t =
@@ -490,7 +497,7 @@ struct
     { obj     : 'a. 'a Hash.t
     ; kind    : kind
     ; tag     : string
-    ; tagger  : User.t
+    ; tagger  : User.t option
     ; message : string }
   and kind = Blob | Commit | Tag | Tree
 
@@ -513,7 +520,7 @@ struct
       Hash.pp obj
       pp_kind kind
       tag
-      User.pp tagger
+      (pp_option User.pp) tagger
       Format.pp_print_text message
 
   module Decoder =
@@ -553,7 +560,9 @@ struct
                         <* commit
       >>= fun kind   -> binding ~key:"tag" ~value:(take_while is_not_lf)
                         <* commit
-      >>= fun tag    -> binding ~key:"tagger" ~value:User.Decoder.user
+      >>= fun tag    -> (option (binding ~key:"tagger" ~value:User.Decoder.user
+                                 >>| fun user -> Some user)
+                                (return None))
                         <* commit
       >>= fun tagger -> skip 1 *> commit *>
         return { obj = Hash.from_pp ~sentinel:(sentinel_from_kind kind) obj
@@ -566,10 +575,8 @@ struct
     let to_result i =
       match Minidec.to_result i tag with
       | Ok (v, p) ->
-        if B.length i - p > 0
-        then let msg = B.to_string @@ B.sub i p (B.length i - p - 1) in
-             Ok { v with message = msg }
-        else Ok v
+        let msg = B.to_string @@ B.sub i p (B.length i - p) in
+        Ok { v with message = msg }
       | Error (exn, _) -> Error exn
   end
 
@@ -588,11 +595,19 @@ struct
       let open Minifor in
       let open Minifor.Infix in
 
+      let write_user_option encoder = function
+        | Some user ->
+          Minienc.write_string encoder "tagger ";
+          User.Encoder.write_user encoder user;
+          Minienc.write_char encoder '\x0a'
+        | None -> ()
+      in
+
       let tag =
         (Const.string "object") ** sp ** string **! lf **
         (Const.string "type") ** sp ** string **! lf **
         (Const.string "tag") ** sp ** string **! lf **
-        (Const.string "tagger") ** sp ** User.Encoder.write_user **= lf **
+        write_user_option **= lf **
         string **! nil
       in
 

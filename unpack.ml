@@ -1003,6 +1003,63 @@ struct
     loop t
 end
 
+module Window =
+struct
+  type 'a t =
+    { rpos   : int
+    ; wpos   : int
+    ; size   : int
+    ; buffer : 'a B.t }
+
+  let make_by ~proof size =
+    { rpos = 0
+    ; wpos = 0
+    ; size = size + 1
+    ; buffer = B.from ~proof (size + 1) }
+
+  let available_to_write { wpos; rpos; size; _ } =
+    if wpos >= rpos then size - (wpos - rpos) - 1
+    else rpos - wpos - 1
+
+  let drop n ({ rpos; size; _ } as t) =
+    { t with rpos = if rpos + n < size then rpos + n
+                    else rpos + n - size }
+
+  let move n ({ wpos; size; _ } as t) =
+    { t with wpos = if wpos + n < size then wpos + n
+                    else wpos + n - size }
+
+  let write buf off len t =
+    let t = if len > available_to_write t
+            then drop (len - (available_to_write t)) t
+            else t in
+
+    let pre = t.size - t.wpos in
+    let extra = len - pre in
+
+    if extra > 0 then begin
+      B.blit buf off t.buffer t.wpos pre;
+      B.blit buf (off + pre) t.buffer 0 extra;
+    end else
+      B.blit buf off t.buffer t.wpos len;
+
+    move len t
+
+  let blit t off dst dst_off len =
+    let off = if t.wpos - off < 0
+              then t.wpos - off + t.size
+              else t.wpos - off in
+
+    let pre = t.size - off in
+    let extra = len - pre in
+
+    if extra > 0 then begin
+      B.blit t.buffer off dst dst_off pre;
+      B.blit t.buffer 0 dst (dst_off + pre) extra
+    end else
+      B.blit t.buffer off dst dst_off len
+end
+
 (* Implementatioon of deserialization of a PACK file *)
 module P =
 struct
@@ -1447,7 +1504,7 @@ struct
      @@ version)
     src t
 
-  let default ~proof ?(chunk = 4096) z_tmp z_win h_tmp =
+  let default ~proof ?(chunk = 4096) ?window z_tmp z_win h_tmp =
     { i_off   = 0
     ; i_pos   = 0
     ; i_len   = 0
@@ -1468,15 +1525,15 @@ struct
     in
     loop 1 (vl lsr 4) (* avoid type and msb *)
 
-  let from_hunks (type a) ~(proof:a B.t) hunks offset z_tmp z_win h_tmp =
-    { i_off   = Int64.to_int offset (* TODO: [i_off] is an int64? *)
+  let from_absolute_offset (type a) ~(proof:a B.t) src_offset pack_offset z_tmp z_win h_tmp =
+    { i_off   = src_offset
     ; i_pos   = 0
     ; i_len   = 0
     ; local   = true
     ; o_z     = z_tmp
     ; o_w     = z_win
     ; o_h     = h_tmp
-    ; read    = offset (* from_hunks used with a map of pack-file *)
+    ; read    = pack_offset
     ; version = 0l
     ; objects = 1l
     ; counter = 1l
@@ -1579,63 +1636,6 @@ struct
     loop t
 end
 
-module Window =
-struct
-  type 'a t =
-    { rpos   : int
-    ; wpos   : int
-    ; size   : int
-    ; buffer : 'a B.t }
-
-  let make_by ~proof size =
-    { rpos = 0
-    ; wpos = 0
-    ; size = size + 1
-    ; buffer = B.from ~proof (size + 1) }
-
-  let available_to_write { wpos; rpos; size; _ } =
-    if wpos >= rpos then size - (wpos - rpos) - 1
-    else rpos - wpos - 1
-
-  let drop n ({ rpos; size; _ } as t) =
-    { t with rpos = if rpos + n < size then rpos + n
-                    else rpos + n - size }
-
-  let move n ({ wpos; size; _ } as t) =
-    { t with wpos = if wpos + n < size then wpos + n
-                    else wpos + n - size }
-
-  let write buf off len t =
-    let t = if len > available_to_write t
-            then drop (len - (available_to_write t)) t
-            else t in
-
-    let pre = t.size - t.wpos in
-    let extra = len - pre in
-
-    if extra > 0 then begin
-      B.blit buf off t.buffer t.wpos pre;
-      B.blit buf (off + pre) t.buffer 0 extra;
-    end else
-      B.blit buf off t.buffer t.wpos len;
-
-    move len t
-
-  let blit t off dst dst_off len =
-    let off = if t.wpos - off < 0
-              then t.wpos - off + t.size
-              else t.wpos - off in
-
-    let pre = t.size - off in
-    let extra = len - pre in
-
-    if extra > 0 then begin
-      B.blit t.buffer off dst dst_off pre;
-      B.blit t.buffer 0 dst (dst_off + pre) extra
-    end else
-      B.blit t.buffer off dst dst_off len
-end
-
 module D =
 struct
   type error = ..
@@ -1715,35 +1715,123 @@ struct
                    ; consumed = base.consumed }
       else Error (Invalid_target (target_length, hunks.H.target_length))
 
+  (* XXX(dinosaure): en français. La déserialization d'un fichier PACK se
+                     découpe en plusieurs étapes:
+
+                     1 PACK file (header + checksum)
+                     2 Inflate (Decompress)
+                     3 Git Object + Hunks
+                     4 Git Object
+
+                     De l'étape 1 à 3, le module {!P} suffit et on est bien face
+                     à une interface *non-blocking* (dans le sens où nous avons
+                     un état que vous pouvez arrêter et reprendre plus tard sans
+                     perdre aucune information - il n'y a donc aucun prérequis
+                     dans la taille de l'input). Malheureusement, pour passer à
+                     l'étape 4, nous devons *peut-être* traiter une information
+                     qui est apparu dans le flux (utilisé par {!P}) et qui est
+                     désormais indisponible.
+
+                     Cette fonction [delta] correspond exactement à cette
+                     quatrième étape. Comme on peut le voir dans le code, on y
+                     obtient un [offset] absolue dans un fichier PACK donné.
+                     Ainsi, nous devons travailler sur un flux correspondant à
+                     cette offset.
+
+                     Imaginons un objet [Hunks] qui fait référence à un objet
+                     Git qui ce trouve [N] bytes avant. Imaginons ensuite que
+                     vous déserializer le fichier PACK à l'aide d'un input dont
+                     la taille est de [M] bytes. Enfin, imaginons que [N > M],
+                     dans ce cas, l'objet auquel fait référence le [Hunks]
+                     n'est plus disponible dans votre input.
+
+                     Ainsi, la fonction [delta] demande (pour l'instant), à ce
+                     que votre fichier PACK soit mappé (et donc que l'entièreté
+                     de son contenu soit disponible). Le premier problème est:
+                     il n'est plus nécessaire de se forcer d'avoir une interface
+                     *non-blocking* puisque tout le contenu du fichier PACK est
+                     disponible. Mais le deuxième problème est plus
+                     problématique et on peut le dénoter dans le code. En effet,
+                     l'offset qu'on peut obtenir (qui correspond à un offset
+                     relatif ou absolue - mais particulièrement absolue) tient
+                     sur un entier 64 bits. Et OCaml ne peut pas traiter un
+                     fichier aussi gros (puisqu'on travaille, pour une
+                     architecture 64 bits, avec des entiers 63 bits - voir les
+                     fonctions {!get} et {!blit}).
+
+                     Alors comment résoudre la problématique ? Doit on oubier
+                     l'existence (très rare, voir innexistante) d'un énorme
+                     fichier PACK où un offset tenant sur un entier 64 bits est
+                     nécessaire ? Pour l'instant, c'est le cas.
+
+                     Maintenant, j'ai regardé comment Git fonctionne sur ce
+                     sujet et j'ai remarqué l'existence de *window* permettant
+                     de:
+                       1. ne pas être obliger de mapper la totalité le fichier
+                       mais seulement [1024 * 1024] bytes
+                       2. travailler sur ces windows lorsqu'on a un offset
+                       relatif ou absolute (en espérant que celui-ci soit
+                       disponible - pour le coup, la documentation de Git est
+                       très ... pas documenté)
+
+                     Après, ce ne sont pas réellement des windows (comme on peut
+                     le retrouver dans Decompress où il s'agit de garder une
+                     partie de l'input) mais plutôt un système de cache - pour
+                     preuve, la définition de ces windows est dans [cache.h].
+                     Git va tout simplement garder plusieurs windows où chacunes
+                     est associées à un fichier PACK (spécifiquement à son [file
+                     descriptor]) et un offset dans ce fichier PACK. Il utilise
+                     l'algorithme par comptage de référence pour faire office de
+                     *garbage collector* auprès de ces windows. Enfin, dès qu'il
+                     souhaite obtenir un objet Git par le biais d'une référence
+                     absolue ou relative, il regarde son lot de windows pour
+                     savoir si l'offset s'y retrouve.
+
+                     Dans le cas où il trouve une window, il informe qu'il faut
+                     garder la window (en incrémentant le nombre de référence)
+                     et donne le contenu de la window. La déserialization
+                     travaille désormais sur ce flux limité à [1024 * 1024]
+                     bytes et on peut y déserializer l'objet.
+
+                     Dans le cas où il ne trouve pas la window, il cherche le
+                     fichier PACK associé et créer une nouvelle window de [1024
+                     * 1024] bytes qui résultera d'un simple [map] à l'offset
+                     absolue renseigné (paddé sur 1024) du [file descriptor] du
+                     fichier PACK file.
+
+                     Cela correspond plus donc à un système de cache qu'une
+                     window que l'on pourrait utiliser tout au long de la
+                     déserialization pour construire les objets [Hunks].
+
+                     DONC, le constat est qu'on a toujours ce problème avec les
+                     [Int64.t] et [nativeint] dans ce code. Le système de cache
+                     pourrait résoudre le problème (puisqu'on travaillerrait
+                     plus qu'avec des *chunks* de [1024 * 1024] bytes) mais il
+                     me semble qu'il soit hors de propos dans la déserialization
+                     d'un fichier PACK. De plus, l'attitude de Git par rapport à
+                     ses objets est plutôt [lazy] dans le sens où la
+                     construction de ces objets se fait à la demande (alors que
+                     ici, elle peut se faire directement après qu'on est lu
+                     l'objet - cela n'empêche pas d'adopter une manière [lazy]
+                     avec cette interface, mais il faut créer le système de
+                     cache autour de cette déserialization et c'est dans ce sens
+                     que ce dernier est hors de propos).
+
+                     Bref, je laisse ce commentaire pour m'en souvenir déjà et
+                     pour les autres pour comprendre la problématique.
+  *)
   let delta { map_pck; fun_idx; } hunks offset z_tmp z_win h_tmp =
-      (* TODO(dinosaure): same as [from_hunks], a pack file can be huge (up than
-                          a size stored in an int31/int32 variable). We need to
-                          move all to int64 (but, afterwards, it's about
-                          performance).
-
-                          It's about the compatibility between a 32-bit and a
-                          64-bit processor. We need to think about that.
-
-                          Another note, it's about decompress. Indeed, this
-                          library don't care about that and can compute only a
-                          [Sys.max_string_length] data (as a chunk) - that means
-                          decompress can compute a big file chunked by
-                          [Sys.max_string_length]. We need to report this
-                          constraint to the deserializer firstly but permit to
-                          compute a big file with and move all offset to an
-                          int64 variable. LOL!
-      *)
-      let offset = match hunks.H.reference with
+      let absolute_offset = match hunks.H.reference with
         | H.Offset off -> Ok (Int64.sub offset off)
         | H.Hash hash -> match fun_idx hash with
           | Some off -> Ok off
           | None -> Error (Invalid_hash hash)
       in
 
-      match offset with
-      | Ok offset ->
+      match absolute_offset with
+      | Ok absolute_offset ->
         let chunk    = 0x8000 in
-        let t        = P.from_hunks ~proof:map_pck hunks offset z_tmp z_win h_tmp in
+        let t        = P.from_absolute_offset ~proof:map_pck (Int64.to_int offset) offset z_tmp z_win h_tmp in
         let base_raw = B.from ~proof:map_pck hunks.H.source_length in
 
         let rec loop offset' result kind t =
@@ -1752,16 +1840,6 @@ struct
             let chunk' = min (Int64.to_int (Int64.sub (Int64.of_int (B.length map_pck)) offset')) chunk in
             if chunk' > 0
             then loop (Int64.add offset' (Int64.of_int chunk')) result kind (P.refill (Int64.to_int offset') chunk' t)
-                 (* XXX(dinosaure): [P.refill] must be accept only a int but we
-                                    send a int64. It's because we work on a mapped
-                                    pack file but we must need to work on a
-                                    non-blocking flow (we are lucky, it's only
-                                    when we try to undelta... an object).
-
-                                    So we need to compute on the flow and not on
-                                    the mapped pack file as the [module P]. For a
-                                    big pack-file it's may be a problem.
-                 *)
             else Error (Invalid_source offset)
           | `Flush t ->
             let o, n = P.output t in
