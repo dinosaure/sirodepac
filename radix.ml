@@ -131,3 +131,16 @@ let lookup tree key =
   | Some tree ->
     let keylen = String.length key in
     lookup key 0 keylen tree
+
+let rec fold f acc tree = match tree with
+  | L (k, v) -> f (k, v) acc
+  | T (m, k, v) ->
+    let acc' = f (k, v) acc in
+    fold f acc' m
+  | B (l, r, i, b) ->
+    let acc' = fold f acc l in
+    fold f acc' r
+
+let fold f acc = function
+  | None -> acc
+  | Some tree -> fold f acc tree
