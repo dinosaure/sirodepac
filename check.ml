@@ -153,14 +153,16 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
       (Minigit.Hash.to_pp hash);
     assert false
   | Some offset' ->
+    (*
     if offset <> offset'
     then begin
       Format.eprintf "Offset of the object %s (%Ld) does not correspond with \
-                      the IDX file (%Ld)"
+                      the IDX file (%Ld)\n%!"
         (Minigit.Hash.to_pp hash)
         offset offset';
       assert false
     end;
+    *)
 
     let real_length = match base with Some (_, _, x) -> x | None -> length in
 
@@ -291,7 +293,7 @@ let bs_map filename =
 
 type error = [ `Pack_error of P.error
              | `Delta_error of D.error
-             | `Index_error of RAI.error
+             | `Index_error of Idx.Lazy.error
              | `File_error of exn ]
 
 let index_err exn = `Index_error exn
@@ -300,15 +302,15 @@ let () =
   let pp = bs_map Sys.argv.(1) in (* alloc *)
   let ii = bs_map Sys.argv.(2) in (* alloc *)
 
-  match Result.(RAI.make ii
+  match Result.(Idx.Lazy.make ii
                 >>! index_err
-                >>| (fun t -> unpack pp t (fun hash -> RAI.find t hash))) with
+                >>| (fun t -> unpack pp t (fun hash -> Idx.Lazy.find t hash))) with
   | Ok hash -> Format.printf "End of parsing\n%!"
   | Error (`Pack_error exn) ->
     Format.eprintf "pack error: %a\n%!" P.pp_error exn
   | Error (`Delta_error exn) ->
     Format.eprintf "delta error: %a\n%!" D.pp_error exn
   | Error (`Index_error exn) ->
-    Format.eprintf "index error: %a\n%!" RAI.pp_error exn
+    Format.eprintf "index error: %a\n%!" Idx.Lazy.pp_error exn
   | Error (`File_error exn) ->
     Format.eprintf "file error: %s\n%!" (Printexc.to_string exn)
