@@ -144,8 +144,8 @@ struct
     | idx ->
       if has t.map (t.fanout_offset + (4 * idx)) 4
       && has t.map (t.fanout_offset + (4 * (idx - 1))) 4
-      then let off1 = Int32.to_int @@ swap32 @@ B.get_u32 t.map (t.fanout_offset + (4 * idx)) in
-           let off0 = Int32.to_int @@ swap32 @@ B.get_u32 t.map (t.fanout_offset + (4 * (idx - 1))) in
+      then let off1 = Int32.to_int @@ Endian.get_u32 t.map (t.fanout_offset + (4 * idx)) in
+           let off0 = Int32.to_int @@ Endian.get_u32 t.map (t.fanout_offset + (4 * (idx - 1))) in
 
            if has t.map (t.hashes_offset + (off0 * 20)) ((off1 - off0) * 20)
            then Ok (binary_search (B.sub t.map (t.hashes_offset + (off0 * 20)) ((off1 - off0) * 20)) hash + off0)
@@ -163,7 +163,7 @@ struct
     | None ->
       match fanout_idx t hash with
       | Ok idx ->
-        let off = swap32 @@ B.get_u32 t.map (t.values_offset + (idx * 4)) in
+        let off = Endian.get_u32 t.map (t.values_offset + (idx * 4)) in
         Some (Int64.of_int32 off)
       | Error _ -> None
 end
