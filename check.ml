@@ -147,13 +147,21 @@ let hash_of_encoder encoder =
 let encoder_tmp = B.from B.proof_bigstring 0x8000
 let encoder = Minienc.from encoder_tmp
 
+(* check the offset provided by the deserialization of the PACK file with the
+     offset from the IDX file (lazy implementation).
+   check the decoding (from the PACK file) and the encoding (see Minigit and
+     dual) of the Git object and produce an encoder object (which contains the
+     Git object).
+   check the hash produced by the result of the encoding (see hash_of_encoder)
+     and compare with the hash provided by the parsing of the PACK file.
+   print the result.
+*)
 let check hash kind raw length consumed offset ?base getter = match getter hash with
   | None ->
     Format.eprintf "Object %s not found\n%!"
       (Minigit.Hash.to_pp hash);
     assert false
   | Some offset' ->
-    (*
     if offset <> offset'
     then begin
       Format.eprintf "Offset of the object %s (%Ld) does not correspond with \
@@ -162,7 +170,6 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
         offset offset';
       assert false
     end;
-    *)
 
     let real_length = match base with Some (_, _, x) -> x | None -> length in
 
@@ -293,24 +300,68 @@ let bs_map filename =
 
 type error = [ `Pack_error of P.error
              | `Delta_error of D.error
-             | `Index_error of Idx.Lazy.error
+             | `Lazy_index_error of Idx.Lazy.error
+             | `Index_error of Idx.Decoder.error
+             | `Implementation_index_error
              | `File_error of exn ]
 
-let index_err exn = `Index_error exn
+let lazy_index_err exn = `Lazy_index_error exn
+let dual_index_err ()  = `Dual_index_error
+
+exception Break
+
+(* check the parsing of the non-blocking deserialization of the IDX file.
+   check the value of each hash from the lazy implementation with the
+     non-blocking implementation.
+*)
+let check_idx_implementation map rai =
+  let pos = ref 0 in
+  let len = B.length map in
+
+  let refiller buffer =
+    let n = min (len - !pos) (B.length buffer) in
+    B.blit map !pos buffer 0 n;
+    pos := !pos + n;
+    n
+  in
+
+  let getter hash = Idx.Lazy.find rai hash in
+
+  match Idx.idx_to_tree refiller with
+  | Error exn -> Error (`Index_error exn)
+  | Ok tree ->
+    try let () = Radix.fold (fun (key, value) () ->
+      match getter key with
+      | None -> raise Break
+      | Some value' ->
+        if value <> value'
+        then raise Break
+        else ()) () tree
+        in Ok rai
+    with Break -> Error `Implementation_index_error
 
 let () =
   let pp = bs_map Sys.argv.(1) in (* alloc *)
   let ii = bs_map Sys.argv.(2) in (* alloc *)
 
+  (* check the lazy implementation of the IDX file.
+     check the non-blocking deserialization of the IDX file.
+     check the non-blocking deserialization of the PACK file.
+   *)
   match Result.(Idx.Lazy.make ii
-                >>! index_err
+                >>! lazy_index_err
+                >>= check_idx_implementation ii
                 >>| (fun t -> unpack pp t (fun hash -> Idx.Lazy.find t hash))) with
   | Ok hash -> Format.printf "End of parsing\n%!"
   | Error (`Pack_error exn) ->
     Format.eprintf "pack error: %a\n%!" P.pp_error exn
   | Error (`Delta_error exn) ->
     Format.eprintf "delta error: %a\n%!" D.pp_error exn
+  | Error (`Lazy_index_error exn) ->
+    Format.eprintf "lazy index error: %a\n%!" Idx.Lazy.pp_error exn
   | Error (`Index_error exn) ->
-    Format.eprintf "index error: %a\n%!" Idx.Lazy.pp_error exn
+    Format.eprintf "index error: %a\n%!" Idx.Decoder.pp_error exn
+  | Error `Implementation_index_error ->
+    Format.eprintf "implementation index error\n%!"
   | Error (`File_error exn) ->
     Format.eprintf "file error: %s\n%!" (Printexc.to_string exn)
