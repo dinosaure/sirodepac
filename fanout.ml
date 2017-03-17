@@ -11,8 +11,7 @@ let merge lst key value =
 
 let bind key value { fanout } =
   let idx = Char.code key.[0] in
-  Array.set fanout idx (merge (Array.get fanout idx) key value);
-  { fanout }
+  Array.set fanout idx (merge (Array.get fanout idx) key value)
 
 let length idx { fanout } =
   if idx < 256

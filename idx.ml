@@ -119,6 +119,10 @@ struct
     with ReturnT -> true
        | ReturnF -> false
 
+  (* XXX(dinosaure): keep in your mind, it's important to implement this
+                     function in the tail-rec way. We can use the [@@tailcall]
+                     annotation...
+   *)
   let binary_search buf hash =
     let rec aux off len buf =
       if len = 20
@@ -516,17 +520,22 @@ struct
     ; boffsets : int64 array
     ; state    : 'o state }
   and 'o state =
-    | Header  of ('o B.t -> 'o t -> 'o res)
-    | Fanout  of ('o B.t -> 'o t -> 'o res)
-    | Hashes  of ('o B.t -> 'o t -> 'o res)
-    | Crcs    of ('o B.t -> 'o t -> 'o res)
-    | Offsets of ('o B.t -> 'o t -> 'o res)
+    | Header     of ('o B.t -> 'o t -> 'o res)
+    | Fanout     of ('o B.t -> 'o t -> 'o res)
+    | Hashes     of ('o B.t -> 'o t -> 'o res)
+    | Crcs       of ('o B.t -> 'o t -> 'o res)
+    | Offsets    of ('o B.t -> 'o t -> 'o res)
     | BigOffsets of ('o B.t -> 'o t -> 'o res)
   and 'o res =
     | Error  of 'o t * error
     | Flush  of 'o t
     | Cont   of 'o t
     | Ok     of 'o t
+
+  (* XXX(dinosaure): the state contains only a closure. May be we can optimize
+                     the serialization with an hot loop (like Decompress). But
+                     the first goal is to work!
+   *)
 
   module Int32 =
   struct
@@ -548,6 +557,10 @@ struct
         k dst { t with o_pos = t.o_pos + 1 }
       end else Flush { t with state = Header (put_byte chr k) }
 
+    (* XXX(dinosaure): we can abstract the constructor of the state and provide
+                       only one implementation of [put_int32] for all [K*]
+                       modules.
+     *)
     let rec put_int32 integer k dst t =
       if (t.o_len - t.o_pos) >= 4
       then begin
@@ -781,6 +794,31 @@ struct
      @@ KHeader.put_byte '\099'
      @@ KHeader.put_int32 2l
      @@ fun dst t -> Cont t)
+    dst t
+
+  type 'a sequence = ('a -> unit) -> unit
+
+  let default : (string * (int32 * int64)) sequence -> 'o t = fun seq ->
+
+    let boffsets = ref [] in
+    let table    = Fanout.make () in
+    let f (hash, (crc, offset)) =
+      if is_big_offset offset
+      then let idx = Int64.of_int (List.length !boffsets) in
+           boffsets := offset :: !boffsets;
+           Fanout.bind hash (crc, idx) table
+      else Fanout.bind hash (crc, offset) table
+    in
+
+    (* make the table and the big offsets table to ensure the order. *)
+    let () = seq f in
+
+    { o_off = 0
+    ; o_pos = 0
+    ; o_len = 0
+    ; table
+    ; boffsets = Array.of_list (List.rev !boffsets)
+    ; state = Header header }
 end
 
 let idx_to_tree refiller =
