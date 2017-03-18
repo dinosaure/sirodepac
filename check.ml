@@ -301,12 +301,34 @@ let bs_map filename =
 type error = [ `Pack_error of P.error
              | `Delta_error of D.error
              | `Lazy_index_error of Idx.Lazy.error
-             | `Index_error of Idx.Decoder.error
+             | `Decoder_index_error of Idx.Decoder.error
+             | `Encoder_index_error of Idx.Encoder.error
              | `Implementation_index_error
              | `File_error of exn ]
 
+let encoder_index_err exn = `Encoder_index_error exn
 let lazy_index_err exn = `Lazy_index_error exn
 let dual_index_err ()  = `Dual_index_error
+
+let serialize_idx_file tree =
+  let state  = Idx.Encoder.default (Radix.to_sequence tree) in
+  let output = Bytes.create 0x800 in
+  let result = BBuffer.create ~proof:B.proof_bytes 0x800 in
+
+  let rec loop t = match Idx.Encoder.eval (B.from_bytes output) t with
+    | `Flush t ->
+      let len = Idx.Encoder.used_out t in
+      BBuffer.add_bytes output ~off:0 ~len result;
+      loop (Idx.Encoder.flush 0 0x800 t)
+    | `End t ->
+      if Idx.Encoder.used_out t <> 0
+      then BBuffer.add_bytes output ~off:0 ~len:(Idx.Encoder.used_out t) result;
+
+      Ok (B.to_string @@ BBuffer.contents result)
+    | `Error (t, exn) -> Error exn
+  in
+
+  loop state
 
 exception Break
 
@@ -314,35 +336,60 @@ exception Break
    check the value of each hash from the lazy implementation with the
      non-blocking implementation.
 *)
-let check_idx_implementation map rai =
-  let pos = ref 0 in
-  let len = B.length map in
-
-  let refiller buffer =
-    let n = min (len - !pos) (B.length buffer) in
-    B.blit map !pos buffer 0 n;
-    pos := !pos + n;
-    n
-  in
-
+let check_idx_implementation refiller rai =
   let getter hash = Idx.Lazy.find rai hash in
 
   match Idx.idx_to_tree refiller with
-  | Error exn -> Error (`Index_error exn)
+  | Error exn -> Error (`Decoder_index_error exn)
   | Ok tree ->
-    try let () = Radix.fold (fun (key, value) () ->
-      match getter key with
-      | None -> raise Break
-      | Some value' ->
-        if value <> value'
-        then raise Break
-        else ()) () tree
-        in Ok rai
+    try let () = Radix.fold (fun (key, (_, value)) () -> match getter key with
+                             | None -> raise Break
+                             | Some value' ->
+                               if value <> value'
+                               then raise Break
+                               else ())
+                 () tree
+        in Ok (tree, rai)
     with Break -> Error `Implementation_index_error
+
+let dual_idx (tree, rai) =
+  let open Result in
+
+  serialize_idx_file tree
+  >>! encoder_index_err
+  >>= fun map ->
+
+  let oc = open_out "check.idx" in
+  output_string oc map;
+  close_out oc;
+
+  let refiller bytes =
+    let pos = ref 0 in
+    let len = String.length bytes in
+
+    fun buffer ->
+      let n = min (len - !pos) (B.length buffer) in
+      B.blit_string bytes !pos buffer 0 n;
+      pos := !pos + n;
+      n
+  in
+
+  check_idx_implementation (refiller map) rai
 
 let () =
   let pp = bs_map Sys.argv.(1) in (* alloc *)
   let ii = bs_map Sys.argv.(2) in (* alloc *)
+
+  let refiller map =
+    let pos = ref 0 in
+    let len = B.length map in
+
+    fun buffer ->
+      let n = min (len - !pos) (B.length buffer) in
+      B.blit map !pos buffer 0 n;
+      pos := !pos + n;
+      n
+  in
 
   (* check the lazy implementation of the IDX file.
      check the non-blocking deserialization of the IDX file.
@@ -350,8 +397,10 @@ let () =
    *)
   match Result.(Idx.Lazy.make ii
                 >>! lazy_index_err
-                >>= check_idx_implementation ii
-                >>| (fun t -> unpack pp t (fun hash -> Idx.Lazy.find t hash))) with
+                >>= check_idx_implementation (refiller ii)
+                >>= dual_idx
+                >>| snd (* take the lazy implementation *)
+                >>| (fun rai -> unpack pp rai (fun hash -> Idx.Lazy.find rai hash))) with
   | Ok hash -> Format.printf "End of parsing\n%!"
   | Error (`Pack_error exn) ->
     Format.eprintf "pack error: %a\n%!" P.pp_error exn
@@ -359,8 +408,10 @@ let () =
     Format.eprintf "delta error: %a\n%!" D.pp_error exn
   | Error (`Lazy_index_error exn) ->
     Format.eprintf "lazy index error: %a\n%!" Idx.Lazy.pp_error exn
-  | Error (`Index_error exn) ->
+  | Error (`Decoder_index_error exn) ->
     Format.eprintf "index error: %a\n%!" Idx.Decoder.pp_error exn
+  | Error (`Encoder_index_error exn) ->
+    Format.eprintf "index error: %a\n%!" Idx.Encoder.pp_error exn
   | Error `Implementation_index_error ->
     Format.eprintf "implementation index error\n%!"
   | Error (`File_error exn) ->

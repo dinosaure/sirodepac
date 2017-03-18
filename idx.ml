@@ -217,23 +217,23 @@ struct
   let ok t        = Ok { t with state = End }
 
   let to_int32 b0 b1 b2 b3 =
-    let (<<) = Int32.shift_left in
-    let (||) = Int32.logor in
+    let ( << ) = Int32.shift_left in (* >> *)
+    let ( || ) = Int32.logor in
     (Int32.of_int b0 << 24)
     || (Int32.of_int b1 << 16)
     || (Int32.of_int b2 << 8)
     || (Int32.of_int b3)
 
   let to_int64 b0 b1 b2 b3 b4 b5 b6 b7 =
-    let (<<) = Int64.shift_left in
-    let (||) = Int64.logor in
+    let ( << ) = Int64.shift_left in (* >> *)
+    let ( || ) = Int64.logor in
     (Int64.of_int b0 << 56)
-    || (Int64.of_int b1 << 48)
-    || (Int64.of_int b2 << 40)
-    || (Int64.of_int b3 << 32)
-    || (Int64.of_int b4 << 24)
-    || (Int64.of_int b5 << 16)
-    || (Int64.of_int b6 << 8)
+    || (Int64.of_int b1 << 48) (* >> *)
+    || (Int64.of_int b2 << 40) (* >> *)
+    || (Int64.of_int b3 << 32) (* >> *)
+    || (Int64.of_int b4 << 24) (* >> *)
+    || (Int64.of_int b5 << 16) (* >> *)
+    || (Int64.of_int b6 << 8) (* >> *)
     || (Int64.of_int b7)
 
   module KHeader =
@@ -512,10 +512,14 @@ module Encoder =
 struct
   type error = ..
 
+  let pp_error fmt = function
+    | _ -> Format.fprintf fmt "<error>"
+
   type 'o t =
     { o_off    : int
     ; o_pos    : int
     ; o_len    : int
+    ; write    : int
     ; table    : (int32 * int64) Fanout.t
     ; boffsets : int64 array
     ; state    : 'o state }
@@ -526,6 +530,7 @@ struct
     | Crcs       of ('o B.t -> 'o t -> 'o res)
     | Offsets    of ('o B.t -> 'o t -> 'o res)
     | BigOffsets of ('o B.t -> 'o t -> 'o res)
+    | End
   and 'o res =
     | Error  of 'o t * error
     | Flush  of 'o t
@@ -542,7 +547,7 @@ struct
     include Int32
 
     let ( >> ) = Int32.shift_right
-    let ( << ) = Int32.shift_left
+    let ( << ) = Int32.shift_left (* >> *)
     let ( && ) = Int32.logand
     let ( || ) = Int32.logor
     let ( ! )  = Int32.to_int
@@ -554,7 +559,8 @@ struct
       if (t.o_len - t.o_pos) > 0
       then begin
         B.set dst (t.o_off + t.o_pos) chr;
-        k dst { t with o_pos = t.o_pos + 1 }
+        k dst { t with o_pos = t.o_pos + 1
+                     ; write = t.write + 1 }
       end else Flush { t with state = Header (put_byte chr k) }
 
     (* XXX(dinosaure): we can abstract the constructor of the state and provide
@@ -565,7 +571,8 @@ struct
       if (t.o_len - t.o_pos) >= 4
       then begin
         Endian.set_u32 dst (t.o_off + t.o_pos) integer;
-        k dst { t with o_pos = t.o_pos + 4 }
+        k dst { t with o_pos = t.o_pos + 4
+                     ; write = t.write + 4 }
       end else if (t.o_len - t.o_pos) > 0
       then let i1 = Char.unsafe_chr @@ Int32.(! ((integer && 0xFF000000l) >> 24)) in
            let i2 = Char.unsafe_chr @@ Int32.(! ((integer && 0x00FF0000l) >> 16)) in
@@ -585,7 +592,7 @@ struct
     include Int64
 
     let ( >> ) = Int64.shift_right_logical
-    let ( << ) = Int64.shift_left
+    let ( << ) = Int64.shift_left (* >> *)
     let ( && ) = Int64.logand
     let ( || ) = Int64.logor
     let ( ! )  = Int64.to_int
@@ -597,14 +604,16 @@ struct
       if (t.o_len - t.o_pos) > 0
       then begin
         B.set dst (t.o_off + t.o_pos) chr;
-        k dst { t with o_pos = t.o_pos + 1 }
+        k dst { t with o_pos = t.o_pos + 1
+                     ; write = t.write + 1 }
       end else Flush { t with state = Fanout (put_byte chr k) }
 
     let rec put_int32 integer k dst t =
       if (t.o_len - t.o_pos) >= 4
       then begin
         Endian.set_u32 dst (t.o_off + t.o_pos) integer;
-        k dst { t with o_pos = t.o_pos + 4 }
+        k dst { t with o_pos = t.o_pos + 4
+                     ; write = t.write + 4 }
       end else if (t.o_len - t.o_pos) > 0
       then let i1 = Char.unsafe_chr @@ Int32.(! ((integer && 0xFF000000l) >> 24)) in
            let i2 = Char.unsafe_chr @@ Int32.(! ((integer && 0x00FF0000l) >> 16)) in
@@ -625,21 +634,24 @@ struct
       if (t.o_len - t.o_pos) > 0
       then begin
         B.set dst (t.o_off + t.o_pos) chr;
-        k dst { t with o_pos = t.o_pos + 1 }
+        k dst { t with o_pos = t.o_pos + 1
+                     ; write = t.write + 1 }
       end else Flush { t with state = Hashes (put_byte chr k) }
 
     let rec put_hash hash k dst t =
       if (t.o_len - t.o_pos) >= 20
       then begin
         B.blit_string hash 0 dst (t.o_off + t.o_pos) 20;
-        k dst { t with o_pos = t.o_pos + 20 }
+        k dst { t with o_pos = t.o_pos + 20
+                     ; write = t.write + 20 }
       end else if (t.o_len - t.o_pos) > 0
       then let rec aux rest hash k dst t =
-             if rest = 0
+             if rest <> 0
              then let n = min (t.o_len - t.o_pos) rest in
                   B.blit_string hash (20 - rest) dst (t.o_off + t.o_pos)  n;
                   Flush { t with state = Hashes (aux (rest - n) hash k)
-                               ; o_pos = t.o_pos + n }
+                               ; o_pos = t.o_pos + n
+                               ; write = t.write + n }
              else k dst t
            in aux 20 hash k dst t
       else Flush { t with state = Hashes (put_hash hash k) }
@@ -651,14 +663,16 @@ struct
       if (t.o_len - t.o_pos) > 0
       then begin
         B.set dst (t.o_off + t.o_pos) chr;
-        k dst { t with o_pos = t.o_pos + 1 }
+        k dst { t with o_pos = t.o_pos + 1
+                     ; write = t.write + 1 }
       end else Flush { t with state = Crcs (put_byte chr k) }
 
     let rec put_int32 integer k dst t =
       if (t.o_len - t.o_pos) >= 4
       then begin
         Endian.set_u32 dst (t.o_off + t.o_pos) integer;
-        k dst { t with o_pos = t.o_pos + 4 }
+        k dst { t with o_pos = t.o_pos + 4
+                     ; write = t.write + 4 }
       end else if (t.o_len - t.o_pos) > 0
       then let i1 = Char.unsafe_chr @@ Int32.(! ((integer && 0xFF000000l) >> 24)) in
            let i2 = Char.unsafe_chr @@ Int32.(! ((integer && 0x00FF0000l) >> 16)) in
@@ -679,14 +693,16 @@ struct
       if (t.o_len - t.o_pos) > 0
       then begin
         B.set dst (t.o_off + t.o_pos) chr;
-        k dst { t with o_pos = t.o_pos + 1 }
+        k dst { t with o_pos = t.o_pos + 1
+                     ; write = t.write + 1 }
       end else Flush { t with state = Offsets (put_byte chr k) }
 
     let rec put_int32 integer k dst t =
       if (t.o_len - t.o_pos) >= 4
       then begin
         Endian.set_u32 dst (t.o_off + t.o_pos) integer;
-        k dst { t with o_pos = t.o_pos + 4 }
+        k dst { t with o_pos = t.o_pos + 4
+                     ; write = t.write + 4 }
       end else if (t.o_len - t.o_pos) > 0
       then let i1 = Char.unsafe_chr @@ Int32.(! ((integer && 0xFF000000l) >> 24)) in
            let i2 = Char.unsafe_chr @@ Int32.(! ((integer && 0x00FF0000l) >> 16)) in
@@ -707,14 +723,16 @@ struct
       if (t.o_len - t.o_pos) > 0
       then begin
         B.set dst (t.o_off + t.o_pos) chr;
-        k dst { t with o_pos = t.o_pos + 1 }
+        k dst { t with o_pos = t.o_pos + 1
+                     ; write = t.write + 1 }
       end else Flush { t with state = BigOffsets (put_byte chr k) }
 
     let rec put_int64 integer k dst t =
       if (t.o_len - t.o_pos) >= 8
       then begin
         Endian.set_u64 dst (t.o_off + t.o_pos) integer;
-        k dst { t with o_pos = t.o_pos + 8 }
+        k dst { t with o_pos = t.o_pos + 8
+                     ; write = t.write + 8 }
       end else if (t.o_len - t.o_pos) > 0
       then let i1 = Char.unsafe_chr @@ Int64.(! ((integer && 0xFF00000000000000L) >> 56)) in
            let i2 = Char.unsafe_chr @@ Int64.(! ((integer && 0x00FF000000000000L) >> 48)) in
@@ -737,18 +755,20 @@ struct
       else Flush { t with state = BigOffsets (put_int64 integer k) }
   end
 
+  let ok t = Ok { t with state = End }
+
   let is_big_offset integer =
     Int64.(integer >> 31) <> 0L
 
   let rec boffsets idx dst t =
     if idx = Array.length t.boffsets
-    then Cont t
+    then ok t
     else KBOffsets.put_int64 (Array.get t.boffsets idx)
            (boffsets (idx + 1)) dst t
 
   let rec offsets idx idx_boffs dst t =
     if idx = 256
-    then Cont t
+    then Cont { t with state = BigOffsets (boffsets 0) }
     else let rec aux acc idx_boffs dst t = match acc with
            | [] -> Cont { t with state = Offsets (offsets (idx + 1) idx_boffs) }
            | (_, (_, off)) :: r ->
@@ -762,7 +782,7 @@ struct
 
   let rec crcs idx dst t =
     if idx = 256
-    then Cont t
+    then Cont { t with state = Offsets (offsets 0 0) }
     else let rec aux acc dst t = match acc with
            | [] -> Cont { t with state = Hashes (crcs (idx + 1)) }
            | (_, (crc, _)) :: r -> KCrcs.put_int32 crc (aux r) dst t
@@ -771,16 +791,18 @@ struct
 
   let rec hashes idx dst t =
     if idx = 256
-    then Cont t
+    then Cont { t with state = Crcs (crcs 0) }
     else let rec aux acc dst t = match acc with
            | [] -> Cont { t with state = Hashes (hashes (idx + 1)) }
-           | (hash, _) :: r -> KHashes.put_hash hash (aux r) dst t
+           | (hash, _) :: r ->
+             KHashes.put_hash hash (aux r) dst t
          in
          aux (Fanout.get idx t.table) dst t
 
   let rec fanout idx acc dst t =
     match idx with
-    | 256 -> Cont t
+    | 256 ->
+      Cont { t with state = Hashes (hashes 0) }
     | n ->
       let value = Int32.of_int (Fanout.length n t.table) in
       KFanout.put_int32 (Int32.add value acc)
@@ -793,10 +815,38 @@ struct
      @@ KHeader.put_byte '\079'
      @@ KHeader.put_byte '\099'
      @@ KHeader.put_int32 2l
-     @@ fun dst t -> Cont t)
+     @@ fun dst t -> Cont { t with state = Fanout (fanout 0 0l) })
     dst t
 
   type 'a sequence = ('a -> unit) -> unit
+
+  let flush off len t =
+    { t with o_off = off
+           ; o_len = len
+           ; o_pos = 0 }
+
+  let used_out t = t.o_pos
+
+  let eval dst t =
+    let eval0 t = match t.state with
+      | Header k     -> k dst t
+      | Fanout k     -> k dst t
+      | Hashes k     -> k dst t
+      | Crcs   k     -> k dst t
+      | Offsets k    -> k dst t
+      | BigOffsets k -> k dst t
+      | End -> ok t
+    in
+
+    let rec loop t =
+      match eval0 t with
+      | Cont t -> loop t
+      | Flush t -> `Flush t
+      | Ok t -> `End t
+      | Error (t, exn) -> `Error (t, exn)
+    in
+
+    loop t
 
   let default : (string * (int32 * int64)) sequence -> 'o t = fun seq ->
 
@@ -816,6 +866,7 @@ struct
     { o_off = 0
     ; o_pos = 0
     ; o_len = 0
+    ; write = 0
     ; table
     ; boffsets = Array.of_list (List.rev !boffsets)
     ; state = Header header }
@@ -831,7 +882,7 @@ let idx_to_tree refiller =
       loop tree t
     | `End t -> Ok tree
     | `Hash (t, (hash, crc, offset)) ->
-      loop (Radix.bind tree hash offset) t
+      loop (Radix.bind tree hash (crc, offset)) t
     | `Error (t, exn) -> Error exn
   in
 

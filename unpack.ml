@@ -7,6 +7,8 @@ module B : sig
      and type 'a t = 'a Decompress.B.t
 
   val to_cstruct : 'a t -> Cstruct.t
+  val blit_string : string -> int -> 'a t -> int -> int -> unit
+  val blit_bytes  : bytes -> int -> 'a t -> int -> int -> unit
 end = struct
   include Decompress.B
 
@@ -15,6 +17,14 @@ end = struct
     = function
     | Bytes v -> Cstruct.of_bytes v
     | Bigstring v -> Cstruct.of_bigarray v
+
+  let blit_string src src_off dst dst_off len =
+    for i = 0 to len - 1
+    do set dst (dst_off + i) (String.get src (src_off + i)) done
+
+  let blit_bytes src src_off dst dst_off len =
+    for i = 0 to len - 1
+    do set dst (dst_off + i) (Bytes.get src (src_off + i)) done
 end
 
 module BBuffer =
@@ -590,22 +600,22 @@ struct
       else await { t with state = Header (fun src t -> (get_byte[@tailcall]) k src t) }
 
     let swap n =
-      let (>>) = Int32.shift_right in
-      let (<<) = Int32.shift_left in
-      let (||) = Int32.logor in
+      let ( >> ) = Int32.shift_right in
+      let ( << ) = Int32.shift_left in (* >> *)
+      let ( || ) = Int32.logor in
       let ( & ) = Int32.logand in
 
       ((n >> 24) & 0xffl)
-      || ((n << 8) & 0xff0000l)
+      || ((n << 8) & 0xff0000l)    (* >> *)
       || ((n >> 8) & 0xff00l)
-      || ((n << 24) & 0xff000000l)
+      || ((n << 24) & 0xff000000l) (* >> *)
 
     let to_int32 b0 b1 b2 b3 =
-      let (<<) = Int32.shift_left in
-      let (||) = Int32.logor in
-      (Int32.of_int b0 << 24)
-      || (Int32.of_int b1 << 16)
-      || (Int32.of_int b2 << 8)
+      let ( << ) = Int32.shift_left in (* >> *)
+      let ( || ) = Int32.logor in
+      (Int32.of_int b0 << 24)    (* >> *)
+      || (Int32.of_int b1 << 16) (* >> *)
+      || (Int32.of_int b2 << 8)  (* >> *)
       || (Int32.of_int b3)
 
     let rec get_u32 k src t =
@@ -1051,7 +1061,6 @@ struct
   let is_hunk t = match P.kind t with
     | P.Hunk _ -> true
     | _ -> false
-
   let hash_of_object kind length =
     let hdr = Format.sprintf "%s %d\000"
       (match kind with

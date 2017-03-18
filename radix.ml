@@ -43,6 +43,7 @@ type 'a node =
   | B of 'a node * 'a node * int * int
 
 type 'a t = 'a node option
+type 'a sequence = ('a -> unit) -> unit
 
 let empty = None
 
@@ -144,3 +145,17 @@ let rec fold f acc tree = match tree with
 let fold f acc = function
   | None -> acc
   | Some tree -> fold f acc tree
+
+let rec iter f tree = match tree with
+  | L (k, v) -> f (k, v)
+  | T (m, k, v) -> let () = f (k, v) in iter f m
+  | B (l, r, i, b) ->
+    let () = iter f l in iter f r
+
+let iter f = function
+  | None -> ()
+  | Some tree -> iter f tree
+
+let to_sequence
+    : 'a t -> (string * 'a) sequence
+    = fun tree k -> iter k tree
