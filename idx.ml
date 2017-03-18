@@ -441,7 +441,7 @@ struct
               (hashes[@tailcall]) (Int32.succ idx) max src t)
            src t
 
-  (* XXX(dinosaure): fix this compute. See the serialization to understand. *)
+  (* XXX(dinosaure): Fix this compute. See the serialization to understand. *)
   let rec fanout idx src t =
     match idx with
     | 256 ->
@@ -818,8 +818,6 @@ struct
      @@ fun dst t -> Cont { t with state = Fanout (fanout 0 0l) })
     dst t
 
-  type 'a sequence = ('a -> unit) -> unit
-
   let flush off len t =
     { t with o_off = off
            ; o_len = len
@@ -848,6 +846,12 @@ struct
 
     loop t
 
+  type 'a sequence = ('a -> unit) -> unit
+
+  (* XXX(dinosaure): The sequence type is an abstraction of the iteration of a data structure.
+                     The order of the iteration is not important, the Fanout module takes care about that.
+                     So, we let the user to use any data structure to store the CRC and the Offset for each hash.
+   *)
   let default : (string * (int32 * int64)) sequence -> 'o t = fun seq ->
 
     let boffsets = ref [] in

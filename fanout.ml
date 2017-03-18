@@ -4,6 +4,9 @@ type 'a t =
 let make () =
   { fanout = Array.make 256 [] }
 
+(* XXX(dinosaure): if, one day, we find a bug about the serialization of the IDX file,
+                   may be it's about this function (stable/unstable sort).
+ *)
 let merge lst key value =
   List.merge
     (fun (k1, _) (k2, _) -> String.compare k1 k2)

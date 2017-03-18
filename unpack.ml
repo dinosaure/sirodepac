@@ -599,17 +599,6 @@ struct
                              ; read = Int64.add t.read 1L }
       else await { t with state = Header (fun src t -> (get_byte[@tailcall]) k src t) }
 
-    let swap n =
-      let ( >> ) = Int32.shift_right in
-      let ( << ) = Int32.shift_left in (* >> *)
-      let ( || ) = Int32.logor in
-      let ( & ) = Int32.logand in
-
-      ((n >> 24) & 0xffl)
-      || ((n << 8) & 0xff0000l)    (* >> *)
-      || ((n >> 8) & 0xff00l)
-      || ((n << 24) & 0xff000000l) (* >> *)
-
     let to_int32 b0 b1 b2 b3 =
       let ( << ) = Int32.shift_left in (* >> *)
       let ( || ) = Int32.logor in
@@ -620,8 +609,8 @@ struct
 
     let rec get_u32 k src t =
       if (t.i_len - t.i_pos) > 3
-      then let num = B.get_u32 src (t.i_off + t.i_pos) in
-           k (swap num) src
+      then let num = Endian.get_u32 src (t.i_off + t.i_pos) in
+           k num src
              { t with i_pos = t.i_pos + 4
                     ; read = Int64.add t.read 4L }
       else if (t.i_len - t.i_pos) > 0
@@ -1155,8 +1144,8 @@ struct
                      architecture 64 bits, avec des entiers 63 bits - voir les
                      fonctions {!get} et {!blit}).
 
-                     Alors comment résoudre la problématique ? Doit on oubier
-                     l'existence (très rare, voir innexistante) d'un énorme
+                     Alors comment résoudre la problématique ? Doit on oublier
+                     l'existence (très rare, voir inexistante) d'un énorme
                      fichier PACK où un offset tenant sur un entier 64 bits est
                      nécessaire ? Pour l'instant, c'est le cas.
 

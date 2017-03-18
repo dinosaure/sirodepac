@@ -310,6 +310,7 @@ let encoder_index_err exn = `Encoder_index_error exn
 let lazy_index_err exn = `Lazy_index_error exn
 let dual_index_err ()  = `Dual_index_error
 
+(* serialization of a IDX tree. *)
 let serialize_idx_file tree =
   let state  = Idx.Encoder.default (Radix.to_sequence tree) in
   let output = Bytes.create 0x800 in
@@ -352,16 +353,16 @@ let check_idx_implementation refiller rai =
         in Ok (tree, rai)
     with Break -> Error `Implementation_index_error
 
+(* check the serialization of the IDX file.
+   check the deserialization of the serialization of the IDX file.
+   check the value provided by the serialization of the IDX file with the lazy implementation.
+ *)
 let dual_idx (tree, rai) =
   let open Result in
 
   serialize_idx_file tree
   >>! encoder_index_err
   >>= fun map ->
-
-  let oc = open_out "check.idx" in
-  output_string oc map;
-  close_out oc;
 
   let refiller bytes =
     let pos = ref 0 in
@@ -393,6 +394,7 @@ let () =
 
   (* check the lazy implementation of the IDX file.
      check the non-blocking deserialization of the IDX file.
+     check the non-blocking serialization of the IDX file.
      check the non-blocking deserialization of the PACK file.
    *)
   match Result.(Idx.Lazy.make ii
