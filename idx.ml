@@ -140,6 +140,21 @@ struct
 
     aux 0 (B.length buf) buf
 
+  (* XXX(dinosaure): we have a problem with a 32 bits architecture. Indeed, in
+                     the 32 bits architecture, the integer in OCaml is a 31
+                     bits, and the size of the IDX file can be around
+                     [max_int32]. We convert in this function the [int32] to the
+                     native integer. If this [int32] use all bits, we lost the
+                     information when we cast. It's a bug!
+
+                     In this case, the best is to use the [Decoder] module and
+                     generate a radix-tree (see [idx_to_tree]) to provide the
+                     function [string -> int64] to the PACK decoder.
+
+                     In the 64 bits architecture, the native integer is a 63
+                     bits integer, the cast between the [int32] to the native
+                     integer is safe.
+   *)
   let fanout_idx t hash =
     match Char.code @@ String.get hash 0 with
     | 0 ->
@@ -848,9 +863,11 @@ struct
 
   type 'a sequence = ('a -> unit) -> unit
 
-  (* XXX(dinosaure): The sequence type is an abstraction of the iteration of a data structure.
-                     The order of the iteration is not important, the Fanout module takes care about that.
-                     So, we let the user to use any data structure to store the CRC and the Offset for each hash.
+  (* XXX(dinosaure): The sequence type is an abstraction of the iteration of a
+                     data structure. The order of the iteration is not
+                     important, the Fanout module takes care about that. So, we
+                     let the user to use any data structure to store the CRC and
+                     the Offset for each hash.
    *)
   let default : (string * (int32 * int64)) sequence -> 'o t = fun seq ->
 

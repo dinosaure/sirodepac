@@ -25,61 +25,6 @@ struct
   let ( >>| ) a f = match a with Ok a -> Ok (f a) | Error exn -> Error exn
 end
 
-module Hash =
-struct
-  type 'a t = string constraint 'a = [>]
-
-  external tree   : string -> [ `Tree ]   t = "%identity"
-  external commit : string -> [ `Commit ] t = "%identity"
-  external blob   : string -> [ `Blob ]   t = "%identity"
-  external tag    : string -> [ `Tag ]    t = "%identity"
-
-  (* XXX(dinosaure): from ocaml-hex *)
-  let to_char x y =
-    let code c = match c with
-      | '0'..'9' -> Char.code c - 48 (* Char.code '0' *)
-      | 'A'..'F' -> Char.code c - 55 (* Char.code 'A' + 10 *)
-      | 'a'..'f' -> Char.code c - 87 (* Char.code 'a' + 10 *)
-      | _ -> 
-        raise (Invalid_argument (Format.sprintf "Hash.to_char: %d is an invalid char" (Char.code c)))
-    in
-  Char.chr (code x lsl 4 + code y)
-
-  let from_pp
-    : sentinel:'sentinel -> string -> 'sentinel t
-    = fun ~sentinel x ->
-      let tmp = Bytes.create 20 in
-      let buf = if String.length x mod 2 = 1
-                then x ^ "0" else x
-      in
-
-      let rec aux i j =
-        if i >= 40 then ()
-        else if j >= 40
-        then raise (Invalid_argument "Hash.from_pp")
-             (* XXX(dinosaure): this case is impossible because
-                                if j is odd and we only add (+) 2,
-                                j stay odd as long as we compute.
-
-                                So j <> 40, in any case.
-              *)
-        else begin
-          Bytes.set tmp (i / 2) (to_char buf.[i] buf.[j]);
-          aux (j + 1) (j + 2)
-        end
-      in aux 0 1; Bytes.unsafe_to_string tmp
-
-  let pp fmt hash =
-    for i = 0 to String.length hash - 1
-    do Format.fprintf fmt "%02x" (Char.code @@ String.get hash i) done
-
-  let to_pp hash =
-    let buf = Buffer.create 40 in
-    let fmt = Format.formatter_of_buffer buf in
-    Format.fprintf fmt "%a%!" pp hash;
-    Buffer.contents buf
-end
-
 let pp_list ?(sep = "") pp_data fmt lst =
   let rec aux = function
     | [] -> ()
@@ -205,8 +150,8 @@ end
 module Commit =
 struct
   type t =
-    { tree      : [ `Tree ] Hash.t
-    ; parents   : [ `Commit ] Hash.t list
+    { tree      : ([ `Tree ],   [ `SHA1 ]) Hash.t
+    ; parents   : ([ `Commit ], [ `SHA1 ]) Hash.t list
     ; author    : User.t
     ; committer : User.t
     ; message   : string  }
@@ -317,7 +262,7 @@ struct
   type entry =
     { perm : perm
     ; name : string
-    ; node : 'a. 'a Hash.t }
+    ; node : 'a. ('a, [ `SHA1 ]) Hash.t }
   and perm =
     [ `Normal | `Everybody | `Exec | `Link | `Dir | `Commit ]
   and t = entry list
@@ -399,7 +344,7 @@ struct
       >>= fun hash ->
         return { perm
                ; name
-               ; node = (hash : [ `Unknow ] Hash.t) }
+               ; node = (hash : ([ `Unknow ], [ `SHA1 ]) Hash.t) }
       <* commit
 
     let tree = Minidec.many entry
@@ -494,7 +439,7 @@ end
 module Tag =
 struct
   type t =
-    { obj     : 'a. 'a Hash.t
+    { obj     : 'a. ('a, [ `SHA1 ]) Hash.t
     ; kind    : kind
     ; tag     : string
     ; tagger  : User.t option

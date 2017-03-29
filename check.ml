@@ -1,5 +1,21 @@
 open Unpack
 
+module Mapper : MAPPER with type fd = Unix.file_descr =
+struct
+  type fd = Unix.file_descr
+
+  let map fd ?pos ~share len =
+    let max = (Unix.LargeFile.fstat fd).Unix.LargeFile.st_size in (* avoid to grow the file. *)
+    let max = match pos with
+      | Some pos -> Int64.sub max pos
+      | None -> max
+    in
+    let min_int64 (a : int64) (b : int64) = if a < b then a else b in
+    Bigarray.Array1.map_file fd ?pos Bigarray.Char Bigarray.c_layout share (Int64.to_int (min_int64 (Int64.of_int len) max))
+end
+
+module D = D(Mapper)
+
 let hash_of_object kind length =
   let hdr = Format.sprintf "%s %d\000"
     (match kind with
@@ -159,14 +175,14 @@ let encoder = Minienc.from encoder_tmp
 let check hash kind raw length consumed offset ?base getter = match getter hash with
   | None ->
     Format.eprintf "Object %s not found\n%!"
-      (Minigit.Hash.to_pp hash);
+      (Hash.to_pp hash);
     assert false
   | Some offset' ->
     if offset <> offset'
     then begin
       Format.eprintf "Offset of the object %s (%Ld) does not correspond with \
                       the IDX file (%Ld)\n%!"
-        (Minigit.Hash.to_pp hash)
+        (Hash.to_pp hash)
         offset offset';
       assert false
     end;
@@ -180,8 +196,8 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
     then begin
       Format.eprintf "Hash of the object %s does not correspond with the hash \
                       produced by the encoder %s\n%!"
-        (Minigit.Hash.to_pp hash)
-        (Minigit.Hash.to_pp hash');
+        (Hash.to_pp hash)
+        (Hash.to_pp hash');
 
       Format.eprintf "OCaml value: %a\n%!"
         pp (deserialize (kind, raw, real_length));
@@ -194,7 +210,7 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
          let raw' = Cstruct.concat lst in
 
          Format.eprintf "BAD [%s]:\n%a\n%!"
-           (Minigit.Hash.to_pp (Cstruct.to_string (Nocrypto.Hash.SHA1.digest raw')))
+           (Hash.to_pp (Hash.digest raw'))
            Hex.hexdump (Hex.of_string_fast (Cstruct.to_string raw'));
 
          Format.eprintf "OK (without header):\n%a\n%!"
@@ -210,27 +226,29 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
     match base with
     | Some (level, base_hash, base_length) ->
       Format.printf "%s %a %d %d %Ld %d %s\n%!"
-        (Minigit.Hash.to_pp hash)
+        (Hash.to_pp hash)
         pp_kind kind
         length
         consumed
         offset
-        level (Minigit.Hash.to_pp base_hash)
+        level (Hash.to_pp base_hash)
     | None ->
       Format.printf "%s %a %d %d %Ld\n%!"
-        (Minigit.Hash.to_pp hash)
+        (Hash.to_pp hash)
         pp_kind kind
         length
         consumed
         offset
 
-let unpack ?(chunk = 0x8000) map idx get =
+let unpack ?(chunk = 0x8000) pack_filename get =
   let buf   = BBuffer.create ~proof:(B.from_bigstring B.Bigstring.empty) chunk in
   let z_tmp = B.from_bigstring (B.Bigstring.create 0x8000) in
   let h_tmp = B.from_bigstring (B.Bigstring.create 0x8000) in
   let z_win = Decompress.Window.create ~proof:B.proof_bigstring in
 
-  let rap   = D.make map get in
+  let pack_fd = Unix.openfile pack_filename [ Unix.O_RDONLY ] 0o644 in
+  let map     = B.from_bigstring @@ Bigarray.Array1.map_file pack_fd Bigarray.Char Bigarray.c_layout false (-1) in
+  let rap     = D.make pack_fd get in
 
   let rec loop offset (t : ('a, 'a) P.t) =
     match P.eval map t with
@@ -253,6 +271,11 @@ let unpack ?(chunk = 0x8000) map idx get =
         let (rlength, rconsumed, roffset) = P.length t, P.consumed t, P.offset t in
 
         let rec undelta ?(level = 1) hunks offset =
+          B.fill z_tmp 0 0x8000 '\000';
+          B.fill h_tmp 0 0x8000 '\000';
+
+          assert (D.check_file rap pack_fd);
+
           match D.delta rap hunks offset z_tmp z_win h_tmp with
           | Error exn ->
             Error (`Delta_error exn)
@@ -260,7 +283,7 @@ let unpack ?(chunk = 0x8000) map idx get =
             (match undelta ~level:(level + 1) hunks offset with
              | Ok (base, _, level) ->
 
-               Result.(D.apply rap hunks base
+               Result.(D.apply ~proof:B.proof_bigstring hunks base
                        >>! (fun exn -> `Delta_error exn)
                        >>| (fun base ->
                             let base_hash = hash_of_object base.D.Base.kind base.D.Base.length base.D.Base.raw in
@@ -273,7 +296,7 @@ let unpack ?(chunk = 0x8000) map idx get =
 
         (match undelta hunks (P.offset t) with
          | Ok (base, base_hash, level) ->
-           (match D.apply rap hunks base with
+           (match D.apply ~proof:B.proof_bigstring hunks base with
             | Ok base ->
               let hash = hash_of_object base.D.Base.kind base.D.Base.length base.D.Base.raw in
 
@@ -378,7 +401,7 @@ let dual_idx (tree, rai) =
   check_idx_implementation (refiller map) rai
 
 let () =
-  let pp = bs_map Sys.argv.(1) in (* alloc *)
+  let pack_filename = Sys.argv.(1) in (* alloc *)
   let ii = bs_map Sys.argv.(2) in (* alloc *)
 
   let refiller map =
@@ -402,8 +425,8 @@ let () =
                 >>= check_idx_implementation (refiller ii)
                 >>= dual_idx
                 >>| snd (* take the lazy implementation *)
-                >>| (fun rai -> unpack pp rai (fun hash -> Idx.Lazy.find rai hash))) with
-  | Ok hash -> Format.printf "End of parsing\n%!"
+                >>= (fun rai -> unpack pack_filename (fun hash -> Idx.Lazy.find rai hash))) with
+  | Ok hash -> Format.printf "End of parsing: %a\n%!" Hash.pp hash
   | Error (`Pack_error exn) ->
     Format.eprintf "pack error: %a\n%!" P.pp_error exn
   | Error (`Delta_error exn) ->

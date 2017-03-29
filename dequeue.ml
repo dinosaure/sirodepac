@@ -34,7 +34,8 @@ type 'a node =
 
 type 'a t =
   { mutable cur  : 'a node
-  ; mutable size : int }
+  ; mutable size : int
+  ; mutable idx  : int }
 
 exception Empty
 
@@ -43,7 +44,8 @@ let create () =
                 ; prev = cur
                 ; next = cur }
   in { cur
-     ; size = 0 }
+     ; size = 0
+     ; idx  = 0 }
 
 let clear q =
   let rec cur = { cell = Zero
@@ -53,8 +55,13 @@ let clear q =
      q.size <- 0;
      ()
 
+let length d = d.size
+
 let incr_size d = d.size <- d.size + 1
 let decr_size d = d.size <- d.size - 1
+
+let incr_idx d = d.idx <- d.idx + 1
+let decr_idx d = d.idx <- d.idx - 1
 
 let is_zero n = match n.cell with
   | Zero -> true
@@ -65,8 +72,24 @@ let is_empty d =
   assert (res = is_zero d.cur);
   res
 
+let unsafe_front_index d = d.idx
+
+let front_index d =
+  if is_empty d
+  then None
+  else Some (unsafe_front_index d)
+
+let unsafe_back_index d =
+  d.idx + length d - 1
+
+let back_index d =
+  if is_empty d
+  then None
+  else Some (unsafe_back_index d)
+
 let push_front d x =
   incr_size d;
+  decr_idx  d;
 
   match d.cur.cell with
   | Zero       -> d.cur.cell <- One x
@@ -144,6 +167,8 @@ let take_front_node n = match n.cell with
   | Three (x, y, z) -> n.cell <- Two (y, z); x
 
 let take_front d =
+  incr_idx d;
+
   if is_empty d
   then raise Empty
   else if d.cur.prev == d.cur
@@ -195,8 +220,56 @@ let fold f acc d =
   in
   aux ~first:d.cur f acc d.cur
 
-let length d = d.size
-
 let to_rev_list q = fold (fun l x -> x :: l) [] q
 
 let to_list q = List.rev (to_rev_list q)
+
+let true_index_exn d idx =
+  let idx_from_zero = idx - d.idx in
+
+  if idx_from_zero < 0 || length d <= idx_from_zero
+  then raise (Invalid_argument "Dequeue.true_index_exn")
+  else
+    let true_idx = d.idx + idx_from_zero in
+
+    if true_idx >= length d
+    then true_idx - length d
+    else true_idx
+
+let nth d i =
+  if i >= length d
+  then raise (Invalid_argument "Dequeue.nth")
+  else
+    let i_node = i / 3 in
+    let i_cell = i mod 3 in
+
+    let rec iter_node rest node =
+      if rest = 0
+      then match node.cell, i_cell with
+        | (One x | Two (x, _) | Three (x, _, _)), 0 -> x
+        | (Two (_, x) | Three (_, x, _)), 1 -> x
+        | Three (_, _, x), 2 -> x
+        | _ -> raise (Invalid_argument "Dequeue.nth")
+      else iter_node (rest - 1) node.next
+    in
+
+    iter_node i_node d.cur
+
+let nth_exn d i = nth d (true_index_exn d i)
+
+let nth d i = try Some (nth_exn d i) with exn -> None
+
+let pp pp_data fmt d =
+  let pp_list ?(sep = (fun fmt -> ())) pp_data fmt lst =
+    let rec aux = function
+      | [] -> ()
+      | [ x ] -> pp_data fmt x
+      | x :: r -> pp_data fmt x; sep fmt; aux r
+    in
+    aux lst
+  in
+
+  Format.fprintf fmt "{| (idx:%d) @[<hov>%a@] |}"
+    d.idx
+    (pp_list ~sep:(fun fmt -> Format.fprintf fmt ";@ ") pp_data)
+    (to_list d)

@@ -1,3 +1,24 @@
+(* This file is part of Ocaml-aliases.
+
+   Ocaml-quadtree is free software: you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public
+   License as published by the Free Software Foundation.
+
+   Ocaml-quadtree is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public
+   License along with Ocaml-aliases. If not, see <http://www.gnu.org/licenses/>.
+
+   Copyright 2012 Be Sport
+
+   XXX(dinosaure): This module is originally provided by https://github.com/khigia/ocaml-stringset
+                   but Ludo (aka khigia) did not put a LICENSE. Then, Hugo (from BeSport) improved
+                   the project. So, this module is a mix between ocaml-stringset and ocaml-aliases.
+*)
+
 module Compare =
 struct
   type t =

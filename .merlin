@@ -1,4 +1,4 @@
 B _build
 S .
 
-PKG decompress nocrypto cstruct
+PKG decompress nocrypto cstruct patience_diff lru

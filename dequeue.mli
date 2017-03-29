@@ -29,6 +29,11 @@ val create       : unit -> 'a t
 val clear        : 'a t -> unit
 val is_empty     : 'a t -> bool
 
+val unsafe_front_index  : 'a t -> int
+val unsafe_back_index   : 'a t -> int
+val front_index      : 'a t -> int option
+val back_index       : 'a t -> int option
+
 val push_front   : 'a t -> 'a -> unit
 val push_back    : 'a t -> 'a -> unit
 val peek_front   : 'a t -> 'a
@@ -41,6 +46,12 @@ val append_back  : into: 'a t -> 'a t -> unit
 
 val iter         : ('a -> unit) -> 'a t -> unit
 val fold         : ('a -> 'b -> 'a) -> 'a -> 'b t -> 'a
+val length       : 'a t -> int
 
 val to_rev_list  : 'a t -> 'a list
 val to_list      : 'a t -> 'a list
+
+val nth          : 'a t -> int -> 'a option
+val nth_exn      : 'a t -> int -> 'a
+
+val pp           : (Format.formatter -> 'a -> unit) -> Format.formatter -> 'a t -> unit

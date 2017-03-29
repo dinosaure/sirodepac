@@ -400,61 +400,25 @@ struct
   let read t = t.read
 end
 
+module Int64 =
+struct
+  include Int64
+
+  let ( / ) = Int64.div
+  let ( * ) = Int64.mul
+  let ( + ) = Int64.add
+  let ( - ) = Int64.sub
+end
+
 module Window =
 struct
-  type 'a t =
-    { rpos   : int
-    ; wpos   : int
-    ; size   : int
-    ; buffer : 'a B.t }
+  type t =
+    { raw : B.Bigstring.t
+    ; off : int64
+    ; len : int } (* [len] must be positive. *)
 
-  let make_by ~proof size =
-    { rpos = 0
-    ; wpos = 0
-    ; size = size + 1
-    ; buffer = B.from ~proof (size + 1) }
-
-  let available_to_write { wpos; rpos; size; _ } =
-    if wpos >= rpos then size - (wpos - rpos) - 1
-    else rpos - wpos - 1
-
-  let drop n ({ rpos; size; _ } as t) =
-    { t with rpos = if rpos + n < size then rpos + n
-                    else rpos + n - size }
-
-  let move n ({ wpos; size; _ } as t) =
-    { t with wpos = if wpos + n < size then wpos + n
-                    else wpos + n - size }
-
-  let write buf off len t =
-    let t = if len > available_to_write t
-            then drop (len - (available_to_write t)) t
-            else t in
-
-    let pre = t.size - t.wpos in
-    let extra = len - pre in
-
-    if extra > 0 then begin
-      B.blit buf off t.buffer t.wpos pre;
-      B.blit buf (off + pre) t.buffer 0 extra;
-    end else
-      B.blit buf off t.buffer t.wpos len;
-
-    move len t
-
-  let blit t off dst dst_off len =
-    let off = if t.wpos - off < 0
-              then t.wpos - off + t.size
-              else t.wpos - off in
-
-    let pre = t.size - off in
-    let extra = len - pre in
-
-    if extra > 0 then begin
-      B.blit t.buffer off dst dst_off pre;
-      B.blit t.buffer 0 dst (dst_off + pre) extra
-    end else
-      B.blit t.buffer off dst dst_off len
+  let inside offset t =
+    offset >= t.off && offset < Int64.add t.off (Int64.of_int t.len)
 end
 
 (* Implementatioon of deserialization of a PACK file *)
@@ -544,35 +508,77 @@ struct
     | Tag -> pp fmt "Tag"
     | Hunk hunks -> pp fmt "(Hunks %a)" H.pp_hunks hunks
 
+  let pp_state fmt = function
+    | Header _ -> pp fmt "(Header #k)"
+    | Object _ -> pp fmt "(Object #k)"
+    | VariableLength _ -> pp fmt "(VariableLength #k)"
+    | Unzip { offset
+            ; consumed
+            ; length
+            ; kind
+            ; z } ->
+      pp fmt "{ @[<hov>offset = %Ld;@ \
+                       consumed = %d;@ \
+                       length = %d;@ \
+                       kind = %a;@ \
+                       z = %a;@] }"
+        offset consumed length pp_kind kind Decompress.Inflate.pp z
+    | Hunks { offset
+            ; length
+            ; consumed
+            ; z
+            ; h } ->
+      pp fmt "{ @[<hov>offset = %Ld;@ \
+                       consumed = %d;@ \
+                       length = %d;@ \
+                       z = %a;@ \
+                       h = %a;@] }"
+        offset consumed length Decompress.Inflate.pp z H.pp h
+    | Next { offset
+           ; consumed
+           ; length
+           ; length' } ->
+      pp fmt "{ @[<hov>offset = %Ld;@ \
+                       consumed = %d;@ \
+                       length = %d;@ \
+                       length' = %d;@] @}"
+        offset consumed length length'
+    | Checksum _ -> pp fmt "(Checksum #k)"
+    | End hash -> pp fmt "(End %a)" Hash.pp hash
+    | Exception err -> pp fmt "(Exception %a)" pp_error err 
+
   let pp fmt { i_off; i_pos; i_len; o_z; version; objects; counter; state; } =
     match state with
     | Unzip { z; _ } ->
-      pp fmt "{@[<hov>i_off = %d;@ \
-                      i_pos = %d;@ \
-                      i_len = %d;@ \
-                      version = %ld;@ \
-                      objects = %ld;@ \
-                      counter = %ld;@ \
-                      z = %a@]}"
-        i_off i_pos i_len version objects counter Decompress.Inflate.pp z
+      pp fmt "{ @[<hov>i_off = %d;@ \
+                       i_pos = %d;@ \
+                       i_len = %d;@ \
+                       version = %ld;@ \
+                       objects = %ld;@ \
+                       counter = %ld;@ \
+                       state = %a;@ \
+                       z = %a;@] }"
+        i_off i_pos i_len version objects counter pp_state state Decompress.Inflate.pp z
     | Hunks { z; h; _ } ->
-      pp fmt "{@[<hov>i_off = %d;@ \
-                      i_pos = %d;@ \
-                      i_len = %d;@ \
-                      version = %ld;@ \
-                      objects = %ld;@ \
-                      counter = %ld;@ \
-                      z = %a;@ \
-                      h = %a@]}"
-        i_off i_pos i_len version objects counter Decompress.Inflate.pp z H.pp h
+      pp fmt "{ @[<hov>i_off = %d;@ \
+                       i_pos = %d;@ \
+                       i_len = %d;@ \
+                       version = %ld;@ \
+                       objects = %ld;@ \
+                       counter = %ld;@ \
+                       state = %a;@ \
+                       z = %a;@ \
+                       h = %a;@] }"
+        i_off i_pos i_len version objects counter pp_state state Decompress.Inflate.pp z H.pp h
     | _ ->
-      pp fmt "{@[<hov>i_off = %d;@ \
-                      i_pos = %d;@ \
-                      i_len = %d;@ \
-                      version = %ld;@ \
-                      objects = %ld;@ \
-                      counter = %ld@]}"
-        i_off i_pos i_len version objects counter
+      pp fmt "{ @[<hov>i_off = %d;@ \
+                       i_pos = %d;@ \
+                       i_len = %d;@ \
+                       version = %ld;@ \
+                       objects = %ld;@ \
+                       counter = %ld;@ \
+                       state = %a@;] }"
+        i_off i_pos i_len version objects counter pp_state state
 
   let await t      = Wait t
   let flush t      = Flush t
@@ -925,6 +931,20 @@ struct
     ; counter = 1l
     ; state   = Object kind }
 
+  let from_window (type a) ~(proof:a B.t) window win_offset z_tmp z_win h_tmp =
+    { i_off   = 0
+    ; i_pos   = 0
+    ; i_len   = 0
+    ; local   = true
+    ; o_z     = z_tmp
+    ; o_w     = z_win
+    ; o_h     = h_tmp
+    ; read    = Int64.add window.Window.off (Int64.of_int win_offset)
+    ; version = 0l
+    ; objects = 1l
+    ; counter = 1l
+    ; state   = Object kind }
+
   let sp = Format.sprintf
 
   let refill off len t =
@@ -1022,7 +1042,14 @@ struct
     loop t
 end
 
-module D =
+module type MAPPER =
+sig
+  type fd
+
+  val map : fd -> ?pos:int64 -> share:bool -> int -> B.Bigstring.t
+end
+
+module D (Mapper : MAPPER) =
 struct
   type error = ..
   type error += Invalid_hash of string
@@ -1036,20 +1063,25 @@ struct
     | Invalid_hash hash ->
       Format.fprintf fmt "(Invalid_hash %a)" pp_hash hash
     | Invalid_source off ->
-      Format.fprintf fmt "(Invalid_chunk %Ld)" off
+      Format.fprintf fmt "(Invalid_source %Ld)" off
     | Invalid_target (has, expected) ->
       Format.fprintf fmt "(Invalid_target (%d, %d))"
         has expected
     | Unpack_error exn ->
       Format.fprintf fmt "(Unpack_error %a)" P.pp_error exn
 
-  type 'a t =
-    { map_pck : 'a B.t
-    ; fun_idx : (string -> Int64.t option) }
+  type t =
+    { file  : Mapper.fd
+    ; win   : Window.t Bulk.t
+    ; idx   : 'a. ('a, [ `SHA1 ]) Hash.t -> int64 option
+    ; hash  : ([ `PACK ], [ `SHA1 ]) Hash.t }
+
+  let check_file t file = t.file == file
 
   let is_hunk t = match P.kind t with
     | P.Hunk _ -> true
     | _ -> false
+
   let hash_of_object kind length =
     let hdr = Format.sprintf "%s %d\000"
       (match kind with
@@ -1080,8 +1112,8 @@ struct
       | _ -> false
   end
 
-  let apply { map_pck; fun_idx; } hunks base =
-    let raw = B.from ~proof:map_pck hunks.H.target_length in
+  let apply ~proof hunks base =
+    let raw = B.from ~proof hunks.H.target_length in
 
     let target_length = List.fold_left
        (fun acc -> function
@@ -1205,36 +1237,87 @@ struct
                      Bref, je laisse ce commentaire pour m'en souvenir déjà et
                      pour les autres pour comprendre la problématique.
   *)
-  let delta { map_pck; fun_idx; } hunks offset_of_hunks z_tmp z_win h_tmp =
+
+  let new_window t offset_requested =
+    let pos = Int64.((offset_requested / 1024L) * 1024L) in (* padding *)
+    let map = Mapper.map t.file ~pos ~share:false (1024 * 1024) in
+    { Window.raw = map
+    ; off   = pos
+    ; len   = B.Bigstring.length map }
+
+  let really_inside offset_requested window =
+    let relative_offset = Int64.to_int Int64.(offset_requested - window.Window.off) in
+    (* XXX(dinosaure): the window size is [1024 * 1024], the relative offset can't be upper than
+                       [max_int31] in any case. It's safe to cast to a native integer in any
+                       architecture
+     *)
+    try
+      let byte = Char.code @@ B.Bigstring.get window.Window.raw relative_offset in
+      let msb  = byte land 0x80 <> 0 in
+      let _    = (byte land 0x70) lsr 4 in (* kind of the git object *)
+
+      let rec loop msb (len, bit, n) idx = match msb with
+        | true ->
+          let byte = Char.code @@ B.Bigstring.get window.Window.raw (relative_offset + idx) in
+          let msb  = byte land 0x80 <> 0 in
+          loop msb (len lor ((byte land 0x7F) lsl bit), bit + 7, n + 1) (idx + 1)
+        | false -> len, n
+      in
+
+      let len, n = loop msb (byte land 0x0F, 4, 1) 1 in
+      (* XXX(dinosaure): tips, [idx = n]. *)
+
+      Window.inside Int64.(offset_requested + (of_int n) + (of_int len) + 20L) window
+    with exn -> false (* appear with [B.Bigstring.get]. *)
+
+  let find t offset_requested =
+    let predicate window =
+      Window.inside offset_requested window
+      && really_inside offset_requested window
+    in
+
+    match Bulk.find t.win predicate with
+    | Some window ->
+      let relative_offset = Int64.to_int Int64.(offset_requested - window.Window.off) in
+      window, relative_offset
+    | None ->
+      let window = new_window t offset_requested in
+      let relative_offset = Int64.to_int Int64.(offset_requested - window.Window.off) in
+
+      let () = Bulk.add t.win window in window, relative_offset
+
+  let delta ?(chunk_size = 0x8000) t hunks offset_of_hunks z_tmp z_win h_tmp =
       let absolute_offset = match hunks.H.reference with
         | H.Offset off -> Ok (Int64.sub offset_of_hunks off)
-        | H.Hash hash -> match fun_idx hash with
+        | H.Hash hash -> match t.idx hash with
           | Some off -> Ok off
           | None -> Error (Invalid_hash hash)
       in
 
       match absolute_offset with
       | Ok absolute_offset ->
-        let chunk    = 0x8000 in
-        let t        = P.from_absolute_offset ~proof:map_pck (Int64.to_int absolute_offset) absolute_offset z_tmp z_win h_tmp in
-        let base_raw = B.from ~proof:map_pck hunks.H.source_length in
+        let window, relative_offset = find t absolute_offset in
+        let state    = P.from_window ~proof:B.proof_bigstring window relative_offset z_tmp z_win h_tmp in
+        let base_raw = B.from ~proof:B.proof_bigstring hunks.H.source_length in
 
-        let rec loop offset' result kind t =
-          match P.eval map_pck t with
-          | `Await t ->
-            let chunk' = min (Int64.to_int (Int64.sub (Int64.of_int (B.length map_pck)) offset')) chunk in
-            if chunk' > 0
-            then loop (Int64.add offset' (Int64.of_int chunk')) result kind (P.refill (Int64.to_int offset') chunk' t)
+        let rec loop consumed_in_window writted_in_raw git_object state =
+          match P.eval (B.from_bigstring window.Window.raw) state with
+          | `Await state ->
+            let rest_in_window = min (window.Window.len - consumed_in_window) chunk_size in
+
+            if rest_in_window > 0
+            then loop (consumed_in_window + rest_in_window) writted_in_raw git_object (P.refill consumed_in_window rest_in_window state)
             else Error (Invalid_source absolute_offset)
-          | `Flush t ->
-            let o, n = P.output t in
-            B.blit o 0 base_raw result n;
-            loop offset' (result + n) kind (P.flush 0 n t)
-          | `Object t ->
-            loop offset' result (Some (P.kind t, P.offset t, P.length t, P.consumed t)) (P.next_object t) (* XXX *)
-          | `Error (t, exn) ->
+          | `Flush state ->
+            let o, n = P.output state in
+            B.blit o 0 base_raw writted_in_raw n;
+            loop consumed_in_window (writted_in_raw + n) git_object (P.flush 0 n state)
+          | `Object state ->
+            loop consumed_in_window writted_in_raw (Some (P.kind state, P.offset state, P.length state, P.consumed state)) (P.next_object state) (* XXX *)
+          | `Error (state, exn) ->
             Error (Unpack_error exn)
-          | `End (t, _) -> match kind with
+          | `End (state, _) ->
+            match git_object with
             | Some (kind, offset, length, consumed) ->
               Ok (kind, offset, length, consumed)
             | None -> assert false
@@ -1243,7 +1326,7 @@ struct
              *)
         in
 
-        (match loop absolute_offset 0 None t with
+        (match loop relative_offset 0 None state with
          | Ok (base_kind, base_offset, base_length, base_consumed) ->
            Ok Base.{ kind     = base_kind
                    ; raw      = base_raw
@@ -1253,5 +1336,83 @@ struct
          | Error exn -> Error exn)
       | Error exn -> Error exn
 
-  let make map_pck fun_idx = { map_pck; fun_idx; }
+  let make ?(bulk = 10) file (idx : string -> int64 option) =
+    { file
+    ; win  = Bulk.make bulk
+    ; idx  = idx
+    ; hash = "" (* TODO *) }
+
+  let get ?(chunk_size = 0x800) t hash z_tmp z_win h_tmp =
+    match t.idx hash with
+    | Some absolute_offset ->
+      let window, relative_offset = find t absolute_offset in
+      let state  = P.from_window ~proof:B.proof_bigstring window relative_offset z_tmp z_win h_tmp in
+      let buffer = BBuffer.create ~proof:B.proof_bigstring chunk_size in
+
+      let rec loop consumed_in_window writted_in_raw git_object state =
+        match P.eval (B.from_bigstring window.Window.raw) state with
+        | `Await state ->
+          let rest_in_window = min (window.Window.len - consumed_in_window) chunk_size in
+
+          if rest_in_window > 0
+          then loop (consumed_in_window + rest_in_window) writted_in_raw git_object (P.refill consumed_in_window rest_in_window state)
+          else Error (Invalid_source absolute_offset)
+        | `Flush t ->
+          let o, n = P.output t in
+          let ()   = BBuffer.add o ~len:n buffer in
+          loop consumed_in_window (writted_in_raw + n) git_object (P.flush 0 n t)
+        | `Object state ->
+          (match P.kind state with
+           | P.Hunk hunks ->
+             let (rlength, rconsumed, roffset) = P.length state, P.consumed state, P.offset state in
+
+             let rec undelta ?(level = 1) hunks offset =
+               match delta t hunks offset z_tmp z_win h_tmp with
+               | Error exn -> Error exn
+               | Ok { Base.kind = P.Hunk hunks; offset; _ } ->
+                 (match undelta ~level:(level + 1) hunks offset with
+                  | Ok (base, level) ->
+                    (match apply ~proof:B.proof_bigstring hunks base with
+                     | Ok base -> Ok (base, level)
+                     | Error exn -> Error exn)
+                  | Error exn -> Error exn)
+               | Ok base -> Ok (base, level)
+             in
+
+             (match undelta hunks (P.offset state) with
+              | Ok (base, level) ->
+                (match apply ~proof:B.proof_bigstring hunks base with
+                 | Ok base ->
+                   loop consumed_in_window writted_in_raw
+                     (Some (base.Base.kind, Some base.Base.raw, roffset, rlength, rconsumed))
+                     (P.next_object state)
+                 | Error exn -> Error exn)
+              | Error exn -> Error exn)
+           | kind ->
+             loop consumed_in_window writted_in_raw
+               (Some (kind, None, P.offset state, P.length state, P.consumed state))
+               (P.next_object state))
+        | `Error (state, exn) ->
+          Error (Unpack_error exn)
+        | `End (t, _) -> match git_object with
+          | Some (kind, raw_opt, offset, length, consumed) ->
+            Ok (kind, raw_opt, offset, length, consumed)
+          | None -> assert false
+      in
+
+      (match loop relative_offset 0 None state with
+       | Ok (kind, None, offset, length, consumed) ->
+         Ok Base.{ kind
+                 ; raw = BBuffer.contents buffer
+                 ; offset
+                 ; length
+                 ; consumed }
+       | Ok (kind, Some raw, offset, length, consumed) ->
+         Ok Base.{ kind
+                 ; raw
+                 ; offset
+                 ; length
+                 ; consumed }
+       | Error exn -> Error exn)
+    | None -> Error (Invalid_hash hash)
 end
