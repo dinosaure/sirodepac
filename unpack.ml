@@ -476,13 +476,8 @@ struct
                    ; consumed : int
                    ; length   : int
                    ; length'  : int
-                   (* XXX(dinosaure): about [consumed], [length] and [length'],
-                                      may be we need to consider theses as an
-                                      int64 because the variable length (see
-                                      [length]) can be up than [max_int].
-
-                                      Indeed, Git can store a huge file but we
-                                      have a limitation in OCaml. So, TODO!
+                   (* XXX(dinosaure): we have a problem in the 32-bit architecture,
+                                      the [length] can be big! TODO!
                     *)
                    ; kind     : 'i kind }
     | Checksum  of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
@@ -1268,6 +1263,7 @@ struct
       (* XXX(dinosaure): tips, [idx = n]. *)
 
       Window.inside Int64.(offset_requested + (of_int n) + (of_int len) + 20L) window
+      (* XXX(dinosaure): + 20L need to be fixed! TODO! *)
     with exn -> false (* appear with [B.Bigstring.get]. *)
 
   let find t offset_requested =
