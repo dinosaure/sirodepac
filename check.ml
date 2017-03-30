@@ -4,8 +4,10 @@ module Mapper : MAPPER with type fd = Unix.file_descr =
 struct
   type fd = Unix.file_descr
 
+  let length fd = (Unix.LargeFile.fstat fd).Unix.LargeFile.st_size
+
   let map fd ?pos ~share len =
-    let max = (Unix.LargeFile.fstat fd).Unix.LargeFile.st_size in (* avoid to grow the file. *)
+    let max = length fd in (* avoid to grow the file. *)
     let max = match pos with
       | Some pos -> Int64.sub max pos
       | None -> max

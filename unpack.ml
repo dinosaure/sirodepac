@@ -408,6 +408,8 @@ struct
   let ( * ) = Int64.mul
   let ( + ) = Int64.add
   let ( - ) = Int64.sub
+  let ( << ) = Int64.shift_left (* >> *)
+  let ( || ) = Int64.logor
 end
 
 module Window =
@@ -848,8 +850,8 @@ struct
                    ; read = Int64.add t.read (Int64.of_int (Decompress.Inflate.used_in z)) }
     | `Flush z ->
       flush { t with state = Unzip { offset; length; consumed
-                                 ; kind
-                                 ; z } }
+                                   ; kind
+                                   ; z } }
     | `End z ->
       if Decompress.Inflate.used_out z <> 0
       then flush { t with state = Unzip { offset; length; consumed
@@ -911,20 +913,6 @@ struct
       | n -> loop (acc + 1) (n lsr 7)
     in
     loop 1 (vl lsr 4) (* avoid type and msb *)
-
-  let from_absolute_offset (type a) ~(proof:a B.t) src_offset pack_offset z_tmp z_win h_tmp =
-    { i_off   = src_offset
-    ; i_pos   = 0
-    ; i_len   = 0
-    ; local   = true
-    ; o_z     = z_tmp
-    ; o_w     = z_win
-    ; o_h     = h_tmp
-    ; read    = pack_offset
-    ; version = 0l
-    ; objects = 1l
-    ; counter = 1l
-    ; state   = Object kind }
 
   let from_window (type a) ~(proof:a B.t) window win_offset z_tmp z_win h_tmp =
     { i_off   = 0
@@ -1001,6 +989,7 @@ struct
     | Next { length; _ } -> length
     | _ -> raise (Invalid_argument "P.length: bad state")
 
+  (* XXX(dinosaure): the diff with git verify-pack is different. FIXME! *)
   let consumed t = match t.state with
     | Next { consumed; _ } -> consumed
     | _ -> raise (Invalid_argument "P.consumed: bad state")
@@ -1041,6 +1030,7 @@ module type MAPPER =
 sig
   type fd
 
+  val length : fd -> int64
   val map : fd -> ?pos:int64 -> share:bool -> int -> B.Bigstring.t
 end
 
@@ -1048,7 +1038,7 @@ module D (Mapper : MAPPER) =
 struct
   type error = ..
   type error += Invalid_hash of string
-  type error += Invalid_source of int64
+  type error += Invalid_offset of int64
   type error += Invalid_target of (int * int)
   type error += Unpack_error of P.error
 
@@ -1057,8 +1047,8 @@ struct
   let pp_error fmt = function
     | Invalid_hash hash ->
       Format.fprintf fmt "(Invalid_hash %a)" pp_hash hash
-    | Invalid_source off ->
-      Format.fprintf fmt "(Invalid_source %Ld)" off
+    | Invalid_offset off ->
+      Format.fprintf fmt "(Invalid_offset %Ld)" off
     | Invalid_target (has, expected) ->
       Format.fprintf fmt "(Invalid_target (%d, %d))"
         has expected
@@ -1067,6 +1057,7 @@ struct
 
   type t =
     { file  : Mapper.fd
+    ; max   : int64
     ; win   : Window.t Bulk.t
     ; idx   : 'a. ('a, [ `SHA1 ]) Hash.t -> int64 option
     ; hash  : ([ `PACK ], [ `SHA1 ]) Hash.t }
@@ -1127,213 +1118,97 @@ struct
                    ; consumed = base.consumed }
       else Error (Invalid_target (target_length, hunks.H.target_length))
 
-  (* XXX(dinosaure): en français. La déserialization d'un fichier PACK se
-                     découpe en plusieurs étapes:
-
-                     1 PACK file (header + checksum)
-                     2 Inflate (Decompress)
-                     3 Git Object + Hunks
-                     4 Git Object
-
-                     De l'étape 1 à 3, le module {!P} suffit et on est bien face
-                     à une interface *non-blocking* (dans le sens où nous avons
-                     un état que vous pouvez arrêter et reprendre plus tard sans
-                     perdre aucune information - il n'y a donc aucun prérequis
-                     dans la taille de l'input). Malheureusement, pour passer à
-                     l'étape 4, nous devons *peut-être* traiter une information
-                     qui est apparu dans le flux (utilisé par {!P}) et qui est
-                     désormais indisponible.
-
-                     Cette fonction [delta] correspond exactement à cette
-                     quatrième étape. Comme on peut le voir dans le code, on y
-                     obtient un [offset] absolue dans un fichier PACK donné.
-                     Ainsi, nous devons travailler sur un flux correspondant à
-                     cette offset.
-
-                     Imaginons un objet [Hunks] qui fait référence à un objet
-                     Git qui ce trouve [N] bytes avant. Imaginons ensuite que
-                     vous déserializer le fichier PACK à l'aide d'un input dont
-                     la taille est de [M] bytes. Enfin, imaginons que [N > M],
-                     dans ce cas, l'objet auquel fait référence le [Hunks]
-                     n'est plus disponible dans votre input.
-
-                     Ainsi, la fonction [delta] demande (pour l'instant), à ce
-                     que votre fichier PACK soit mappé (et donc que l'entièreté
-                     de son contenu soit disponible). Le premier problème est:
-                     il n'est plus nécessaire de se forcer d'avoir une interface
-                     *non-blocking* puisque tout le contenu du fichier PACK est
-                     disponible. Mais le deuxième problème est plus
-                     problématique et on peut le dénoter dans le code. En effet,
-                     l'offset qu'on peut obtenir (qui correspond à un offset
-                     relatif ou absolue - mais particulièrement absolue) tient
-                     sur un entier 64 bits. Et OCaml ne peut pas traiter un
-                     fichier aussi gros (puisqu'on travaille, pour une
-                     architecture 64 bits, avec des entiers 63 bits - voir les
-                     fonctions {!get} et {!blit}).
-
-                     Alors comment résoudre la problématique ? Doit on oublier
-                     l'existence (très rare, voir inexistante) d'un énorme
-                     fichier PACK où un offset tenant sur un entier 64 bits est
-                     nécessaire ? Pour l'instant, c'est le cas.
-
-                     Maintenant, j'ai regardé comment Git fonctionne sur ce
-                     sujet et j'ai remarqué l'existence de *window* permettant
-                     de:
-                       1. ne pas être obliger de mapper la totalité le fichier
-                       mais seulement [1024 * 1024] bytes
-                       2. travailler sur ces windows lorsqu'on a un offset
-                       relatif ou absolute (en espérant que celui-ci soit
-                       disponible - pour le coup, la documentation de Git est
-                       très ... pas documenté)
-
-                     Après, ce ne sont pas réellement des windows (comme on peut
-                     le retrouver dans Decompress où il s'agit de garder une
-                     partie de l'input) mais plutôt un système de cache - pour
-                     preuve, la définition de ces windows est dans [cache.h].
-                     Git va tout simplement garder plusieurs windows où chacunes
-                     est associées à un fichier PACK (spécifiquement à son [file
-                     descriptor]) et un offset dans ce fichier PACK. Il utilise
-                     l'algorithme par comptage de référence pour faire office de
-                     *garbage collector* auprès de ces windows. Enfin, dès qu'il
-                     souhaite obtenir un objet Git par le biais d'une référence
-                     absolue ou relative, il regarde son lot de windows pour
-                     savoir si l'offset s'y retrouve.
-
-                     Dans le cas où il trouve une window, il informe qu'il faut
-                     garder la window (en incrémentant le nombre de référence)
-                     et donne le contenu de la window. La déserialization
-                     travaille désormais sur ce flux limité à [1024 * 1024]
-                     bytes et on peut y déserializer l'objet.
-
-                     Dans le cas où il ne trouve pas la window, il cherche le
-                     fichier PACK associé et créer une nouvelle window de [1024
-                     * 1024] bytes qui résultera d'un simple [map] à l'offset
-                     absolue renseigné (paddé sur 1024) du [file descriptor] du
-                     fichier PACK file.
-
-                     Cela correspond plus donc à un système de cache qu'une
-                     window que l'on pourrait utiliser tout au long de la
-                     déserialization pour construire les objets [Hunks].
-
-                     DONC, le constat est qu'on a toujours ce problème avec les
-                     [Int64.t] et [nativeint] dans ce code. Le système de cache
-                     pourrait résoudre le problème (puisqu'on travaillerrait
-                     plus qu'avec des *chunks* de [1024 * 1024] bytes) mais il
-                     me semble qu'il soit hors de propos dans la déserialization
-                     d'un fichier PACK. De plus, l'attitude de Git par rapport à
-                     ses objets est plutôt [lazy] dans le sens où la
-                     construction de ces objets se fait à la demande (alors que
-                     ici, elle peut se faire directement après qu'on est lu
-                     l'objet - cela n'empêche pas d'adopter une manière [lazy]
-                     avec cette interface, mais il faut créer le système de
-                     cache autour de cette déserialization et c'est dans ce sens
-                     que ce dernier est hors de propos).
-
-                     Bref, je laisse ce commentaire pour m'en souvenir déjà et
-                     pour les autres pour comprendre la problématique.
-  *)
-
-  let new_window t offset_requested =
+  let map_window t offset_requested =
     let pos = Int64.((offset_requested / 1024L) * 1024L) in (* padding *)
     let map = Mapper.map t.file ~pos ~share:false (1024 * 1024) in
     { Window.raw = map
     ; off   = pos
     ; len   = B.Bigstring.length map }
 
-  let really_inside offset_requested window =
-    let relative_offset = Int64.to_int Int64.(offset_requested - window.Window.off) in
-    (* XXX(dinosaure): the window size is [1024 * 1024], the relative offset can't be upper than
-                       [max_int31] in any case. It's safe to cast to a native integer in any
-                       architecture
-     *)
-    try
-      let byte = Char.code @@ B.Bigstring.get window.Window.raw relative_offset in
-      let msb  = byte land 0x80 <> 0 in
-      let _    = (byte land 0x70) lsr 4 in (* kind of the git object *)
-
-      let rec loop msb (len, bit, n) idx = match msb with
-        | true ->
-          let byte = Char.code @@ B.Bigstring.get window.Window.raw (relative_offset + idx) in
-          let msb  = byte land 0x80 <> 0 in
-          loop msb (len lor ((byte land 0x7F) lsl bit), bit + 7, n + 1) (idx + 1)
-        | false -> len, n
-      in
-
-      let len, n = loop msb (byte land 0x0F, 4, 1) 1 in
-      (* XXX(dinosaure): tips, [idx = n]. *)
-
-      Window.inside Int64.(offset_requested + (of_int n) + (of_int len) + 20L) window
-      (* XXX(dinosaure): + 20L need to be fixed! TODO! *)
-    with exn -> false (* appear with [B.Bigstring.get]. *)
-
   let find t offset_requested =
-    let predicate window =
-      Window.inside offset_requested window
-      && really_inside offset_requested window
-    in
+    let predicate window = Window.inside offset_requested window in
 
     match Bulk.find t.win predicate with
     | Some window ->
       let relative_offset = Int64.to_int Int64.(offset_requested - window.Window.off) in
       window, relative_offset
     | None ->
-      let window = new_window t offset_requested in
+      let window = map_window t offset_requested in
       let relative_offset = Int64.to_int Int64.(offset_requested - window.Window.off) in
 
       let () = Bulk.add t.win window in window, relative_offset
 
   let delta ?(chunk_size = 0x8000) t hunks offset_of_hunks z_tmp z_win h_tmp =
-      let absolute_offset = match hunks.H.reference with
-        | H.Offset off -> Ok (Int64.sub offset_of_hunks off)
-        | H.Hash hash -> match t.idx hash with
-          | Some off -> Ok off
-          | None -> Error (Invalid_hash hash)
+    let absolute_offset = match hunks.H.reference with
+      | H.Offset off ->
+        if off < t.max && off >= 0L
+        then Ok (Int64.sub offset_of_hunks off)
+        else Error (Invalid_offset off)
+      | H.Hash hash -> match t.idx hash with
+        | Some off -> Ok off
+        | None -> Error (Invalid_hash hash)
+    in
+
+    match absolute_offset with
+    | Ok absolute_offset ->
+      let window, relative_offset = find t absolute_offset in
+      let state    = P.from_window ~proof:B.proof_bigstring window relative_offset z_tmp z_win h_tmp in
+      let base_raw = B.from ~proof:B.proof_bigstring hunks.H.source_length in
+
+      let rec loop window consumed_in_window writted_in_raw git_object state =
+        match P.eval (B.from_bigstring window.Window.raw) state with
+        | `Await state ->
+          let rest_in_window = min (window.Window.len - consumed_in_window) chunk_size in
+
+          if rest_in_window > 0
+          then
+            loop window
+              (consumed_in_window + rest_in_window) writted_in_raw git_object
+              (P.refill consumed_in_window rest_in_window state)
+          else
+            let window, relative_offset = find t Int64.(window.Window.off + (of_int consumed_in_window)) in
+            (* XXX(dinosaure): we try to find a new window to compute the rest of the current object. *)
+            loop window
+              relative_offset
+              writted_in_raw
+              git_object
+              (P.refill 0 0 state)
+        | `Flush state ->
+          let o, n = P.output state in
+          B.blit o 0 base_raw writted_in_raw n;
+          loop window consumed_in_window (writted_in_raw + n) git_object (P.flush 0 n state)
+        | `Object state ->
+          loop window consumed_in_window writted_in_raw
+            (Some (P.kind state,
+                    P.offset state,
+                    P.length state,
+                    P.consumed state))
+            (P.next_object state) (* XXX *)
+        | `Error (state, exn) ->
+          Error (Unpack_error exn)
+        | `End (state, _) ->
+          match git_object with
+          | Some (kind, offset, length, consumed) ->
+            Ok (kind, offset, length, consumed)
+          | None -> assert false
+          (* XXX: This is not possible, the [`End] state comes only after the
+                  [`Object] state and this state changes [kind] to [Some x].
+            *)
       in
 
-      match absolute_offset with
-      | Ok absolute_offset ->
-        let window, relative_offset = find t absolute_offset in
-        let state    = P.from_window ~proof:B.proof_bigstring window relative_offset z_tmp z_win h_tmp in
-        let base_raw = B.from ~proof:B.proof_bigstring hunks.H.source_length in
-
-        let rec loop consumed_in_window writted_in_raw git_object state =
-          match P.eval (B.from_bigstring window.Window.raw) state with
-          | `Await state ->
-            let rest_in_window = min (window.Window.len - consumed_in_window) chunk_size in
-
-            if rest_in_window > 0
-            then loop (consumed_in_window + rest_in_window) writted_in_raw git_object (P.refill consumed_in_window rest_in_window state)
-            else Error (Invalid_source absolute_offset)
-          | `Flush state ->
-            let o, n = P.output state in
-            B.blit o 0 base_raw writted_in_raw n;
-            loop consumed_in_window (writted_in_raw + n) git_object (P.flush 0 n state)
-          | `Object state ->
-            loop consumed_in_window writted_in_raw (Some (P.kind state, P.offset state, P.length state, P.consumed state)) (P.next_object state) (* XXX *)
-          | `Error (state, exn) ->
-            Error (Unpack_error exn)
-          | `End (state, _) ->
-            match git_object with
-            | Some (kind, offset, length, consumed) ->
-              Ok (kind, offset, length, consumed)
-            | None -> assert false
-            (* XXX: This is not possible, the [`End] state comes only after the
-                    [`Object] state and this state changes [kind] to [Some x].
-             *)
-        in
-
-        (match loop relative_offset 0 None state with
-         | Ok (base_kind, base_offset, base_length, base_consumed) ->
-           Ok Base.{ kind     = base_kind
-                   ; raw      = base_raw
-                   ; offset   = base_offset
-                   ; length   = base_length
-                   ; consumed = base_consumed }
-         | Error exn -> Error exn)
-      | Error exn -> Error exn
+      (match loop window relative_offset 0 None state with
+        | Ok (base_kind, base_offset, base_length, base_consumed) ->
+          Ok Base.{ kind     = base_kind
+                  ; raw      = base_raw
+                  ; offset   = base_offset
+                  ; length   = base_length
+                  ; consumed = base_consumed }
+        | Error exn -> Error exn)
+    | Error exn -> Error exn
 
   let make ?(bulk = 10) file (idx : string -> int64 option) =
     { file
+    ; max  = Mapper.length file
     ; win  = Bulk.make bulk
     ; idx  = idx
     ; hash = "" (* TODO *) }
@@ -1345,18 +1220,30 @@ struct
       let state  = P.from_window ~proof:B.proof_bigstring window relative_offset z_tmp z_win h_tmp in
       let buffer = BBuffer.create ~proof:B.proof_bigstring chunk_size in
 
-      let rec loop consumed_in_window writted_in_raw git_object state =
+      let rec loop window consumed_in_window writted_in_raw git_object state =
         match P.eval (B.from_bigstring window.Window.raw) state with
         | `Await state ->
           let rest_in_window = min (window.Window.len - consumed_in_window) chunk_size in
 
           if rest_in_window > 0
-          then loop (consumed_in_window + rest_in_window) writted_in_raw git_object (P.refill consumed_in_window rest_in_window state)
-          else Error (Invalid_source absolute_offset)
+          then
+            loop window
+              (consumed_in_window + rest_in_window)
+              writted_in_raw
+              git_object
+              (P.refill consumed_in_window rest_in_window state)
+          else
+            let window, relative_offset = find t Int64.(window.Window.off + (of_int consumed_in_window)) in
+            (* XXX(dinosaure): we try to find a new window to compute the rest of the current object. *)
+            loop window
+              relative_offset
+              writted_in_raw
+              git_object
+              (P.refill 0 0 state)
         | `Flush t ->
           let o, n = P.output t in
           let ()   = BBuffer.add o ~len:n buffer in
-          loop consumed_in_window (writted_in_raw + n) git_object (P.flush 0 n t)
+          loop window consumed_in_window (writted_in_raw + n) git_object (P.flush 0 n t)
         | `Object state ->
           (match P.kind state with
            | P.Hunk hunks ->
@@ -1379,13 +1266,13 @@ struct
               | Ok (base, level) ->
                 (match apply ~proof:B.proof_bigstring hunks base with
                  | Ok base ->
-                   loop consumed_in_window writted_in_raw
+                   loop window consumed_in_window writted_in_raw
                      (Some (base.Base.kind, Some base.Base.raw, roffset, rlength, rconsumed))
                      (P.next_object state)
                  | Error exn -> Error exn)
               | Error exn -> Error exn)
            | kind ->
-             loop consumed_in_window writted_in_raw
+             loop window consumed_in_window writted_in_raw
                (Some (kind, None, P.offset state, P.length state, P.consumed state))
                (P.next_object state))
         | `Error (state, exn) ->
@@ -1396,7 +1283,7 @@ struct
           | None -> assert false
       in
 
-      (match loop relative_offset 0 None state with
+      (match loop window relative_offset 0 None state with
        | Ok (kind, None, offset, length, consumed) ->
          Ok Base.{ kind
                  ; raw = BBuffer.contents buffer
