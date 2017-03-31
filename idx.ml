@@ -1,28 +1,3 @@
-module B : sig
-  include module type of Decompress.B
-    with type st = Decompress.B.st
-     and type bs = Decompress.B.bs
-     and type 'a t = 'a Decompress.B.t
-
-  val to_cstruct : 'a t -> Cstruct.t
-  val blit_string : string -> int -> 'a t -> int -> int -> unit
-end = struct
-  include Decompress.B
-
-  let to_cstruct
-    : type a. a t -> Cstruct.t
-    = function
-    | Bytes v -> Cstruct.of_bytes v
-    | Bigstring v -> Cstruct.of_bigarray v
-
-  let blit_string src src_off dst dst_off len =
-    for i = 0 to len - 1
-    do set dst (dst_off + i) (String.get src (src_off + i)) done
-end
-
-external swap32 : int32 -> int32 = "%bswap_int32"
-external swap64 : int64 -> int64 = "%bswap_int64"
-
 module Lazy =
 struct
   type error = ..
@@ -36,8 +11,8 @@ struct
     | Invalid_version version -> pp fmt "(Invalid_version %ld)" version
     | Invalid_index -> pp fmt "Invalid_index"
 
-  type 'a t =
-    { map           : 'a B.t
+  type t =
+    { map           : Cstruct.t
     ; fanout_offset : int
     ; hashes_offset : int
     ; crcs_offset   : int
@@ -46,30 +21,30 @@ struct
     ; cache         : Int64.t LRU.t }
 
   let has map off len =
-    if (off < 0 || len < 0 || off + len > B.length map)
-    then raise (Invalid_argument (Printf.sprintf "%d:%d:%d" off len (B.length map)))
+    if (off < 0 || len < 0 || off + len > Cstruct.len map)
+    then raise (Invalid_argument (Printf.sprintf "%d:%d:%d" off len (Cstruct.len map)))
     else true
 
   let check_header map =
     if has map 0 4
-    then (if B.get map 0 = '\255'
-          && B.get map 1 = '\116'
-          && B.get map 2 = '\079'
-          && B.get map 3 = '\099'
+    then (if Cstruct.get_char map 0 = '\255'
+          && Cstruct.get_char map 1 = '\116'
+          && Cstruct.get_char map 2 = '\079'
+          && Cstruct.get_char map 3 = '\099'
           then Ok ()
-          else Error (Invalid_header (B.to_string @@ B.sub map 0 4)))
+          else Error (Invalid_header (Cstruct.to_string @@ Cstruct.sub map 0 4)))
     else Error Invalid_index
 
   let check_version map =
     if has map 4 4
-    then (if Endian.get_u32 map 4 = 2l
+    then (if Cstruct.BE.get_uint32 map 4 = 2l
           then Ok ()
-          else Error (Invalid_version (Endian.get_u32 map 4)))
+          else Error (Invalid_version (Cstruct.BE.get_uint32 map 4)))
     else Error Invalid_index
 
   let number_of_hashes map =
     if has map 8 (256 * 4)
-    then let n = Endian.get_u32 map (8 + (255 * 4)) in
+    then let n = Cstruct.BE.get_uint32 map (8 + (255 * 4)) in
          Ok (8, n)
     else Error Invalid_index
 
@@ -99,7 +74,7 @@ struct
 
   let compare buf off hash =
     try for i = 0 to 19
-        do if B.get buf (off + i) <> String.get hash i
+        do if Cstruct.get_char buf (off + i) <> String.get hash i
            then raise Break
         done; true
     with Break -> false
@@ -109,7 +84,7 @@ struct
 
   let lt buf off hash =
     try for i = 0 to 19
-        do let a = Char.code @@ B.get buf (off + i) in
+        do let a = Cstruct.get_uint8 buf (off + i) in
            let b = Char.code @@ String.get hash i in
 
            if a > b
@@ -138,7 +113,7 @@ struct
         else aux off' (len - len') buf
     in
 
-    aux 0 (B.length buf) buf
+    aux 0 (Cstruct.len buf) buf
 
   (* XXX(dinosaure): we have a problem with a 32 bits architecture. Indeed, in
                      the 32 bits architecture, the integer in OCaml is a 31
@@ -158,23 +133,23 @@ struct
   let fanout_idx t hash =
     match Char.code @@ String.get hash 0 with
     | 0 ->
-      let n = Endian.get_u32 t.map t.fanout_offset in
-      Ok (binary_search (B.sub t.map t.hashes_offset (Int32.to_int n * 20)) hash)
+      let n = Cstruct.BE.get_uint32 t.map t.fanout_offset in
+      Ok (binary_search (Cstruct.sub t.map t.hashes_offset (Int32.to_int n * 20)) hash)
     | idx ->
       if has t.map (t.fanout_offset + (4 * idx)) 4
       && has t.map (t.fanout_offset + (4 * (idx - 1))) 4
-      then let off1 = Int32.to_int @@ Endian.get_u32 t.map (t.fanout_offset + (4 * idx)) in
-           let off0 = Int32.to_int @@ Endian.get_u32 t.map (t.fanout_offset + (4 * (idx - 1))) in
+      then let off1 = Int32.to_int @@ Cstruct.BE.get_uint32 t.map (t.fanout_offset + (4 * idx)) in
+           let off0 = Int32.to_int @@ Cstruct.BE.get_uint32 t.map (t.fanout_offset + (4 * (idx - 1))) in
 
            if has t.map (t.hashes_offset + (off0 * 20)) ((off1 - off0) * 20)
-           then Ok (binary_search (B.sub t.map (t.hashes_offset + (off0 * 20)) ((off1 - off0) * 20)) hash + off0)
+           then Ok (binary_search (Cstruct.sub t.map (t.hashes_offset + (off0 * 20)) ((off1 - off0) * 20)) hash + off0)
            else Error Invalid_index
       else Error Invalid_index
 
   let nth t n =
     let off = Int32.to_int @@ Int32.mul 20l n in
 
-    B.sub t.map (t.hashes_offset + off) 20
+    Cstruct.sub t.map (t.hashes_offset + off) 20
 
   let find t hash =
     match LRU.find t.cache hash with
@@ -182,7 +157,7 @@ struct
     | None ->
       match fanout_idx t hash with
       | Ok idx ->
-        let off = Endian.get_u32 t.map (t.values_offset + (idx * 4)) in
+        let off = Cstruct.BE.get_uint32 t.map (t.values_offset + (idx * 4)) in
         Some (Int64.of_int32 off)
       | Error _ -> None
 end
@@ -202,7 +177,7 @@ struct
     | Invalid_index_of_bigoffset idx -> pp fmt "(Invalid_index_of_bigoffset %d)" idx
     | Expected_bigoffset_table -> pp fmt "Expected_bigoffset_table"
 
-  type 'i t =
+  type t =
     { i_off   : int
     ; i_pos   : int
     ; i_len   : int
@@ -210,22 +185,23 @@ struct
     ; hashes  : string Queue.t
     ; crcs    : Int32.t Queue.t
     ; offsets : (Int32.t * bool) Queue.t
-    ; state   : 'i state }
-  and 'i state =
-    | Header    of ('i B.t -> 'i t -> 'i res)
-    | Fanout    of ('i B.t -> 'i t -> 'i res)
-    | Hashes    of ('i B.t -> 'i t -> 'i res)
-    | Crcs      of ('i B.t -> 'i t -> 'i res)
-    | Offsets   of ('i B.t -> 'i t -> 'i res)
+    ; state   : state }
+  and k = Cstruct.t -> t -> res
+  and state =
+    | Header    of k
+    | Fanout    of k
+    | Hashes    of k
+    | Crcs      of k
+    | Offsets   of k
     | Ret
     | End
     | Exception of error
-  and 'i res =
-    | Wait   of 'i t
-    | Error  of 'i t * error
-    | Cont   of 'i t
-    | Result of 'i t * (string * Int32.t * Int64.t)
-    | Ok     of 'i t
+  and res =
+    | Wait   of t
+    | Error  of t * error
+    | Cont   of t
+    | Result of t * (string * Int32.t * Int64.t)
+    | Ok     of t
 
   let await t     = Wait t
   let error t exn = Error ({ t with state = Exception exn }, exn)
@@ -254,22 +230,22 @@ struct
   module KHeader =
   struct
     let rec check_byte chr k src t =
-      if (t.i_len - t.i_pos) > 0 && B.get src (t.i_off + t.i_pos) = chr
+      if (t.i_len - t.i_pos) > 0 && Cstruct.get_char src (t.i_off + t.i_pos) = chr
       then k src { t with i_pos = t.i_pos + 1 }
       else if (t.i_len - t.i_pos) = 0
       then await { t with state = Header (fun src t -> (check_byte[@tailcall]) chr k src t) }
       else error { t with i_pos = t.i_pos + 1 }
-                 (Invalid_byte (Char.code @@ B.get src (t.i_off + t.i_pos)))
+                 (Invalid_byte (Cstruct.get_uint8 src (t.i_off + t.i_pos)))
 
     let rec get_byte k src t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
       else await { t with state = Header (fun src t -> (get_byte[@tailcall]) k src t) }
 
     let rec get_u32 k src t =
       if (t.i_len - t.i_pos) > 3
-      then let num = Endian.get_u32 src (t.i_off + t.i_pos) in
+      then let num = Cstruct.BE.get_uint32 src (t.i_off + t.i_pos) in
            k num src
              { t with i_pos = t.i_pos + 4 }
       else if (t.i_len - t.i_pos) > 0
@@ -287,13 +263,13 @@ struct
   struct
     let rec get_byte k src t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
       else await { t with state = Fanout (fun src t -> (get_byte[@tailcall]) k src t) }
 
     let rec get_u32 k src t =
       if (t.i_len - t.i_pos) > 3
-      then let num = Endian.get_u32 src (t.i_off + t.i_pos) in
+      then let num = Cstruct.BE.get_uint32 src (t.i_off + t.i_pos) in
            k num src
              { t with i_pos = t.i_pos + 4 }
       else if (t.i_len - t.i_pos) > 0
@@ -311,7 +287,7 @@ struct
   struct
     let rec get_byte k src t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
       else await { t with state = Hashes (fun src t -> (get_byte[@tailcall]) k src t) }
 
@@ -335,13 +311,13 @@ struct
   struct
     let rec get_byte k src t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
       else await { t with state = Crcs (fun src t -> (get_byte[@tailcall]) k src t) }
 
     let rec get_u32 k src t =
       if (t.i_len - t.i_pos) > 3
-      then let num = Endian.get_u32 src (t.i_off + t.i_pos) in
+      then let num = Cstruct.BE.get_uint32 src (t.i_off + t.i_pos) in
            k num src
              { t with i_pos = t.i_pos + 4 }
       else if (t.i_len - t.i_pos) > 0
@@ -359,13 +335,13 @@ struct
   struct
     let rec get_byte k src t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
       else await { t with state = Offsets (fun src t -> (get_byte[@tailcall]) k src t) }
 
     let rec get_u32 k src t =
       if (t.i_len - t.i_pos) > 3
-      then let num = Endian.get_u32 src (t.i_off + t.i_pos) in
+      then let num = Cstruct.BE.get_uint32 src (t.i_off + t.i_pos) in
            k num src
              { t with i_pos = t.i_pos + 4 }
       else if (t.i_len - t.i_pos) > 0
@@ -386,7 +362,7 @@ struct
 
     let rec get_u64 k src t =
       if (t.i_len - t.i_pos) > 7
-      then let num = Endian.get_u64 src (t.i_off + t.i_pos) in
+      then let num = Cstruct.BE.get_uint64 src (t.i_off + t.i_pos) in
            k num src
              { t with i_pos = t.i_pos + 8 }
       else if (t.i_len - t.i_pos) > 0
@@ -530,27 +506,28 @@ struct
   let pp_error fmt = function
     | _ -> Format.fprintf fmt "<error>"
 
-  type 'o t =
+  type t =
     { o_off    : int
     ; o_pos    : int
     ; o_len    : int
     ; write    : int
     ; table    : (int32 * int64) Fanout.t
     ; boffsets : int64 array
-    ; state    : 'o state }
-  and 'o state =
-    | Header     of ('o B.t -> 'o t -> 'o res)
-    | Fanout     of ('o B.t -> 'o t -> 'o res)
-    | Hashes     of ('o B.t -> 'o t -> 'o res)
-    | Crcs       of ('o B.t -> 'o t -> 'o res)
-    | Offsets    of ('o B.t -> 'o t -> 'o res)
-    | BigOffsets of ('o B.t -> 'o t -> 'o res)
+    ; state    : state }
+  and k = Cstruct.t -> t -> res
+  and state =
+    | Header     of k
+    | Fanout     of k
+    | Hashes     of k
+    | Crcs       of k
+    | Offsets    of k
+    | BigOffsets of k
     | End
-  and 'o res =
-    | Error  of 'o t * error
-    | Flush  of 'o t
-    | Cont   of 'o t
-    | Ok     of 'o t
+  and res =
+    | Error  of t * error
+    | Flush  of t
+    | Cont   of t
+    | Ok     of t
 
   (* XXX(dinosaure): the state contains only a closure. May be we can optimize
                      the serialization with an hot loop (like Decompress). But
@@ -573,7 +550,7 @@ struct
     let rec put_byte chr k dst t =
       if (t.o_len - t.o_pos) > 0
       then begin
-        B.set dst (t.o_off + t.o_pos) chr;
+        Cstruct.set_char dst (t.o_off + t.o_pos) chr;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = t.write + 1 }
       end else Flush { t with state = Header (put_byte chr k) }
@@ -585,7 +562,7 @@ struct
     let rec put_int32 integer k dst t =
       if (t.o_len - t.o_pos) >= 4
       then begin
-        Endian.set_u32 dst (t.o_off + t.o_pos) integer;
+        Cstruct.BE.set_uint32 dst (t.o_off + t.o_pos) integer;
         k dst { t with o_pos = t.o_pos + 4
                      ; write = t.write + 4 }
       end else if (t.o_len - t.o_pos) > 0
@@ -618,7 +595,7 @@ struct
     let rec put_byte chr k dst t =
       if (t.o_len - t.o_pos) > 0
       then begin
-        B.set dst (t.o_off + t.o_pos) chr;
+        Cstruct.set_char dst (t.o_off + t.o_pos) chr;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = t.write + 1 }
       end else Flush { t with state = Fanout (put_byte chr k) }
@@ -626,7 +603,7 @@ struct
     let rec put_int32 integer k dst t =
       if (t.o_len - t.o_pos) >= 4
       then begin
-        Endian.set_u32 dst (t.o_off + t.o_pos) integer;
+        Cstruct.BE.set_uint32 dst (t.o_off + t.o_pos) integer;
         k dst { t with o_pos = t.o_pos + 4
                      ; write = t.write + 4 }
       end else if (t.o_len - t.o_pos) > 0
@@ -648,7 +625,7 @@ struct
     let rec put_byte chr k dst t =
       if (t.o_len - t.o_pos) > 0
       then begin
-        B.set dst (t.o_off + t.o_pos) chr;
+        Cstruct.set_char dst (t.o_off + t.o_pos) chr;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = t.write + 1 }
       end else Flush { t with state = Hashes (put_byte chr k) }
@@ -656,14 +633,14 @@ struct
     let rec put_hash hash k dst t =
       if (t.o_len - t.o_pos) >= 20
       then begin
-        B.blit_string hash 0 dst (t.o_off + t.o_pos) 20;
+        Cstruct.blit_from_string hash 0 dst (t.o_off + t.o_pos) 20;
         k dst { t with o_pos = t.o_pos + 20
                      ; write = t.write + 20 }
       end else if (t.o_len - t.o_pos) > 0
       then let rec aux rest hash k dst t =
              if rest <> 0
              then let n = min (t.o_len - t.o_pos) rest in
-                  B.blit_string hash (20 - rest) dst (t.o_off + t.o_pos)  n;
+                  Cstruct.blit_from_string hash (20 - rest) dst (t.o_off + t.o_pos)  n;
                   Flush { t with state = Hashes (aux (rest - n) hash k)
                                ; o_pos = t.o_pos + n
                                ; write = t.write + n }
@@ -677,7 +654,7 @@ struct
     let rec put_byte chr k dst t =
       if (t.o_len - t.o_pos) > 0
       then begin
-        B.set dst (t.o_off + t.o_pos) chr;
+        Cstruct.set_char dst (t.o_off + t.o_pos) chr;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = t.write + 1 }
       end else Flush { t with state = Crcs (put_byte chr k) }
@@ -685,7 +662,7 @@ struct
     let rec put_int32 integer k dst t =
       if (t.o_len - t.o_pos) >= 4
       then begin
-        Endian.set_u32 dst (t.o_off + t.o_pos) integer;
+        Cstruct.BE.set_uint32 dst (t.o_off + t.o_pos) integer;
         k dst { t with o_pos = t.o_pos + 4
                      ; write = t.write + 4 }
       end else if (t.o_len - t.o_pos) > 0
@@ -707,7 +684,7 @@ struct
     let rec put_byte chr k dst t =
       if (t.o_len - t.o_pos) > 0
       then begin
-        B.set dst (t.o_off + t.o_pos) chr;
+        Cstruct.set_char dst (t.o_off + t.o_pos) chr;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = t.write + 1 }
       end else Flush { t with state = Offsets (put_byte chr k) }
@@ -715,7 +692,7 @@ struct
     let rec put_int32 integer k dst t =
       if (t.o_len - t.o_pos) >= 4
       then begin
-        Endian.set_u32 dst (t.o_off + t.o_pos) integer;
+        Cstruct.BE.set_uint32 dst (t.o_off + t.o_pos) integer;
         k dst { t with o_pos = t.o_pos + 4
                      ; write = t.write + 4 }
       end else if (t.o_len - t.o_pos) > 0
@@ -737,7 +714,7 @@ struct
     let rec put_byte chr k dst t =
       if (t.o_len - t.o_pos) > 0
       then begin
-        B.set dst (t.o_off + t.o_pos) chr;
+        Cstruct.set_char dst (t.o_off + t.o_pos) chr;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = t.write + 1 }
       end else Flush { t with state = BigOffsets (put_byte chr k) }
@@ -745,7 +722,7 @@ struct
     let rec put_int64 integer k dst t =
       if (t.o_len - t.o_pos) >= 8
       then begin
-        Endian.set_u64 dst (t.o_off + t.o_pos) integer;
+        Cstruct.BE.set_uint64 dst (t.o_off + t.o_pos) integer;
         k dst { t with o_pos = t.o_pos + 8
                      ; write = t.write + 8 }
       end else if (t.o_len - t.o_pos) > 0
@@ -869,7 +846,7 @@ struct
                      let the user to use any data structure to store the CRC and
                      the Offset for each hash.
    *)
-  let default : (string * (int32 * int64)) sequence -> 'o t = fun seq ->
+  let default : (string * (int32 * int64)) sequence -> t = fun seq ->
 
     let boffsets = ref [] in
     let table    = Fanout.make () in
@@ -894,7 +871,7 @@ struct
 end
 
 let idx_to_tree refiller =
-  let input = B.from ~proof:B.proof_bigstring 0x8000 in
+  let input = Cstruct.create 0x8000 in
 
   let rec loop tree t = match Decoder.eval input t with
     | `Await t ->

@@ -6,14 +6,18 @@ struct
 
   let length fd = (Unix.LargeFile.fstat fd).Unix.LargeFile.st_size
 
+  (* specialization of [min]. *)
+  let min_int64 (a : int64) (b : int64) = if a < b then a else b
+
   let map fd ?pos ~share len =
     let max = length fd in (* avoid to grow the file. *)
     let max = match pos with
       | Some pos -> Int64.sub max pos
       | None -> max
     in
-    let min_int64 (a : int64) (b : int64) = if a < b then a else b in
-    Bigarray.Array1.map_file fd ?pos Bigarray.Char Bigarray.c_layout share (Int64.to_int (min_int64 (Int64.of_int len) max))
+    let result = Bigarray.Array1.map_file fd ?pos Bigarray.Char Bigarray.c_layout share (Int64.to_int (min_int64 (Int64.of_int len) max)) in
+
+    Cstruct.of_bigarray result
 end
 
 module D = D(Mapper)
@@ -31,7 +35,7 @@ let hash_of_object kind length =
   fun raw ->
     Nocrypto.Hash.SHA1.digestv
       [ Cstruct.of_string hdr
-      ; B.to_cstruct raw ]
+      ; raw ]
     |> Cstruct.to_string
 
 let pp_kind fmt = function
@@ -89,6 +93,10 @@ let pp fmt = function
   | `Tree tree -> Minigit.Tree.pp fmt tree
   | `Blob blob -> Format.fprintf fmt "#blob"
 
+let to_cstruct : type a. a Decompress.B.t -> Cstruct.t = function
+  | Decompress.B.Bytes bs -> Cstruct.of_bytes bs
+  | Decompress.B.Bigstring bs -> Cstruct.of_bigarray bs
+
 let dual encoder (kind, raw, length) =
   write_header encoder (kind, raw, length);
 
@@ -98,32 +106,28 @@ let dual encoder (kind, raw, length) =
      | Ok commit -> Minigit.Commit.Encoder.write_commit encoder commit
      | Error exn ->
        Format.eprintf "Invalid commit: %a\n%!" Minidec.pp_error exn;
-       Format.eprintf "%a\n%!"
-         Hex.hexdump (Hex.of_string_fast (B.to_string raw));
+       Format.eprintf "%a\n%!" Cstruct.hexdump_pp (to_cstruct raw);
        assert false)
   | P.Tree ->
     (match Minigit.Tree.Decoder.to_result raw with
      | Ok tree -> Minigit.Tree.Encoder.write_tree encoder tree
      | Error exn ->
        Format.eprintf "Invalid tree: %a\n%!" Minidec.pp_error exn;
-       Format.eprintf "%a\n%!"
-         Hex.hexdump (Hex.of_string_fast (B.to_string raw));
+       Format.eprintf "%a\n%!" Cstruct.hexdump_pp (to_cstruct raw);
        assert false)
   | P.Blob ->
     (match Minigit.Blob.Decoder.to_result raw with
      | Ok blob -> Minigit.Blob.Encoder.write_blob encoder blob
      | Error exn ->
        Format.eprintf "Invalid blob: %a\n%!" Minidec.pp_error exn;
-       Format.eprintf "%a\n%!"
-         Hex.hexdump (Hex.of_string_fast (B.to_string raw));
+       Format.eprintf "%a\n%!" Cstruct.hexdump_pp (to_cstruct raw);
        assert false)
   | P.Tag ->
     (match Minigit.Tag.Decoder.to_result raw with
      | Ok tag -> Minigit.Tag.Encoder.write_tag encoder tag
      | Error exn ->
        Format.eprintf "Invalid tag: %a\n%!" Minidec.pp_error exn;
-       Format.eprintf "%a\n%!"
-         Hex.hexdump (Hex.of_string_fast (B.to_string raw));
+       Format.eprintf "%a\n%!" Cstruct.hexdump_pp (to_cstruct raw);
        assert false)
   | P.Hunk _ -> assert false
 
@@ -162,7 +166,7 @@ let hash_of_encoder encoder =
     Format.eprintf "Unexpected close of the encoder\n%!";
     assert false
 
-let encoder_tmp = B.from B.proof_bigstring 0x8000
+let encoder_tmp = Decompress.B.from Decompress.B.proof_bigstring 0x8000
 let encoder = Minienc.from encoder_tmp
 
 (* check the offset provided by the deserialization of the PACK file with the
@@ -217,7 +221,7 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
 
          Format.eprintf "OK (without header):\n%a\n%!"
            Hex.hexdump (Hex.of_string_fast ((header_to_string (kind, raw, length))
-                                            ^ B.to_string raw));
+                                            ^ Decompress.B.to_string raw));
 
          `Ok (Cstruct.lenv lst))
       in
@@ -243,19 +247,19 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
         offset
 
 let unpack ?(chunk = 0x8000) pack_filename get =
-  let buf   = BBuffer.create ~proof:(B.from_bigstring B.Bigstring.empty) chunk in
-  let z_tmp = B.from_bigstring (B.Bigstring.create 0x8000) in
-  let h_tmp = B.from_bigstring (B.Bigstring.create 0x8000) in
-  let z_win = Decompress.Window.create ~proof:B.proof_bigstring in
+  let buf   = BBuffer.create chunk in
+  let z_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000) in
+  let h_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000) in
+  let z_win = Decompress.Window.create ~proof:Decompress.B.proof_bigstring in
 
   let pack_fd = Unix.openfile pack_filename [ Unix.O_RDONLY ] 0o644 in
-  let map     = B.from_bigstring @@ Bigarray.Array1.map_file pack_fd Bigarray.Char Bigarray.c_layout false (-1) in
+  let map     = Cstruct.of_bigarray @@ Bigarray.Array1.map_file pack_fd Bigarray.Char Bigarray.c_layout false (-1) in
   let rap     = D.make pack_fd get in
 
-  let rec loop offset (t : ('a, 'a) P.t) =
+  let rec loop offset (t : P.t) =
     match P.eval map t with
     | `Await t ->
-      let chunk = min (B.length map - offset) chunk in
+      let chunk = min (Cstruct.len map - offset) chunk in
       if chunk > 0
       then loop (offset + chunk) (P.refill offset chunk t)
       else Error (`File_error End_of_file)
@@ -273,11 +277,6 @@ let unpack ?(chunk = 0x8000) pack_filename get =
         let (rlength, rconsumed, roffset) = P.length t, P.consumed t, P.offset t in
 
         let rec undelta ?(level = 1) hunks offset =
-          B.fill z_tmp 0 0x8000 '\000';
-          B.fill h_tmp 0 0x8000 '\000';
-
-          assert (D.check_file rap pack_fd);
-
           match D.delta rap hunks offset z_tmp z_win h_tmp with
           | Error exn ->
             Error (`Delta_error exn)
@@ -285,7 +284,7 @@ let unpack ?(chunk = 0x8000) pack_filename get =
             (match undelta ~level:(level + 1) hunks offset with
              | Ok (base, _, level) ->
 
-               Result.(D.apply ~proof:B.proof_bigstring hunks base
+               Result.(D.apply hunks base
                        >>! (fun exn -> `Delta_error exn)
                        >>| (fun base ->
                             let base_hash = hash_of_object base.D.Base.kind base.D.Base.length base.D.Base.raw in
@@ -298,11 +297,11 @@ let unpack ?(chunk = 0x8000) pack_filename get =
 
         (match undelta hunks (P.offset t) with
          | Ok (base, base_hash, level) ->
-           (match D.apply ~proof:B.proof_bigstring hunks base with
+           (match D.apply hunks base with
             | Ok base ->
               let hash = hash_of_object base.D.Base.kind base.D.Base.length base.D.Base.raw in
 
-              check hash base.D.Base.kind base.D.Base.raw rlength rconsumed roffset ~base:(level, base_hash, base.D.Base.length) get;
+              check hash base.D.Base.kind (Decompress.B.Bigstring (Cstruct.to_bigarray base.D.Base.raw)) rlength rconsumed roffset ~base:(level, base_hash, base.D.Base.length) get;
               loop offset (P.next_object t)
             | Error exn -> Error (`Delta_error exn))
          | Error exn -> Error exn)
@@ -310,18 +309,18 @@ let unpack ?(chunk = 0x8000) pack_filename get =
         let raw = BBuffer.contents buf in
         let hash = hash_of_object kind (P.length t) raw in
 
-        check hash kind raw (P.length t) (P.consumed t) (P.offset t) get;
+        check hash kind (Decompress.B.Bigstring (Cstruct.to_bigarray raw)) (P.length t) (P.consumed t) (P.offset t) get;
         BBuffer.clear buf;
         loop offset (P.next_object t)
   in
 
-  loop 0 (P.default ~proof:map ~chunk:chunk z_tmp z_win h_tmp)
+  loop 0 (P.default z_tmp z_win h_tmp)
 
 (* Bigstring map. *)
-let bs_map filename =
+let cstruct_map filename =
   let i = Unix.openfile filename [ Unix.O_RDONLY ] 0o644 in
   let m = Bigarray.Array1.map_file i Bigarray.Char Bigarray.c_layout false (-1) in
-  B.from_bigstring m
+  Cstruct.of_bigarray m
 
 type error = [ `Pack_error of P.error
              | `Delta_error of D.error
@@ -338,19 +337,19 @@ let dual_index_err ()  = `Dual_index_error
 (* serialization of a IDX tree. *)
 let serialize_idx_file tree =
   let state  = Idx.Encoder.default (Radix.to_sequence tree) in
-  let output = Bytes.create 0x800 in
-  let result = BBuffer.create ~proof:B.proof_bytes 0x800 in
+  let output = Cstruct.create 0x800 in
+  let result = BBuffer.create 0x800 in
 
-  let rec loop t = match Idx.Encoder.eval (B.from_bytes output) t with
+  let rec loop t = match Idx.Encoder.eval output t with
     | `Flush t ->
       let len = Idx.Encoder.used_out t in
-      BBuffer.add_bytes output ~off:0 ~len result;
+      BBuffer.add output ~off:0 ~len result;
       loop (Idx.Encoder.flush 0 0x800 t)
     | `End t ->
       if Idx.Encoder.used_out t <> 0
-      then BBuffer.add_bytes output ~off:0 ~len:(Idx.Encoder.used_out t) result;
+      then BBuffer.add output ~off:0 ~len:(Idx.Encoder.used_out t) result;
 
-      Ok (B.to_string @@ BBuffer.contents result)
+      Ok (Cstruct.to_string @@ BBuffer.contents result)
     | `Error (t, exn) -> Error exn
   in
 
@@ -363,6 +362,8 @@ exception Break
      non-blocking implementation.
 *)
 let check_idx_implementation refiller rai =
+  Format.eprintf "check_idx_implementation\n%!";
+
   let getter hash = Idx.Lazy.find rai hash in
 
   match Idx.idx_to_tree refiller with
@@ -394,8 +395,8 @@ let dual_idx (tree, rai) =
     let len = String.length bytes in
 
     fun buffer ->
-      let n = min (len - !pos) (B.length buffer) in
-      B.blit_string bytes !pos buffer 0 n;
+      let n = min (len - !pos) (Cstruct.len buffer) in
+      Cstruct.blit_from_string bytes !pos buffer 0 n;
       pos := !pos + n;
       n
   in
@@ -404,15 +405,15 @@ let dual_idx (tree, rai) =
 
 let () =
   let pack_filename = Sys.argv.(1) in (* alloc *)
-  let ii = bs_map Sys.argv.(2) in (* alloc *)
+  let ii = cstruct_map Sys.argv.(2) in (* alloc *)
 
   let refiller map =
     let pos = ref 0 in
-    let len = B.length map in
+    let len = Cstruct.len map in
 
     fun buffer ->
-      let n = min (len - !pos) (B.length buffer) in
-      B.blit map !pos buffer 0 n;
+      let n = min (len - !pos) (Cstruct.len buffer) in
+      Cstruct.blit map !pos buffer 0 n;
       pos := !pos + n;
       n
   in
@@ -436,9 +437,9 @@ let () =
   | Error (`Lazy_index_error exn) ->
     Format.eprintf "lazy index error: %a\n%!" Idx.Lazy.pp_error exn
   | Error (`Decoder_index_error exn) ->
-    Format.eprintf "index error: %a\n%!" Idx.Decoder.pp_error exn
+    Format.eprintf "index (decoder) error: %a\n%!" Idx.Decoder.pp_error exn
   | Error (`Encoder_index_error exn) ->
-    Format.eprintf "index error: %a\n%!" Idx.Encoder.pp_error exn
+    Format.eprintf "index (encoder) error: %a\n%!" Idx.Encoder.pp_error exn
   | Error `Implementation_index_error ->
     Format.eprintf "implementation index error\n%!"
   | Error (`File_error exn) ->

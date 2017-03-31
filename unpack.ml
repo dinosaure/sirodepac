@@ -1,44 +1,17 @@
 let () = Printexc.record_backtrace true
 
-module B : sig
-  include module type of Decompress.B
-    with type st = Decompress.B.st
-     and type bs = Decompress.B.bs
-     and type 'a t = 'a Decompress.B.t
-
-  val to_cstruct : 'a t -> Cstruct.t
-  val blit_string : string -> int -> 'a t -> int -> int -> unit
-  val blit_bytes  : bytes -> int -> 'a t -> int -> int -> unit
-end = struct
-  include Decompress.B
-
-  let to_cstruct
-    : type a. a t -> Cstruct.t
-    = function
-    | Bytes v -> Cstruct.of_bytes v
-    | Bigstring v -> Cstruct.of_bigarray v
-
-  let blit_string src src_off dst dst_off len =
-    for i = 0 to len - 1
-    do set dst (dst_off + i) (String.get src (src_off + i)) done
-
-  let blit_bytes src src_off dst dst_off len =
-    for i = 0 to len - 1
-    do set dst (dst_off + i) (Bytes.get src (src_off + i)) done
-end
-
 module BBuffer =
 struct
-  type 'i t =
-    { mutable buf : 'i B.t
+  type t =
+    { mutable buf : Cstruct.t
     ; mutable pos : int
     ; mutable len : int
-    ; init        : 'i B.t }
+    ; init        : Cstruct.t }
 
-  let create ~proof n =
+  let create n =
     let n = if n < 1 then 1 else n in
     let n = if n > Sys.max_string_length then Sys.max_string_length else n in
-    let s = B.from ~proof n in
+    let s = Cstruct.create n in
 
     { buf  = s
     ; pos  = 0
@@ -46,7 +19,7 @@ struct
     ; init = s }
 
   let contents b =
-    B.sub b.buf 0 b.pos
+    Cstruct.sub b.buf 0 b.pos
 
   let length b = b.pos
 
@@ -60,28 +33,16 @@ struct
          then len' := Sys.max_string_length
          else raise (Failure "BBuffer.add: cannot grow buffer");
 
-    let buf' = B.from buf !len' in
+    let buf' = Cstruct.create !len' in
 
-    B.blit buf 0 buf' 0 pos;
+    Cstruct.blit buf 0 buf' 0 pos;
     b.buf <- buf';
     b.len <- !len'
 
-  let blit_string src src_off dst dst_off len =
-    for i = 0 to len - 1
-    do B.set dst (dst_off + i) (String.get src (src_off + i)) done
-
-  let blit_bytes src src_off dst dst_off len =
-    for i = 0 to len - 1
-    do B.set dst (dst_off + i) (Bytes.get src (src_off + i)) done
-
-  let blit_bigstring src src_off dst dst_off len =
-    for i = 0 to len - 1
-    do B.set dst (dst_off + i) (B.Bigstring.get src (src_off + i)) done
-
   (* XXX(dinosaure): we can factorize by a first module, but too big to be
                      useful. *)
-  let add tmp ?(off = 0) ?(len = B.length tmp) buf =
-    if off < 0 || len < 0 || off + len > B.length tmp
+  let add tmp ?(off = 0) ?(len = Cstruct.len tmp) buf =
+    if off < 0 || len < 0 || off + len > Cstruct.len tmp
     then raise (Invalid_argument "BBuffer.add");
 
     let pos' = buf.pos + len in
@@ -89,7 +50,8 @@ struct
     if pos' > buf.len
     then resize buf len;
 
-    B.blit tmp off buf.buf buf.pos len;
+    Cstruct.blit tmp off buf.buf buf.pos len;
+
     buf.pos <- pos'
 
   let add_string tmp ?(off = 0) ?(len = String.length tmp) buf =
@@ -101,7 +63,7 @@ struct
     if pos' > buf.len
     then resize buf len;
 
-    blit_string tmp off buf.buf buf.pos len;
+    Cstruct.blit_from_string tmp off buf.buf buf.pos len;
     buf.pos <- pos'
 
   let add_bytes tmp ?(off = 0) ?(len = Bytes.length tmp) buf =
@@ -113,11 +75,11 @@ struct
     if pos' > buf.len
     then resize buf len;
 
-    blit_bytes tmp off buf.buf buf.pos len;
+    Cstruct.blit_from_bytes tmp off buf.buf buf.pos len;
     buf.pos <- pos'
 
-  let add_bigstring tmp ?(off = 0) ?(len = B.Bigstring.length tmp) buf =
-    if off < 0 || len < 0 || off + len > B.Bigstring.length tmp
+  let add_bigstring tmp ?(off = 0) ?(len = Decompress.B.Bigstring.length tmp) buf =
+    if off < 0 || len < 0 || off + len > Decompress.B.Bigstring.length tmp
     then raise (Invalid_argument "BBuffer.add_bigstring");
 
     let pos' = buf.pos + len in
@@ -125,18 +87,11 @@ struct
     if pos' > buf.len
     then resize buf len;
 
-    blit_bigstring tmp off buf.buf buf.pos len;
+    Cstruct.blit (Cstruct.of_bigarray tmp) off buf.buf buf.pos len;
     buf.pos <- pos'
 
   let clear b = b.pos <- 0
 end
-
-external swap32 : int32 -> int32 = "%bswap_int32"
-external swap64 : int64 -> int64 = "%bswap_int64"
-
-let pp_hash fmt s =
-  for i = 0 to String.length s - 1
-  do Format.fprintf fmt "%02x" (Char.code @@ String.get s i) done
 
 let sp = Format.sprintf
 
@@ -156,38 +111,39 @@ struct
   type error += Reserved_opcode of int
   type error += Wrong_insert_hunk of int * int * int
 
-  type 'i t =
-    { i_off         : int
-    ; i_pos         : int
-    ; i_len         : int
-    ; read          : int
+  type t =
+    { i_off          : int
+    ; i_pos          : int
+    ; i_len          : int
+    ; read           : int
     ; _length        : int
     ; _reference     : reference
     ; _source_length : int
     ; _target_length : int
-    ; _hunks         : 'i hunk list
-    ; state         : 'i state }
-  and 'i state =
-    | Header    of ('i B.t -> 'i t -> 'i res)
-    | List      of ('i B.t -> 'i t -> 'i res)
-    | Is_insert of ('i B.t * int * int)
-    | Is_copy   of ('i B.t -> 'i t -> 'i res)
+    ; _hunks         : hunk list
+    ; state          : state }
+  and k = Cstruct.t -> t -> res
+  and state =
+    | Header    of k
+    | List      of k
+    | Is_insert of (Cstruct.t * int * int)
+    | Is_copy   of k
     | End
     | Exception of error
-  and 'i res =
-    | Wait   of 'i t
-    | Error  of 'i t * error
-    | Cont   of 'i t
-    | Ok     of 'i t * 'i hunks
-  and 'i hunk =
-    | Insert of 'i B.t
+  and res =
+    | Wait   of t
+    | Error  of t * error
+    | Cont   of t
+    | Ok     of t * hunks
+  and hunk =
+    | Insert of Cstruct.t
     | Copy   of int * int
   and reference =
     | Offset of int64
     | Hash   of string
-  and 'i hunks =
+  and hunks =
     { reference     : reference
-    ; hunks         : 'i hunk list
+    ; hunks         : hunk list
     ; length        : int
     ; source_length : int
     ; target_length : int }
@@ -203,7 +159,7 @@ struct
 
   let pp_obj fmt = function
     | Insert buf ->
-      pp fmt "(Insert %a)" B.pp buf
+      pp fmt "(Insert %a)" Cstruct.hexdump_pp buf
     | Copy (off, len) ->
       pp fmt "(Copy (%d, %d))" off len
 
@@ -216,7 +172,7 @@ struct
     | Hash hash -> pp fmt "(Reference %s)" hash
     | Offset off -> pp fmt "(Offset %Ld)" off
 
-  let pp_hunks fmt ({ reference; hunks; length; source_length; target_length; } : 'i hunks) =
+  let pp_hunks fmt ({ reference; hunks; length; source_length; target_length; } : hunks) =
     pp fmt "{@[<hov>reference = %a;@ \
                     hunks = [@[<hov>%a@]];@ \
                     length = %d;@ \
@@ -254,7 +210,7 @@ struct
   struct
     let rec get_byte k src t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src
              { t with i_pos = t.i_pos + 1
                     ; read = t.read + 1 }
@@ -282,7 +238,7 @@ struct
   struct
     let rec get_byte k src t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src 
              { t with i_pos = t.i_pos + 1
                     ; read = t.read + 1 }
@@ -294,7 +250,7 @@ struct
       if not flag
       then k 0 src t
       else if (t.i_len - t.i_pos) > 0
-           then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+           then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
                 k byte src 
                   { t with i_pos = t.i_pos + 1
                          ; read = t.read + 1 }
@@ -328,14 +284,14 @@ struct
            (fun opcode src t ->
              if opcode = 0 then error t (Reserved_opcode opcode)
              else match opcode land 0x80 with
-             | 0 -> Cont { t with state = Is_insert (B.from ~proof:src opcode, 0, opcode) }
+             | 0 -> Cont { t with state = Is_insert (Cstruct.create opcode, 0, opcode) }
              | _ -> Cont { t with state = Is_copy (copy opcode) })
            src t
     else ok { t with _hunks = List.rev t._hunks }
 
   let insert src t buffer (off, rest) =
     let n = min (t.i_len - t.i_pos) rest in
-    B.blit src (t.i_off + t.i_pos) buffer off n;
+    Cstruct.blit src (t.i_off + t.i_pos) buffer off n;
     if rest - n = 0
     then Cont ({ t with _hunks = (Insert buffer) :: t._hunks
                       ; i_pos = t.i_pos + n
@@ -415,7 +371,7 @@ end
 module Window =
 struct
   type t =
-    { raw : B.Bigstring.t
+    { raw : Cstruct.t
     ; off : int64
     ; len : int } (* [len] must be positive. *)
 
@@ -447,33 +403,34 @@ struct
     | Hunk_input (expected, has)     -> pp fmt "(Hunk_input (%d <> %d))" expected has
     | Invalid_state                  -> pp fmt "Invalid_state"
 
-  type ('i, 'o) t =
+  type t =
     { i_off   : int
     ; i_pos   : int
     ; i_len   : int
     ; local   : bool
     ; read    : int64
-    ; o_z     : 'o B.t
-    ; o_w     : 'o Decompress.Window.t
-    ; o_h     : 'o B.t
+    ; o_z     : Decompress.B.bs Decompress.B.t
+    ; o_w     : Decompress.B.bs Decompress.Window.t
+    ; o_h     : Decompress.B.bs Decompress.B.t
     ; version : int32
     ; objects : int32
     ; counter : int32
-    ; state   : ('i, 'o) state }
-  and ('i, 'o) state =
-    | Header    of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
-    | Object    of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
-    | VariableLength of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
+    ; state   : state }
+  and k = Cstruct.t -> t -> res
+  and state =
+    | Header    of k
+    | Object    of k
+    | VariableLength of k
     | Unzip     of { offset   : int64
                    ; consumed : int
                    ; length   : int
-                   ; kind     : 'i kind
-                   ; z        : ('i, 'o) Decompress.Inflate.t }
+                   ; kind     : kind
+                   ; z        : (Decompress.B.bs, Decompress.B.bs) Decompress.Inflate.t }
     | Hunks     of { offset   : int64
                    ; length   : int
                    ; consumed : int
-                   ; z        : ('i, 'o) Decompress.Inflate.t
-                   ; h        : 'i H.t }
+                   ; z        : (Decompress.B.bs, Decompress.B.bs) Decompress.Inflate.t
+                   ; h        : H.t }
     | Next      of { offset   : int64
                    ; consumed : int
                    ; length   : int
@@ -481,22 +438,22 @@ struct
                    (* XXX(dinosaure): we have a problem in the 32-bit architecture,
                                       the [length] can be big! TODO!
                     *)
-                   ; kind     : 'i kind }
-    | Checksum  of ('i B.t -> ('i, 'o) t -> ('i, 'o) res)
+                   ; kind     : kind }
+    | Checksum  of k
     | End       of string
     | Exception of error
-  and ('i, 'o) res =
-    | Wait  of ('i, 'o) t
-    | Flush of ('i, 'o) t
-    | Error of ('i, 'o) t * error
-    | Cont  of ('i, 'o) t
-    | Ok    of ('i, 'o) t * string
-  and 'i kind =
+  and res =
+    | Wait  of t
+    | Flush of t
+    | Error of t * error
+    | Cont  of t
+    | Ok    of t * string
+  and kind =
     | Commit
     | Tree
     | Blob
     | Tag
-    | Hunk of 'i H.hunks
+    | Hunk of H.hunks
 
   let pp_kind fmt = function
     | Commit -> pp fmt "Commit"
@@ -542,7 +499,7 @@ struct
         offset consumed length length'
     | Checksum _ -> pp fmt "(Checksum #k)"
     | End hash -> pp fmt "(End %a)" Hash.pp hash
-    | Exception err -> pp fmt "(Exception %a)" pp_error err 
+    | Exception err -> pp fmt "(Exception %a)" pp_error err
 
   let pp fmt { i_off; i_pos; i_len; o_z; version; objects; counter; state; } =
     match state with
@@ -586,18 +543,18 @@ struct
   module KHeader =
   struct
     let rec check_byte chr k src t =
-      if (t.i_len - t.i_pos) > 0 && B.get src (t.i_off + t.i_pos) = chr
+      if (t.i_len - t.i_pos) > 0 && Cstruct.get_char src (t.i_off + t.i_pos) = chr
       then k src { t with i_pos = t.i_pos + 1
                         ; read = Int64.add t.read 1L }
       else if (t.i_len - t.i_pos) = 0
       then await { t with state = Header (fun src t -> (check_byte[@tailcall]) chr k src t) }
       else error { t with i_pos = t.i_pos + 1
                         ; read = Int64.add t.read 1L }
-                 (Invalid_byte (Char.code @@ B.get src (t.i_off + t.i_pos)))
+                 (Invalid_byte (Cstruct.get_uint8 src (t.i_off + t.i_pos)))
 
     let rec get_byte k src t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1
                              ; read = Int64.add t.read 1L }
       else await { t with state = Header (fun src t -> (get_byte[@tailcall]) k src t) }
@@ -612,7 +569,7 @@ struct
 
     let rec get_u32 k src t =
       if (t.i_len - t.i_pos) > 3
-      then let num = Endian.get_u32 src (t.i_off + t.i_pos) in
+      then let num = Cstruct.BE.get_uint32 src (t.i_off + t.i_pos) in
            k num src
              { t with i_pos = t.i_pos + 4
                     ; read = Int64.add t.read 4L }
@@ -631,7 +588,7 @@ struct
   struct
     let rec get_byte k src t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1
                              ; read = Int64.add t.read 1L }
       else await { t with state = VariableLength (fun src t -> (get_byte[@tailcall]) k src t) }
@@ -641,7 +598,7 @@ struct
   struct
     let rec get_byte k src t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1
                              ; read = Int64.add t.read 1L }
       else await { t with state = Object (fun src t -> (get_byte[@tailcall]) k src t) }
@@ -666,7 +623,7 @@ struct
   struct
     let rec get_byte k src t =
       if (t.i_len - t.i_pos) > 0
-      then let byte = Char.code @@ B.get src (t.i_off + t.i_pos) in
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1
                              ; read = Int64.add t.read 1L }
       else await { t with state = Checksum (fun src t -> (get_byte[@tailcall]) k src t) }
@@ -717,8 +674,8 @@ struct
     | `Error (z, exn) -> error t (Inflate_error exn)
     | `End z ->
       let ret = if Decompress.Inflate.used_out z <> 0
-                then H.eval t.o_z (H.refill 0 (Decompress.Inflate.used_out z) h)
-                else H.eval t.o_z h
+                then H.eval (match t.o_z with Decompress.B.Bigstring bs -> Cstruct.of_bigarray bs) (H.refill 0 (Decompress.Inflate.used_out z) h)
+                else H.eval (match t.o_z with Decompress.B.Bigstring bs -> Cstruct.of_bigarray bs) h
       in
       (match ret with
        | `Ok (h, hunks) ->
@@ -733,15 +690,15 @@ struct
          error t (Hunk_input (length, H.read h))
        | `Error (h, exn) -> error t (Hunk_error exn))
     | `Flush z ->
-      match H.eval t.o_z (H.refill 0 (Decompress.Inflate.used_out z) h) with
+      match H.eval (match t.o_z with Decompress.B.Bigstring bs -> Cstruct.of_bigarray bs) (H.refill 0 (Decompress.Inflate.used_out z) h) with
       | `Await h ->
         Cont { t with state = Hunks { offset; length; consumed
-                                    ; z = (Decompress.Inflate.flush 0 (B.length t.o_z) z)
+                                    ; z = (Decompress.Inflate.flush 0 (Decompress.B.length t.o_z) z)
                                     ; h } }
       | `Error (h, exn) -> error t (Hunk_error exn)
       | `Ok (h, objs) ->
         Cont { t with state = Hunks { offset; length; consumed
-                                    ; z = (Decompress.Inflate.flush 0 (B.length t.o_z) z)
+                                    ; z = (Decompress.Inflate.flush 0 (Decompress.B.length t.o_z) z)
                                     ; h } }
 
   let size_of_variable_length vl =
@@ -766,7 +723,7 @@ struct
                                   ; length   = len
                                   ; consumed = size_of_variable_length len
                                   ; kind = Commit
-                                  ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
+                                  ; z = Decompress.Inflate.flush 0 (Decompress.B.length t.o_z)
                                         @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                         @@ Decompress.Inflate.default (Decompress.Window.reset t.o_w) } }
     | 0b010 ->
@@ -774,7 +731,7 @@ struct
                                   ; length   = len
                                   ; consumed = size_of_variable_length len
                                   ; kind = Tree
-                                  ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
+                                  ; z = Decompress.Inflate.flush 0 (Decompress.B.length t.o_z)
                                         @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                         @@ Decompress.Inflate.default (Decompress.Window.reset t.o_w) } }
     | 0b011 ->
@@ -782,7 +739,7 @@ struct
                                   ; length   = len
                                   ; consumed = size_of_variable_length len
                                   ; kind = Blob
-                                  ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
+                                  ; z = Decompress.Inflate.flush 0 (Decompress.B.length t.o_z)
                                         @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                         @@ Decompress.Inflate.default (Decompress.Window.reset t.o_w) } }
     | 0b100 ->
@@ -790,7 +747,7 @@ struct
                                   ; length   = len
                                   ; consumed = size_of_variable_length len
                                   ; kind = Tag
-                                  ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
+                                  ; z = Decompress.Inflate.flush 0 (Decompress.B.length t.o_z)
                                         @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                         @@ Decompress.Inflate.default (Decompress.Window.reset t.o_w) } }
     | 0b110 ->
@@ -803,7 +760,7 @@ struct
                                            ; length   = len
                                            ; consumed = size_of_variable_length len
                                                         + size_of_offset offset
-                                           ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
+                                           ; z = Decompress.Inflate.flush 0 (Decompress.B.length t.o_z)
                                                  @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                                  @@ Decompress.Inflate.default (Decompress.Window.reset t.o_w)
                                            ; h = H.default len (H.Offset offset) } })
@@ -815,7 +772,7 @@ struct
           Cont { t with state = Hunks { offset   = off
                                       ; length   = len
                                       ; consumed = 20 + size_of_variable_length len
-                                      ; z = Decompress.Inflate.flush 0 (B.length t.o_z)
+                                      ; z = Decompress.Inflate.flush 0 (Decompress.B.length t.o_z)
                                             @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                             @@ Decompress.Inflate.default (Decompress.Window.reset t.o_w)
                                       ; h = H.default len (H.Hash hash) } })
@@ -893,7 +850,7 @@ struct
      @@ version)
     src t
 
-  let default ~proof ?(chunk = 4096) ?window z_tmp z_win h_tmp =
+  let default z_tmp z_win h_tmp =
     { i_off   = 0
     ; i_pos   = 0
     ; i_len   = 0
@@ -914,7 +871,7 @@ struct
     in
     loop 1 (vl lsr 4) (* avoid type and msb *)
 
-  let from_window (type a) ~(proof:a B.t) window win_offset z_tmp z_win h_tmp =
+  let from_window window win_offset z_tmp z_win h_tmp =
     { i_off   = 0
     ; i_pos   = 0
     ; i_len   = 0
@@ -966,9 +923,9 @@ struct
 
   let output t = match t.state with
     | Unzip { z; _ } ->
-      t.o_z, Decompress.Inflate.used_out z
+      (match t.o_z with Decompress.B.Bigstring bs -> Cstruct.of_bigarray bs), Decompress.Inflate.used_out z
     | Hunks { h; _ } ->
-      t.o_h, 0
+      (match t.o_h with Decompress.B.Bigstring bs -> Cstruct.of_bigarray bs), 0
     | _ -> raise (Invalid_argument "P.output: bad state")
 
   let next_object t = match t.state with
@@ -1004,9 +961,9 @@ struct
       | Object k -> k src t
       | VariableLength k -> k src t
       | Unzip { offset; length; consumed; kind; z; } ->
-        unzip src t offset length consumed kind z
+        unzip (Decompress.B.Bigstring (Cstruct.to_bigarray src)) t offset length consumed kind z
       | Hunks { offset; length; consumed; z; h; } ->
-        hunks src t offset length consumed z h
+        hunks (Decompress.B.Bigstring (Cstruct.to_bigarray src)) t offset length consumed z h
       | Next { length; length'; kind; } -> next src t length length' kind
       | Checksum k -> k src t
       | End hash -> ok t hash
@@ -1031,7 +988,7 @@ sig
   type fd
 
   val length : fd -> int64
-  val map : fd -> ?pos:int64 -> share:bool -> int -> B.Bigstring.t
+  val map    : fd -> ?pos:int64 -> share:bool -> int -> Cstruct.t
 end
 
 module D (Mapper : MAPPER) =
@@ -1046,7 +1003,7 @@ struct
 
   let pp_error fmt = function
     | Invalid_hash hash ->
-      Format.fprintf fmt "(Invalid_hash %a)" pp_hash hash
+      Format.fprintf fmt "(Invalid_hash %a)" Hash.pp hash
     | Invalid_offset off ->
       Format.fprintf fmt "(Invalid_offset %Ld)" off
     | Invalid_target (has, expected) ->
@@ -1055,40 +1012,22 @@ struct
     | Unpack_error exn ->
       Format.fprintf fmt "(Unpack_error %a)" P.pp_error exn
 
-  type t =
+  type 'a t =
     { file  : Mapper.fd
     ; max   : int64
-    ; win   : Window.t Bulk.t
+    ; win   : Window.t Bucket.t
     ; idx   : 'a. ('a, [ `SHA1 ]) Hash.t -> int64 option
     ; hash  : ([ `PACK ], [ `SHA1 ]) Hash.t }
-
-  let check_file t file = t.file == file
 
   let is_hunk t = match P.kind t with
     | P.Hunk _ -> true
     | _ -> false
 
-  let hash_of_object kind length =
-    let hdr = Format.sprintf "%s %d\000"
-      (match kind with
-       | P.Commit -> "commit"
-       | P.Blob -> "blob"
-       | P.Tree -> "tree"
-       | P.Tag -> "tag"
-       | P.Hunk _ -> raise (Invalid_argument "hash_of_object"))
-      length
-    in
-    fun raw ->
-      Nocrypto.Hash.SHA1.digestv
-        [ Cstruct.of_string hdr
-        ; B.to_cstruct raw ]
-      |> Cstruct.to_string
-
   module Base =
   struct
-    type 'i t =
-      { kind     : 'i P.kind
-      ; raw      : 'i B.t
+    type t =
+      { kind     : P.kind
+      ; raw      : Cstruct.t
       ; offset   : Int64.t
       ; length   : int
       ; consumed : int }
@@ -1098,15 +1037,15 @@ struct
       | _ -> false
   end
 
-  let apply ~proof hunks base =
-    let raw = B.from ~proof hunks.H.target_length in
+  let apply hunks base =
+    let raw = Cstruct.create hunks.H.target_length in
 
     let target_length = List.fold_left
        (fun acc -> function
         | H.Insert insert ->
-          B.blit insert 0 raw acc (B.length insert); acc + B.length insert
+          Cstruct.blit insert 0 raw acc (Cstruct.len insert); acc + Cstruct.len insert
         | H.Copy (off, len) ->
-          B.blit base.Base.raw off raw acc len; acc + len)
+          Cstruct.blit base.Base.raw off raw acc len; acc + len)
        0 hunks.H.hunks
       in
 
@@ -1123,12 +1062,12 @@ struct
     let map = Mapper.map t.file ~pos ~share:false (1024 * 1024) in
     { Window.raw = map
     ; off   = pos
-    ; len   = B.Bigstring.length map }
+    ; len   = Cstruct.len map }
 
   let find t offset_requested =
     let predicate window = Window.inside offset_requested window in
 
-    match Bulk.find t.win predicate with
+    match Bucket.find t.win predicate with
     | Some window ->
       let relative_offset = Int64.to_int Int64.(offset_requested - window.Window.off) in
       window, relative_offset
@@ -1136,7 +1075,7 @@ struct
       let window = map_window t offset_requested in
       let relative_offset = Int64.to_int Int64.(offset_requested - window.Window.off) in
 
-      let () = Bulk.add t.win window in window, relative_offset
+      let () = Bucket.add t.win window in window, relative_offset
 
   let delta ?(chunk_size = 0x8000) t hunks offset_of_hunks z_tmp z_win h_tmp =
     let absolute_offset = match hunks.H.reference with
@@ -1152,11 +1091,11 @@ struct
     match absolute_offset with
     | Ok absolute_offset ->
       let window, relative_offset = find t absolute_offset in
-      let state    = P.from_window ~proof:B.proof_bigstring window relative_offset z_tmp z_win h_tmp in
-      let base_raw = B.from ~proof:B.proof_bigstring hunks.H.source_length in
+      let state    = P.from_window window relative_offset z_tmp z_win h_tmp in
+      let base_raw = Cstruct.create hunks.H.source_length in
 
       let rec loop window consumed_in_window writted_in_raw git_object state =
-        match P.eval (B.from_bigstring window.Window.raw) state with
+        match P.eval window.Window.raw state with
         | `Await state ->
           let rest_in_window = min (window.Window.len - consumed_in_window) chunk_size in
 
@@ -1175,7 +1114,7 @@ struct
               (P.refill 0 0 state)
         | `Flush state ->
           let o, n = P.output state in
-          B.blit o 0 base_raw writted_in_raw n;
+          Cstruct.blit o 0 base_raw writted_in_raw n;
           loop window consumed_in_window (writted_in_raw + n) git_object (P.flush 0 n state)
         | `Object state ->
           loop window consumed_in_window writted_in_raw
@@ -1209,7 +1148,7 @@ struct
   let make ?(bulk = 10) file (idx : string -> int64 option) =
     { file
     ; max  = Mapper.length file
-    ; win  = Bulk.make bulk
+    ; win  = Bucket.make bulk
     ; idx  = idx
     ; hash = "" (* TODO *) }
 
@@ -1217,11 +1156,11 @@ struct
     match t.idx hash with
     | Some absolute_offset ->
       let window, relative_offset = find t absolute_offset in
-      let state  = P.from_window ~proof:B.proof_bigstring window relative_offset z_tmp z_win h_tmp in
-      let buffer = BBuffer.create ~proof:B.proof_bigstring chunk_size in
+      let state  = P.from_window window relative_offset z_tmp z_win h_tmp in
+      let buffer = BBuffer.create chunk_size in
 
       let rec loop window consumed_in_window writted_in_raw git_object state =
-        match P.eval (B.from_bigstring window.Window.raw) state with
+        match P.eval window.Window.raw state with
         | `Await state ->
           let rest_in_window = min (window.Window.len - consumed_in_window) chunk_size in
 
@@ -1255,7 +1194,7 @@ struct
                | Ok { Base.kind = P.Hunk hunks; offset; _ } ->
                  (match undelta ~level:(level + 1) hunks offset with
                   | Ok (base, level) ->
-                    (match apply ~proof:B.proof_bigstring hunks base with
+                    (match apply hunks base with
                      | Ok base -> Ok (base, level)
                      | Error exn -> Error exn)
                   | Error exn -> Error exn)
@@ -1264,7 +1203,7 @@ struct
 
              (match undelta hunks (P.offset state) with
               | Ok (base, level) ->
-                (match apply ~proof:B.proof_bigstring hunks base with
+                (match apply hunks base with
                  | Ok base ->
                    loop window consumed_in_window writted_in_raw
                      (Some (base.Base.kind, Some base.Base.raw, roffset, rlength, rconsumed))
