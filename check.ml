@@ -57,7 +57,10 @@ let header_to_string (kind, raw, length) =
 
 let write_header encoder (kind, raw, length) =
   let hdr = header_to_string (kind, raw, length) in
-  Minienc.write_string encoder hdr
+  Faraday.write_string encoder hdr
+
+let size_of_header (kind, raw, length) =
+  String.length (header_to_string (kind, raw, length))
 
 module Result =
 struct
@@ -93,70 +96,56 @@ let pp fmt = function
   | `Tree tree -> Minigit.Tree.pp fmt tree
   | `Blob blob -> Format.fprintf fmt "#blob"
 
-let to_cstruct : type a. a Decompress.B.t -> Cstruct.t = function
-  | Decompress.B.Bytes bs -> Cstruct.of_bytes bs
-  | Decompress.B.Bigstring bs -> Cstruct.of_bigarray bs
-
 let dual encoder (kind, raw, length) =
   write_header encoder (kind, raw, length);
 
   match kind with
   | P.Commit ->
     (match Minigit.Commit.Decoder.to_result raw with
-     | Ok commit -> Minigit.Commit.Encoder.write_commit encoder commit
+     | Ok commit ->
+       Minigit.Commit.Encoder.commit encoder commit
      | Error exn ->
-       Format.eprintf "Invalid commit: %a\n%!" Minidec.pp_error exn;
-       Format.eprintf "%a\n%!" Cstruct.hexdump_pp (to_cstruct raw);
+       Format.eprintf "Invalid commit: %s\n%!" exn;
+       Format.eprintf "%a\n%!" Cstruct.hexdump_pp raw;
        assert false)
   | P.Tree ->
     (match Minigit.Tree.Decoder.to_result raw with
-     | Ok tree -> Minigit.Tree.Encoder.write_tree encoder tree
+     | Ok tree -> Minigit.Tree.Encoder.tree encoder tree
      | Error exn ->
-       Format.eprintf "Invalid tree: %a\n%!" Minidec.pp_error exn;
-       Format.eprintf "%a\n%!" Cstruct.hexdump_pp (to_cstruct raw);
+       Format.eprintf "Invalid tree: %s\n%!" exn;
+       Format.eprintf "%a\n%!" Cstruct.hexdump_pp raw;
        assert false)
   | P.Blob ->
     (match Minigit.Blob.Decoder.to_result raw with
-     | Ok blob -> Minigit.Blob.Encoder.write_blob encoder blob
+     | Ok blob -> Minigit.Blob.Encoder.blob encoder blob
      | Error exn ->
-       Format.eprintf "Invalid blob: %a\n%!" Minidec.pp_error exn;
-       Format.eprintf "%a\n%!" Cstruct.hexdump_pp (to_cstruct raw);
+       Format.eprintf "Invalid blob: %s\n%!" exn;
+       Format.eprintf "%a\n%!" Cstruct.hexdump_pp raw;
        assert false)
   | P.Tag ->
     (match Minigit.Tag.Decoder.to_result raw with
-     | Ok tag -> Minigit.Tag.Encoder.write_tag encoder tag
+     | Ok tag -> Minigit.Tag.Encoder.tag encoder tag
      | Error exn ->
-       Format.eprintf "Invalid tag: %a\n%!" Minidec.pp_error exn;
-       Format.eprintf "%a\n%!" Cstruct.hexdump_pp (to_cstruct raw);
+       Format.eprintf "Invalid tag: %s\n%!" exn;
+       Format.eprintf "%a\n%!" Cstruct.hexdump_pp raw;
        assert false)
   | P.Hunk _ -> assert false
 
-let to_cstruct = function
-  | { Minienc.Vec.buf = `Bigstring s
-    ; off
-    ; len } ->
-    Cstruct.of_bigarray ~off ~len s
-  | { Minienc.Vec.buf = `String s
-    ; off
-    ; len } ->
-    Cstruct.of_string (String.sub s off len)
-  | { Minienc.Vec.buf = `Bytes s
-    ; off
-    ; len } ->
-    Cstruct.of_bytes (Bytes.sub s off len)
+let to_cstruct { Faraday.buffer; off; len; } = match buffer with
+  | `Bigstring bs -> Cstruct.of_bigarray ~off ~len bs
+  | `String bs -> Cstruct.of_string (String.sub bs off len)
+  | `Bytes bs -> Cstruct.of_bytes (Bytes.sub bs off len)
 
 let hash_of_encoder encoder =
-  Minienc.flush_buffer encoder;
-
   let digest = Nocrypto.Hash.SHA1.init () in
 
-  match Minienc.serialize encoder
+  match Faraday.serialize encoder
           (fun lst ->
            let lst = List.map to_cstruct lst in
            List.iter (Nocrypto.Hash.SHA1.feed digest) lst;
            `Ok (Cstruct.lenv lst)) with
   | `Yield ->
-    if Minienc.pending encoder
+    if Faraday.has_pending_output encoder
     then begin
       Format.eprintf "The encoder is not totally drained\n%!";
       assert false
@@ -165,9 +154,6 @@ let hash_of_encoder encoder =
   | `Close ->
     Format.eprintf "Unexpected close of the encoder\n%!";
     assert false
-
-let encoder_tmp = Decompress.B.from Decompress.B.proof_bigstring 0x8000
-let encoder = Minienc.from encoder_tmp
 
 (* check the offset provided by the deserialization of the PACK file with the
      offset from the IDX file (lazy implementation).
@@ -194,6 +180,7 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
     end;
 
     let real_length = match base with Some (_, _, x) -> x | None -> length in
+    let encoder = Faraday.create (real_length + size_of_header (kind, raw, real_length)) in
 
     dual encoder (kind, raw, real_length);
     let hash' = hash_of_encoder encoder in
@@ -210,7 +197,7 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
 
       dual encoder (kind, raw, real_length);
 
-      let _ = Minienc.serialize encoder
+      let _ = Faraday.serialize encoder
         (fun lst ->
          let lst = List.map to_cstruct lst in
          let raw' = Cstruct.concat lst in
@@ -221,7 +208,7 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
 
          Format.eprintf "OK (without header):\n%a\n%!"
            Hex.hexdump (Hex.of_string_fast ((header_to_string (kind, raw, length))
-                                            ^ Decompress.B.to_string raw));
+                                            ^ Cstruct.to_string raw));
 
          `Ok (Cstruct.lenv lst))
       in
@@ -301,7 +288,7 @@ let unpack ?(chunk = 0x8000) pack_filename get =
             | Ok base ->
               let hash = hash_of_object base.D.Base.kind base.D.Base.length base.D.Base.raw in
 
-              check hash base.D.Base.kind (Decompress.B.Bigstring (Cstruct.to_bigarray base.D.Base.raw)) rlength rconsumed roffset ~base:(level, base_hash, base.D.Base.length) get;
+              check hash base.D.Base.kind base.D.Base.raw rlength rconsumed roffset ~base:(level, base_hash, base.D.Base.length) get;
               loop offset (P.next_object t)
             | Error exn -> Error (`Delta_error exn))
          | Error exn -> Error exn)
@@ -309,7 +296,7 @@ let unpack ?(chunk = 0x8000) pack_filename get =
         let raw = BBuffer.contents buf in
         let hash = hash_of_object kind (P.length t) raw in
 
-        check hash kind (Decompress.B.Bigstring (Cstruct.to_bigarray raw)) (P.length t) (P.consumed t) (P.offset t) get;
+        check hash kind raw (P.length t) (P.consumed t) (P.offset t) get;
         BBuffer.clear buf;
         loop offset (P.next_object t)
   in

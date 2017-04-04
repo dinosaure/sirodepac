@@ -1,5 +1,5 @@
-true: safe_string, bin_annot, debug
+true: safe_string, bin_annot, debug, keep_locs
 <*/*>: warn(@32@20@25@26@34@33@37@39)
 
-<*.{ml,mli,byte,native}>: package(decompress), package(nocrypto), linkdep(bs.o)
+<*.{ml,mli,byte,native}>: package(decompress), package(angstrom), package(farfadet), package(nocrypto), linkdep(bs.o)
 <diff.{ml,mli,byte,native}>: package(patience_diff)

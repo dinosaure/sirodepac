@@ -1,20 +1,3 @@
-module B =
-struct
-  include Decompress.B
-
-  let blit_string src src_off dst dst_off len =
-    for i = 0 to len - 1
-    do set dst (dst_off + i) (String.get src (src_off + i)) done
-
-  let blit_bytes src src_off dst dst_off len =
-    for i = 0 to len - 1
-    do set dst (dst_off + i) (Bytes.get src (src_off + i)) done
-
-  let blit_bigstring src src_off dst dst_off len =
-    for i = 0 to len - 1
-    do set dst (dst_off + i) (Bigstring.get src (src_off + i)) done
-end
-
 module Option =
 struct
   let ( >>= ) x f = match x with Some x -> Some (f x) | None -> None
@@ -67,22 +50,24 @@ struct
 
   module Decoder =
   struct
-    let lt = Minidec.char '<'
-    let gt = Minidec.char '>'
-    let sp = Minidec.char ' '
-    let pl = Minidec.char '+'
-    let mn = Minidec.char '-'
+    open Angstrom
+
+    let lt = char '<'
+    let gt = char '>'
+    let sp = char ' '
+    let pl = char '+'
+    let mn = char '-'
 
     let is_not_lt chr = chr <> '<'
     let is_not_gt chr = chr <> '>'
 
-    let user =
-      let open Minidec in
+    let int64 = take_while (function '0' .. '9' -> true | _ -> false) >>| Int64.of_string
 
-      count_while is_not_lt <* commit
-      >>= fun n       -> substring (n - 1) <* skip 2 <* commit
-      >>= fun name    -> take_while is_not_gt <* commit
-      >>= fun email   -> skip 2 *> int64 <* commit
+    let user =
+      take_while is_not_lt <* take 1 <* commit
+      >>= fun name    -> let name = String.sub name 0 (String.length name - 1) in
+                         take_while is_not_gt <* commit
+      >>= fun email   -> take 2 *> int64 <* commit
       >>= fun second  -> sp *> ((pl *> return `Plus)
                                  <|> (mn *> return `Minus))
                          <* commit
@@ -102,48 +87,40 @@ struct
                ; date = (second, tz_offset) }
       <* commit
 
-    let to_result i =
-      let open Result in
-      Minidec.to_result i user >>| fst
+    let to_result cs =
+      Angstrom.Unbuffered.parse ~input:(`Bigstring (Cstruct.to_bigarray cs)) user
+      |> Angstrom.Unbuffered.state_to_result
   end
 
   module Encoder =
   struct
-    let lt = Minifor.Const.char '<'
-    let gt = Minifor.Const.char '>'
-    let sp = Minifor.Const.char ' '
+    open Farfadet
 
-    let bint64 =
-      let open Minifor.Blitter in
-      let blit src = B.blit_string (Int64.to_string src) in
-      let length x = String.length @@ Int64.to_string x in
-      { blit; length }
+    let lt = '<'
+    let gt = '>'
+    let sp = ' '
 
-    let write_date encoder = function
-      | None -> Minienc.write_string encoder "+0000"
+    let int64 e x = string e (Int64.to_string x)
+
+    let digit e x =
+      if x < 10
+      then eval e [ char $ '0'; !!string ] (string_of_int x)
+      else if x < 100
+      then string e (string_of_int x)
+      else raise (Invalid_argument "User.Encoder.digit")
+
+    let sign' e = function
+      | `Plus -> char e '+'
+      | `Minus -> char e '-'
+
+    let date e = function
+      | None -> string e "+0000"
       | Some { sign; hours; minutes } ->
-        let open Minifor in
-        let open Minifor.Infix in
-        let date = char **! string **! nil in
-        let fmt  = finalize (make date) in
+        eval e [ !!sign'; !!digit; !!digit ] sign hours minutes
 
-        eval encoder fmt
-          (match sign with | `Plus -> '+' | `Minus -> '-')
-          (Format.sprintf "%02d%02d" hours minutes)
-
-    let write_user encoder t =
-      let open Minifor in
-      let open Minifor.Infix in
-
-      let user = string **! sp ** lt ** string **! gt ** sp ** int64 **? sp ** write_date **= nil in
-
-      let fmt  = finalize (make user) bint64 in
-
-      eval encoder fmt
-        t.name
-        t.email
-        None (fst t.date)
-        (snd t.date)
+    let user e t =
+      eval e [ !!string; char $ sp; char $ lt; !!string; char $ gt; char $ sp; !!int64; char $ sp; !!date ]
+        t.name t.email (fst t.date) (snd t.date)
   end
 end
 
@@ -173,20 +150,18 @@ struct
 
   module Decoder =
   struct
-    let sp = Minidec.char ' '
-    let lf = Minidec.char '\x0a'
+    open Angstrom
+
+    let sp = char ' '
+    let lf = char '\x0a'
     let is_not_lf chr = chr <> '\x0a'
 
     let binding
-      : type a. key:string -> value:a Minidec.t -> a Minidec.t
+      : type a. key:string -> value:a Angstrom.t -> a Angstrom.t
       = fun ~key ~value ->
-      let open Minidec in
-
       string key *> sp *> value <* lf <* commit
 
     let commit =
-      let open Minidec in
-
       binding ~key:"tree" ~value:(take_while is_not_lf) <* commit
       >>= fun tree      -> many (binding ~key:"parent"
                                          ~value:(take_while is_not_lf))
@@ -203,54 +178,49 @@ struct
                  ; message = "" }
       <* commit
 
-    let to_result i =
-      match Minidec.to_result i commit with
-      | Ok (v, p) ->
-        if B.length i - p > 0
-        then let msg = B.to_string @@ B.sub i p (B.length i - p) in
-             Ok { v with message = msg }
-        else Ok v
-      | Error (exn, _) -> Error exn
+    let to_result cs =
+      let open Unbuffered in
+
+      let rec aux = function
+        | Fail (_, path, err) -> Error (String.concat " > " path ^ ": " ^ err)
+        | Partial _ -> Error "incomplete input"
+        | Done (committed, v) ->
+          if Cstruct.len cs - committed > 0
+          then let msg = Cstruct.to_string (Cstruct.sub cs committed (Cstruct.len cs - committed)) in
+                   Ok { v with message = msg }
+          else Ok v
+      in
+
+      Angstrom.Unbuffered.parse ~input:(`Bigstring (Cstruct.to_bigarray cs)) commit
+      |> aux
   end
 
   module Encoder =
   struct
-    let sp = Minifor.Const.char ' '
-    let lf = Minifor.Const.char '\x0a'
+    open Farfadet
 
-    let bparents =
-      let open Minifor.Blitter in
-      let blit src _ dst dst_off len =
-        let len' = List.fold_left
-          (fun off x ->
-            B.blit_string "parent " 0 dst off 7;
-            B.blit_string (Hash.to_pp x) 0 dst (off + 7) 40;
-            B.set dst (off + 7 + 40) '\x0a';
-            off + 7 + 40 + 1)
-          dst_off src
-        in
-        assert (len' = dst_off + len)
-      in
-      let length l = List.fold_left (fun a x -> a + 7 + 40 + 1) 0 l in
-      { blit; length; }
+    let sp = ' '
+    let lf = '\x0a'
 
-    let write_commit encoder t =
-      let open Minifor in
-      let open Minifor.Infix in
+    let parents e x = eval e [ string $ "parent"; char $ sp; !!string ] (Hash.to_pp x)
 
-      let commit =
-        (Const.string "tree") ** sp ** string **! lf **
-        (list string) **?
-        (Const.string "author") ** sp ** User.Encoder.write_user **= lf **
-        (Const.string "committer") ** sp ** User.Encoder.write_user **= lf **
-        string **! nil
-      in
+    let predicate f w e x =
+      if f x
+      then eval e w x
+      else ()
 
-      let fmt = finalize (make commit) bparents in
+    let is_empty l = List.length l <> 0
 
-      eval encoder fmt
+    let commit e t =
+      let sep = (fun e () -> char e lf), () in
+
+      eval e [ string $ "tree"; char $ sp; !!string; char $ lf
+             ; !!(option (seq (list ~sep parents) (fun e () -> char e lf)))
+             ; string $ "author"; char $ sp; !!User.Encoder.user; char $ lf
+             ; string $ "committer"; char $ sp; !!User.Encoder.user; char $ lf
+             ; !!string ]
         (Hash.to_pp t.tree)
-        None t.parents
+        (match t.parents with [] -> None | lst -> Some (lst, ()))
         t.author
         t.committer
         t.message
@@ -288,8 +258,10 @@ struct
 
   module Decoder =
   struct
-    let sp = Minidec.char ' '
-    let nl = Minidec.char '\x00'
+    open Angstrom
+
+    let sp = char ' '
+    let nl = char '\x00'
     let is_not_sp chr = chr <> ' '
     let is_not_nl chr = chr <> '\x00'
 
@@ -328,37 +300,46 @@ struct
         then Buffer.add_substring b path !last (n - !last);
         Buffer.contents b
 
-    let hash = Minidec.take 20
+    let hash = Angstrom.take 20
 
-    type Minidec.error += Invalid_perm of string
+    let sp = Format.sprintf
 
     let entry =
-      let open Minidec in
-
       take_while is_not_sp >>= fun perm ->
         (try return (perm_of_string perm)
-         with _ -> fail (Invalid_perm perm))
+         with _ -> fail (sp "Invalid permission %s" perm))
         <* commit
-      >>= fun perm -> skip 1 *> take_while is_not_nl <* commit
-      >>= fun name -> skip 1 *> hash <* commit
+      >>= fun perm -> take 1 *> take_while is_not_nl <* commit
+      >>= fun name -> take 1 *> hash <* commit
       >>= fun hash ->
         return { perm
                ; name
                ; node = (hash : ([ `Unknow ], [ `SHA1 ]) Hash.t) }
       <* commit
 
-    let tree = Minidec.many entry
+    let tree = many entry
 
-    let to_result i =
-      match Minidec.to_result i tree with
-      | Ok (tree, _) -> Ok tree
-      | Error (exn, _) -> Error exn
+    let to_result cs =
+      let open Angstrom.Unbuffered in
+
+      let bs = Cstruct.to_bigarray cs in
+
+      let rec aux = function
+        | Done (committed, v) -> Ok v
+        | Partial { committed; continue; } -> aux @@ continue (`String "") Complete
+        | Fail (_, path, err) -> Error (String.concat " > " path ^ ": " ^ err)
+      in
+
+      Angstrom.Unbuffered.parse ~input:(`Bigstring bs) tree
+      |> aux
   end
 
   module Encoder =
   struct
-    let sp = Minifor.Const.char ' '
-    let nl = Minifor.Const.char '\x00'
+    open Farfadet
+
+    let sp = ' '
+    let nl = '\x00'
 
     let string_of_perm = function
       | `Normal    -> "100644"
@@ -368,45 +349,8 @@ struct
       | `Dir       -> "40000"
       | `Commit    -> "160000"
 
-    let escaped_characters =
-      [ '\x42'; '\x00'; '\x2f' ]
-
-    let has s l =
-      List.fold_left
-        (||)
-        false
-        (List.map (String.contains s) l)
-
-    let encode path =
-      if not (has path escaped_characters)
-      then path
-      else
-        let n = String.length path in
-        let b = Buffer.create n in
-        let last = ref 0 in
-        for i = 0 to n - 1
-        do if List.mem path.[i] escaped_characters
-           then begin
-             let c = Char.chr (Char.code path.[i] + 1) in
-             if i - !last > 0
-             then Buffer.add_substring b path !last (i - !last);
-             Buffer.add_char b '\x42';
-             Buffer.add_char b c;
-             last := i + 1;
-           end
-        done;
-        if n - !last > 0
-        then Buffer.add_substring b path !last (n - !last);
-        Buffer.contents b
-
-    let write_entry encoder t =
-      let open Minifor in
-      let open Minifor.Infix in
-
-      let entry = string **! sp ** string **! nl ** string **! nil in
-      let fmt   = finalize (make entry) in
-
-      eval encoder fmt
+    let entry e t =
+      eval e [ !!string; char $ sp; !!string; char $ nl; !!string ]
         (string_of_perm t.perm)
         t.name (* XXX(dinosaure): in ocaml-git, we need to escape the byte
                                   '\x42' but I don't find any process like that
@@ -415,24 +359,24 @@ struct
                 *)
         t.node
 
-    let write_tree encoder t =
-      List.iter (write_entry encoder) t
+    let tree e t =
+      (list entry) e t
   end
 end
 
 module Blob =
 struct
-  type 'i t = { content : 'i B.t }
+  type 'i t = { content : Cstruct.t }
 
   module Decoder =
   struct
-    let to_result i = Ok { content = i }
+    let to_result cs = Ok { content = cs }
   end
 
   module Encoder =
   struct
-    let write_blob encoder { content } =
-      Minienc.schedule encoder content
+    let blob e { content } =
+      Faraday.schedule_bigstring e (Cstruct.to_bigarray content)
   end
 end
 
@@ -470,25 +414,23 @@ struct
 
   module Decoder =
   struct
-    let sp = Minidec.char ' '
-    let lf = Minidec.char '\x0a'
+    open Angstrom
+
+    let sp = char ' '
+    let lf = char '\x0a'
     let is_not_lf chr = chr <> '\x0a'
 
-    let obj = Minidec.take 40
+    let obj = take 40
 
     let kind =
-      let open Minidec in
-
       (string "blob"       *> return Blob)
       <|> (string "commit" *> return Commit)
       <|> (string "tag"    *> return Tag)
       <|> (string "tree"   *> return Tree)
 
     let binding
-      : type a. key:string -> value:a Minidec.t -> a Minidec.t
+      : type a. key:string -> value:a Angstrom.t -> a Angstrom.t
       = fun ~key ~value ->
-      let open Minidec in
-
       string key *> sp *> value <* lf
 
     let sentinel_from_kind = function
@@ -498,18 +440,16 @@ struct
       | Tag    -> `Tag
 
     let tag =
-      let open Minidec in
-
       binding ~key:"object" ~value:obj <* commit
       >>= fun obj    -> binding ~key:"type" ~value:kind
                         <* commit
       >>= fun kind   -> binding ~key:"tag" ~value:(take_while is_not_lf)
                         <* commit
-      >>= fun tag    -> (option (binding ~key:"tagger" ~value:User.Decoder.user
-                                 >>| fun user -> Some user)
-                                (return None))
+      >>= fun tag    -> (option None
+                                (binding ~key:"tagger" ~value:User.Decoder.user
+                                 >>= fun user -> return (Some user)))
                         <* commit
-      >>= fun tagger -> skip 1 *> commit *>
+      >>= fun tagger -> take 1 *> commit *>
         return { obj = Hash.from_pp ~sentinel:(sentinel_from_kind kind) obj
                ; kind
                ; tag
@@ -517,18 +457,29 @@ struct
                ; message = "" }
       <* commit
 
-    let to_result i =
-      match Minidec.to_result i tag with
-      | Ok (v, p) ->
-        let msg = B.to_string @@ B.sub i p (B.length i - p) in
-        Ok { v with message = msg }
-      | Error (exn, _) -> Error exn
+    let to_result cs =
+      let open Unbuffered in
+
+      let rec aux = function
+        | Done (committed, v) ->
+          if Cstruct.len cs - committed > 0
+          then let msg = Cstruct.to_string (Cstruct.sub cs committed (Cstruct.len cs - committed)) in
+                   Ok { v with message = msg }
+          else Ok v
+        | Fail (_, path, err) -> Error (String.concat " > " path ^ ": " ^ err)
+        | Partial _ -> Error "incomplete input"
+      in
+
+      Angstrom.Unbuffered.parse ~input:(`Bigstring (Cstruct.to_bigarray cs)) tag
+      |> aux
   end
 
   module Encoder =
   struct
-    let sp = Minifor.Const.char ' '
-    let lf = Minifor.Const.char '\x0a'
+    open Farfadet
+
+    let sp = ' '
+    let lf = '\x0a'
 
     let string_of_kind = function
       | Blob   -> "blob"
@@ -536,29 +487,14 @@ struct
       | Tree   -> "tree"
       | Tag    -> "tag"
 
-    let write_tag encoder t =
-      let open Minifor in
-      let open Minifor.Infix in
+    let tag e t =
+      let tagger e x = eval e [ string $ "tagger"; char $ sp; !!User.Encoder.user; char $ lf ] x in
 
-      let write_user_option encoder = function
-        | Some user ->
-          Minienc.write_string encoder "tagger ";
-          User.Encoder.write_user encoder user;
-          Minienc.write_char encoder '\x0a'
-        | None -> ()
-      in
-
-      let tag =
-        (Const.string "object") ** sp ** string **! lf **
-        (Const.string "type") ** sp ** string **! lf **
-        (Const.string "tag") ** sp ** string **! lf **
-        write_user_option **= lf **
-        string **! nil
-      in
-
-      let fmt = finalize (make tag) in
-
-      eval encoder fmt
+      eval e [ string $ "object"; char $ sp; !!string; char $ lf
+             ; string $ "type"; char $ sp; !!string; char $ lf
+             ; string $ "tag"; char $ sp; !!string; char $ lf
+             ; !!(option tagger); char $ lf
+             ; !!string ]
         (Hash.to_pp t.obj)
         (string_of_kind t.kind)
         t.tag
