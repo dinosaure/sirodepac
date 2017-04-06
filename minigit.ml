@@ -48,6 +48,11 @@ struct
                                  date = (%Ld, %a);@] }"
       name email second (pp_option pp_tz_offset) tz_offset
 
+  let raw_length t =
+    let tz_offset_length = 5 in
+    (String.length t.name) + 1 + 1 + (String.length t.email) + 1 + 1 + (String.length (Int64.to_string (fst t.date))) + 1 + tz_offset_length
+    (*                      ' ' '<'                           '>' ' '                                                  ' '                *)
+
   module Decoder =
   struct
     open Angstrom
@@ -146,7 +151,21 @@ struct
       Hash.pp tree
       (pp_list ~sep:"; " Hash.pp) parents
       User.pp author User.pp committer
-      Format.pp_print_text message;
+      Format.pp_print_text message
+
+  let raw_length t =
+    let parents =
+      List.fold_left (fun acc _ -> (String.length "parent") + 1 + Hash.size + 1 + acc) 0 t.parents
+                                   (*                        ' '             1LF    *)
+    in
+    (String.length "tree") + 1 + Hash.size + 1
+    (*                      ' '             1LF *)
+    + parents
+    + (String.length "author") + 1 + (User.raw_length t.author) + 1
+    (*                          ' '                              1LF *)
+    + (String.length "committer") + 1 + (User.raw_length t.committer)
+    (*                             ' '                             *)
+    + (String.length t.message)
 
   module Decoder =
   struct
@@ -256,6 +275,31 @@ struct
     Format.fprintf fmt "[ @[<hov>%a@] ]"
       (pp_list ~sep:"; " pp_entry) tree
 
+  let string_of_perm = function
+    | `Normal    -> "100644"
+    | `Everybody -> "100664"
+    | `Exec      -> "100755"
+    | `Link      -> "120000"
+    | `Dir       -> "40000"
+    | `Commit    -> "160000"
+
+  let perm_of_string = function
+    | "44"
+    | "100644" -> `Normal
+    | "100664" -> `Everybody
+    | "100755" -> `Exec
+    | "120000" -> `Link
+    | "40000"  -> `Dir
+    | "160000" -> `Commit
+    | s -> raise (Invalid_argument "perm_of_string")
+
+  let raw_length t =
+    let entry acc x =
+      (String.length (string_of_perm x.perm)) + 1 + (String.length x.name) + 1 + Hash.size + acc
+      (*                                       ' '                          1NL               *)
+    in
+    List.fold_left entry 0 t
+
   module Decoder =
   struct
     open Angstrom
@@ -266,16 +310,6 @@ struct
     let is_not_nl chr = chr <> '\x00'
 
     let escape = '\042'
-
-    let perm_of_string = function
-      | "44"
-      | "100644" -> `Normal
-      | "100664" -> `Everybody
-      | "100755" -> `Exec
-      | "120000" -> `Link
-      | "40000"  -> `Dir
-      | "160000" -> `Commit
-      | s -> raise (Invalid_argument "perm_of_string")
 
     let decode path =
       if not (String.contains path escape)
@@ -341,14 +375,6 @@ struct
     let sp = ' '
     let nl = '\x00'
 
-    let string_of_perm = function
-      | `Normal    -> "100644"
-      | `Everybody -> "100664"
-      | `Exec      -> "100755"
-      | `Link      -> "120000"
-      | `Dir       -> "40000"
-      | `Commit    -> "160000"
-
     let entry e t =
       eval e [ !!string; char $ sp; !!string; char $ nl; !!string ]
         (string_of_perm t.perm)
@@ -366,7 +392,9 @@ end
 
 module Blob =
 struct
-  type 'i t = { content : Cstruct.t }
+  type t = { content : Cstruct.t }
+
+  let raw_length t = Cstruct.len t.content
 
   module Decoder =
   struct
@@ -411,6 +439,28 @@ struct
       tag
       (pp_option User.pp) tagger
       Format.pp_print_text message
+
+  let string_of_kind = function
+    | Commit -> "commit"
+    | Tag -> "tag"
+    | Tree -> "tree"
+    | Blob -> "blob"
+
+  let raw_length t =
+    let user_length = match t.tagger with
+      | Some user -> (String.length "tagger") + 1 + (User.raw_length user) + 1
+                     (*                        ' '                          1LF *)
+      | None -> 0
+    in
+    (String.length "object") + 1 + (Hash.size * 2) + 1
+    (*                        ' '                   1LF *)
+    + (String.length "type") + 1 + (String.length (string_of_kind t.kind)) + 1
+    (*                        ' '                                           1LF *)
+    + (String.length "tag") + 1 + (String.length t.tag) + 1
+    (*                       ' '                         1LF *)
+    + user_length
+    + 1 + (String.length t.message)
+  (* 1LF *)
 
   module Decoder =
   struct
