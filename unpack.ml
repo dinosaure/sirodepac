@@ -1153,6 +1153,12 @@ struct
     ; hash = "" (* TODO *) }
 
   let get ?(chunk_size = 0x800) t hash z_tmp z_win h_tmp =
+    (* XXX(dinosaure): we can avoid the [BBuffer] in this compute but we need to
+                       assert than the bigarray sended by the user has a good
+                       size. The variable-length is the canonic length needed to
+                       store the git object (after application of delta). TODO!
+     *)
+
     match t.idx hash with
     | Some absolute_offset ->
       let window, relative_offset = find t absolute_offset in
