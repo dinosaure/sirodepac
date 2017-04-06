@@ -233,6 +233,12 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
         consumed
         offset
 
+type entry =
+  | Commit of Minigit.Commit.t
+  | Tree of Minigit.Tree.t
+  | Tag of Minigit.Tag.t
+  | Blob of Minigit.Blob.t
+
 let unpack ?(chunk = 0x8000) pack_filename get =
   let buf   = BBuffer.create chunk in
   let z_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000) in
@@ -243,19 +249,19 @@ let unpack ?(chunk = 0x8000) pack_filename get =
   let map     = Cstruct.of_bigarray @@ Bigarray.Array1.map_file pack_fd Bigarray.Char Bigarray.c_layout false (-1) in
   let rap     = D.make pack_fd get in
 
-  let rec loop offset (t : P.t) =
+  let rec loop entries offset (t : P.t) =
     match P.eval map t with
     | `Await t ->
       let chunk = min (Cstruct.len map - offset) chunk in
       if chunk > 0
-      then loop (offset + chunk) (P.refill offset chunk t)
+      then loop entries (offset + chunk) (P.refill offset chunk t)
       else Error (`File_error End_of_file)
     | `Flush t ->
       let o, n = P.output t in
       let () = BBuffer.add o ~len:n buf in
-      loop offset (P.flush 0 n t)
+      loop entries offset (P.flush 0 n t)
     | `End (t, hash) ->
-      Ok hash
+      Ok (hash, entries)
     | `Error (t, exn) ->
       Error (`Pack_error exn)
     | `Object t ->
@@ -289,7 +295,21 @@ let unpack ?(chunk = 0x8000) pack_filename get =
               let hash = hash_of_object base.D.Base.kind base.D.Base.length base.D.Base.raw in
 
               check hash base.D.Base.kind base.D.Base.raw rlength rconsumed roffset ~base:(level, base_hash, base.D.Base.length) get;
-              loop offset (P.next_object t)
+
+              (match D.get rap hash z_tmp z_win h_tmp with
+               | Ok base -> Format.printf "%a: [ok]\n%!" Hash.pp hash
+               | Error exn -> Format.eprintf "D.get (delta) fails with: %a\n%!" D.pp_error exn; assert false);
+
+              (* [check] valids [raw]. *)
+              let entry = match base.D.Base.kind with
+                | P.Commit -> Commit Result.(unsafe_ok (Minigit.Commit.Decoder.to_result base.D.Base.raw))
+                | P.Tree -> Tree Result.(unsafe_ok (Minigit.Tree.Decoder.to_result base.D.Base.raw))
+                | P.Tag -> Tag Result.(unsafe_ok (Minigit.Tag.Decoder.to_result base.D.Base.raw))
+                | P.Blob -> Blob Result.(unsafe_ok (Minigit.Blob.Decoder.to_result base.D.Base.raw))
+                | P.Hunk _ -> assert false
+              in
+
+              loop ((hash, entry) :: entries) offset (P.next_object t)
             | Error exn -> Error (`Delta_error exn))
          | Error exn -> Error exn)
       | kind ->
@@ -297,11 +317,25 @@ let unpack ?(chunk = 0x8000) pack_filename get =
         let hash = hash_of_object kind (P.length t) raw in
 
         check hash kind raw (P.length t) (P.consumed t) (P.offset t) get;
+
+        (match D.get rap hash z_tmp z_win h_tmp with
+         | Ok base -> Format.printf "%a: [ok]\n%!" Hash.pp hash
+         | Error exn -> Format.eprintf "D.get fails with: %a\n%!" D.pp_error exn; assert false);
+
+        (* [check] valids [raw]. *)
+        let entry = match kind with
+          | P.Commit -> Commit Result.(unsafe_ok (Minigit.Commit.Decoder.to_result raw))
+          | P.Tree -> Tree Result.(unsafe_ok (Minigit.Tree.Decoder.to_result raw))
+          | P.Tag -> Tag Result.(unsafe_ok (Minigit.Tag.Decoder.to_result raw))
+          | P.Blob -> Blob Result.(unsafe_ok (Minigit.Blob.Decoder.to_result raw))
+          | P.Hunk _ -> assert false
+        in
+
         BBuffer.clear buf;
-        loop offset (P.next_object t)
+        loop ((hash, entry) :: entries) offset (P.next_object t)
   in
 
-  loop 0 (P.default z_tmp z_win h_tmp)
+  loop [] 0 (P.default z_tmp z_win h_tmp)
 
 (* Bigstring map. *)
 let cstruct_map filename =
@@ -390,6 +424,50 @@ let dual_idx (tree, rai) =
 
   check_idx_implementation (refiller map) rai
 
+let unzip l =
+  let rec aux (l1, l2) = function
+    | [] -> (l1, l2)
+    | (a, b) :: r -> aux (a :: l1, b :: l2) r
+  in aux ([], []) l
+
+let zip l1 l2 =
+  let rec aux acc = function
+    | [], [] -> acc
+    | (a :: ra), (b :: rb) -> aux ((a, b) :: acc) (ra, rb)
+    | _ -> raise (Invalid_argument "zip")
+  in
+
+  aux [] (l1, l2)
+
+let pack ?(chunk_size = 0x800) entries =
+  let entries, raws = unzip entries in
+
+  let entries = Array.of_list
+      (List.map (fun (hash, o) -> match o with
+           | Tag o -> Pack.Entry.from_tag hash o
+           | Commit o -> Pack.Entry.from_commit hash o
+           | Tree o -> Pack.Entry.from_tree hash o
+           | Blob o -> Pack.Entry.from_blob hash o)
+          entries)
+  in
+  let dst = Cstruct.create chunk_size in
+
+  Array.sort Pack.Entry.compare entries;
+
+  let rec loop t = match Pack.P.eval dst t with
+    | `Await t -> ()
+    | `Flush t ->
+      let n = Pack.P.used_out t in
+      Format.eprintf "%s%!" (Cstruct.to_string (Cstruct.sub dst 0 n));
+      loop (Pack.P.flush 0 chunk_size t)
+    | `Error (t, exn) -> Format.eprintf "Pack error: %a\n%!" Pack.P.pp_error exn
+    | `End t ->
+      if Pack.P.used_out t <> 0
+      then Format.eprintf "%s%!" (Cstruct.to_string (Cstruct.sub dst 0 (Pack.P.used_out t)));
+  in
+
+  loop (Pack.P.default entries)
+
 let () =
   let pack_filename = Sys.argv.(1) in (* alloc *)
   let ii = cstruct_map Sys.argv.(2) in (* alloc *)
@@ -416,7 +494,7 @@ let () =
                 >>= dual_idx
                 >>| snd (* take the lazy implementation *)
                 >>= (fun rai -> unpack pack_filename (fun hash -> Idx.Lazy.find rai hash))) with
-  | Ok hash -> Format.printf "End of parsing: %a\n%!" Hash.pp hash
+  | Ok (hash, _) -> Format.printf "End of parsing: %a\n%!" Hash.pp hash
   | Error (`Pack_error exn) ->
     Format.eprintf "pack error: %a\n%!" P.pp_error exn
   | Error (`Delta_error exn) ->
