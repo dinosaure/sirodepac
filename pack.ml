@@ -27,6 +27,12 @@ struct
 
   let to_bin x =
     (to_int x) land 0b111
+
+  let pp fmt = function
+    | Commit -> Format.fprintf fmt "Commit"
+    | Tree -> Format.fprintf fmt "Tree"
+    | Blob -> Format.fprintf fmt "Blob"
+    | Tag -> Format.fprintf fmt "Tag"
 end
 
 module Entry =
@@ -36,6 +42,15 @@ struct
     ; hash_object : string
     ; kind        : Kind.t
     ; length      : int64 }
+
+  let pp = Format.fprintf
+
+  let pp fmt { hash_name; hash_object; kind; length; } =
+    pp fmt "{ @[<hov>name = %d;@ \
+                     hash = %a;@ \
+                     kind = %a;@ \
+                     length = %Ld;@] }"
+      hash_name Hash.pp hash_object Kind.pp kind length
 
   (* XXX(dinosaure): hash from git to sort git objects.
                     in git, this hash is computed in an [int32].
@@ -149,6 +164,7 @@ struct
     | Zip of { idx : int
              ; raw : Cstruct.t
              ; z   : (Decompress.B.bs, Decompress.B.bs) Decompress.Deflate.t }
+    | End
     | Exception of error
   and res =
     | Wait of t
@@ -157,9 +173,43 @@ struct
     | Cont of t
     | Ok of t
 
+  let pp = Format.fprintf
+
+  let pp_state fmt = function
+    | Header _ -> pp fmt "(Header #k)"
+    | Object _ -> pp fmt "(Object #k)"
+    | Raw idx  -> pp fmt "(Raw idx:%d)" idx
+    | Zip { idx; raw; z; } ->
+      pp fmt "(Zip { @[<hov>idx = %d;@ \
+                            raw = #raw;@ \
+                            z = %a;@] })"
+        idx Decompress.Deflate.pp z
+    | End -> pp fmt "End"
+    | Exception exn -> pp fmt "(Exception %a)" pp_error exn
+
+  let pp_list ?(sep = (fun fmt () -> ()) )pp_data fmt lst =
+    let rec aux = function
+      | [] -> ()
+      | [ x ] -> pp_data fmt x
+      | x :: r -> pp fmt "%a%a" pp_data x sep (); aux r
+    in aux lst
+
+  let pp fmt { o_off; o_pos; o_len; write; radix; objects; state; } =
+    pp fmt "{ @[<hov>o_off = %d;@ \
+                     o_pos = %d;@ \
+                     o_len = %d;@ \
+                     write = %Ld;@ \
+                     radix = #tree;@ \
+                     objects = #list;@ \
+                     state = @[<hov>%a@];@] }"
+      o_off o_pos o_len
+      write
+      pp_state state
+
   let await t = Wait t
   let flush t = Flush t
   let error t exn = Error ({ t with state = Exception exn }, exn)
+  let ok    t = Ok ({ t with state = End })
 
   module KHeader =
   struct
@@ -214,7 +264,7 @@ struct
 
   let header_entry idx dst t =
     if idx = Array.length t.objects
-    then Cont t
+    then ok t
     else
       let crc    = 0l in (* TODO: calculate crc. *)
       let offset = t.write in
@@ -241,23 +291,29 @@ struct
       else await { t with state = Raw idx }
 
   let raw_entry dst t idx raw z =
-    let raw = Decompress.B.from_bigstring (Cstruct.to_bigarray raw) in
-    let dst = Decompress.B.from_bigstring (Cstruct.to_bigarray dst) in
+    let raw' = Decompress.B.from_bigstring (Cstruct.to_bigarray raw) in
+    let dst' = Decompress.B.from_bigstring (Cstruct.to_bigarray dst) in
 
-    match Decompress.Deflate.eval raw dst z with
-    | `Await z -> await t
-    | `Flush z -> flush t
-    | `End z -> Cont { t with state = Object (header_entry (idx + 1)) }
+    match Decompress.Deflate.eval raw' dst' z with
+    | `Await z ->
+      Format.eprintf "PACK AWAIT: %a\n%!" Decompress.Deflate.pp z;
+      await { t with state = Zip { idx; raw; z; } }
+    | `Flush z ->
+      Format.eprintf "PACK FLUSH: %a\n%!" Decompress.Deflate.pp z;
+      flush { t with state = Zip { idx; raw; z; }
+                   ; o_pos = t.o_pos + (Decompress.Deflate.used_out z) }
+    | `End z -> Cont { t with state = Object (header_entry (idx + 1))
+                            ; o_pos = t.o_pos + (Decompress.Deflate.used_out z) }
     | `Error (z, exn) -> error t (Deflate_error exn)
 
   let number dst t =
     (* XXX(dinosaure): problem in 32-bits architecture. *)
     KHeader.put_u32 (Int32.of_int (Array.length t.objects))
-      (fun dst t -> Cont t)
+      (fun dst t -> Cont { t with state = Object (header_entry 0) })
       dst t
 
   let version dst t =
-    KHeader.put_u32 2l (fun dst t -> Cont t) dst t
+    KHeader.put_u32 2l (fun dst t -> Cont { t with state = Header number }) dst t
 
   let header dst t =
     (KHeader.put_byte (Char.code 'P')
@@ -265,16 +321,32 @@ struct
      @@ KHeader.put_byte (Char.code 'C')
      @@ KHeader.put_byte (Char.code 'K')
      @@ fun dst t -> Cont { t with state = Header version })
-    dst t
+      dst t
+
+  let raw raw t = match t.state with
+    | Raw idx ->
+      let z =
+        Decompress.Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos)
+        @@ Decompress.Deflate.default ~proof:Decompress.B.proof_bigstring 4
+      in
+      { t with state = Zip { idx; raw; z; } }
+    | _ -> raise (Invalid_argument "P.raw: bad state")
+
+  let current_raw t = match t.state with
+    | Zip { raw; _ } -> raw
+    | _ -> raise (Invalid_argument "P.current_raw: bad state")
+
+  let finish_raw t = match t.state with
+    | Zip { idx; raw; z; } ->
+      { t with state = Zip { idx; raw; z = Decompress.Deflate.finish z }}
+    | _ -> raise (Invalid_argument "P.finish_raw: bad state")
 
   let refill off len ?raw t = match t.state, raw with
-    | Raw idx , Some raw ->
-      { t with state = Zip { idx; raw; z = Decompress.Deflate.default ~proof:Decompress.B.proof_bigstring 4 } }
-    | Raw idx, None ->
-      raise (Invalid_argument "P.refill: expected a raw data")
     | Zip { idx; raw; z; }, Some new_raw ->
+      Format.eprintf "PACK REFILL: %a\n%!" Decompress.Deflate.pp z;
       { t with state = Zip { idx; raw = new_raw; z = Decompress.Deflate.no_flush off len z } }
     | Zip { idx; raw; z; }, None ->
+      Format.eprintf "PACK REFILL: %a\n%!" Decompress.Deflate.pp z;
       { t with state = Zip { idx; raw; z = Decompress.Deflate.no_flush off len z } }
     | _ -> raise (Invalid_argument "P.refill: bad state")
 
@@ -309,6 +381,7 @@ struct
       | Raw idx  -> await t
       | Zip { idx; raw; z; } -> raw_entry dst t idx raw z
       | Exception exn -> error t exn
+      | End -> Ok t
     in
 
     let rec loop t =
