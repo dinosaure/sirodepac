@@ -1,5 +1,7 @@
 type ('a, 'b) t = string constraint 'a = [> ]
-                         constraint 'b = [ `SHA1 ]
+  constraint 'b = [ `SHA1 ]
+
+type ctx = Nocrypto.Hash.SHA1.t
 
 let size        = Nocrypto.Hash.SHA1.digest_size
 let digestv l   = Cstruct.to_string (Nocrypto.Hash.SHA1.digestv l)
