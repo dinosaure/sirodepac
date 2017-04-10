@@ -8,8 +8,8 @@ let digest v ?(off = 0) ?len c =
     | Some len -> len
     | None -> Cstruct.len c
   in
-  let b = Cstruct.to_bigarray (Cstruct.sub c off len) in
-  crc32_bigarray v b 0 len
+  let b = Cstruct.to_bigarray c in
+  crc32_bigarray v b off len
 
 let digestv v cs = List.fold_left (fun v c -> digest v c) v cs
 
