@@ -53,7 +53,8 @@ struct
       hash_name Hash.pp hash_object Kind.pp kind length
 
   (* XXX(dinosaure): hash from git to sort git objects.
-                    in git, this hash is computed in an [int32].
+                     in git, this hash is computed in an [int32],
+                     so we have a problem for the 32-bits architecture.
   *)
   let hash name =
     let res = ref 0 in
@@ -149,13 +150,14 @@ struct
     | Deflate_error exn -> Format.fprintf fmt "(Deflate_error %a)" Decompress.Deflate.pp_error exn
 
   type t =
-    { o_off : int
-    ; o_pos : int
-    ; o_len : int
-    ; write : int64
-    ; radix : (Crc32.t * int64) Radix.t
+    { o_off   : int
+    ; o_pos   : int
+    ; o_len   : int
+    ; write   : int64
+    ; radix   : (Crc32.t * int64) Radix.t
     ; objects : Entry.t array
-    ; state : state }
+    ; hash    : Hash.ctx
+    ; state   : state }
   and k = Cstruct.t -> t -> res
   and state =
     | Header of k
@@ -169,6 +171,7 @@ struct
     | Epilogue of { idx : int
                   ; off : int64
                   ; crc : Crc32.t }
+    | Hash of k
     | End
     | Exception of error
   and res =
@@ -196,6 +199,7 @@ struct
                                  off = %Ld;@ \
                                  crc = %a;@] })"
         idx off Crc32.pp crc
+    | Hash _ -> pp fmt "(Hash #k)"
     | End -> pp fmt "End"
     | Exception exn -> pp fmt "(Exception %a)" pp_error exn
 
@@ -219,7 +223,10 @@ struct
       pp_state state
 
   let await t = Wait t
-  let flush t = Flush t
+  let flush dst t =
+    let () = Hash.feed t.hash (Cstruct.to_string (Cstruct.sub dst t.o_off t.o_pos)) in
+                              (* XXX(dinosaure): use [cstruct] instead [string] (avoid allocation). *)
+    Flush t
   let error t exn = Error ({ t with state = Exception exn }, exn)
   let ok    t = Ok ({ t with state = End })
 
@@ -231,7 +238,7 @@ struct
         Cstruct.set_uint8 dst (t.o_off + t.o_pos) byte;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = Int64.add t.write 1L }
-      end else Flush { t with state = Header (put_byte byte k) }
+      end else flush dst { t with state = Header (put_byte byte k) }
 
     let rec put_u32 integer k dst t =
       if (t.o_len - t.o_pos) > 3
@@ -252,7 +259,7 @@ struct
          @@ put_byte a4
          @@ k)
         dst t
-      end else Flush { t with state = Header (put_u32 integer k) }
+      end else flush dst { t with state = Header (put_u32 integer k) }
   end
 
   module KObject =
@@ -263,7 +270,7 @@ struct
         Cstruct.set_uint8 dst (t.o_off + t.o_pos) byte;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = Int64.add t.write 1L }
-      end else Flush { t with state = Object (put_byte byte k) }
+      end else flush dst { t with state = Object (put_byte byte k) }
 
     let rec length n crc k dst t =
       let byte = Int64.(to_int (n && 0x7FL)) in
@@ -274,14 +281,59 @@ struct
       else put_byte byte (k (Crc32.digestc crc byte)) dst t
   end
 
+  module KHash =
+  struct
+    let rec put_byte byte k dst t =
+      if (t.o_len - t.o_pos) > 0
+      then begin
+        Cstruct.set_uint8 dst (t.o_off + t.o_pos) byte;
+        k dst { t with o_pos = t.o_pos + 1
+                     ; write = Int64.add t.write 1L }
+      end else flush dst { t with state = Hash (put_byte byte k) }
+
+    let put_hash hash k dst t =
+      if t.o_len - t.o_pos >= Hash.size
+      then
+        begin
+          Cstruct.blit_from_string hash 0 dst (t.o_off + t.o_pos) Hash.size;
+          k dst t
+        end
+      else
+        let rec loop rest dst t =
+          if rest = 0
+          then k dst t
+          else
+            let n = min Hash.size (t.o_len - t.o_pos) in
+
+            if n = 0
+            then Flush { t with state = Hash (loop rest) }
+
+                 (* XXX(dinosaure): don't use the [flush] function, this function
+                                   computes the hash with the output. *)
+            else
+              begin
+                Cstruct.blit_from_string hash (Hash.size - rest) dst (t.o_off + t.o_pos) n;
+                Flush { t with state = Hash (loop rest) }
+
+                (* XXX(dinosaure): don't use the [flush] function, this function
+                                   computes the hash with the output. *)
+              end
+        in
+
+        loop Hash.size dst t
+  end
+
+  let hash dst t =
+    KHash.put_hash (Hash.get t.hash) (fun _ -> ok) dst t
+
   let header_entry idx dst t =
     if idx = Array.length t.objects
-    then ok t
+    then Cont { t with state = Hash hash }
     else
       let offset = t.write in
-
       let entry  = Array.get t.objects idx in
-      let length = entry.Entry.length in (* TODO: to Big-Endian. *)
+      let length = entry.Entry.length in
+
       let byte   = ((Kind.to_bin entry.Entry.kind) lsl 0x1F) in (* kind *)
       let byte   = byte lor Int64.(to_int (length && 0x0FL)) in (* part of the size *)
 
@@ -316,7 +368,7 @@ struct
     | `Flush z ->
       let crc = Crc32.digest ~off:0 ~len:(Deflate.used_out z) crc dst in
 
-      flush { t with state = Zip { idx; raw; off; crc; z; }
+      flush dst { t with state = Zip { idx; raw; off; crc; z; }
                    ; o_pos = t.o_pos + (Decompress.Deflate.used_out z) }
     | `End z ->
       let crc = Crc32.digest ~off:0 ~len:(Deflate.used_out z) crc dst in
@@ -342,11 +394,14 @@ struct
      @@ fun dst t -> Cont { t with state = Header version })
       dst t
 
-  let raw raw t = match t.state with
+  let raw raw t =
+    let open Decompress in
+
+    match t.state with
     | Raw (idx, off, crc) ->
       let z =
-        Decompress.Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos)
-        @@ Decompress.Deflate.default ~proof:Decompress.B.proof_bigstring 4
+        Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos)
+        @@ Deflate.default ~proof:B.proof_bigstring 4
       in
       { t with state = Zip { idx; raw; off; crc; z; } }
     | _ -> raise (Invalid_argument "P.raw: bad state")
@@ -369,7 +424,8 @@ struct
 
   let flush offset len t =
     if (t.o_len - t.o_pos) = 0
-    then match t.state with
+    then
+      match t.state with
       | Zip { idx; raw; off; crc; z; } ->
         { t with o_off = offset
               ; o_len = len
@@ -399,6 +455,7 @@ struct
       | Zip { idx; raw; off; crc; z; } -> raw_entry dst t idx raw off crc z
       | Epilogue { idx; off; crc; } -> epilogue_entry dst t idx off crc
       | Exception exn -> error t exn
+      | Hash k -> k dst t
       | End -> Ok t
     in
 
@@ -420,5 +477,6 @@ struct
     ; write = 0L
     ; radix = Radix.empty
     ; objects
+    ; hash = Hash.init ()
     ; state = (Header header) }
 end
