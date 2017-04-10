@@ -162,14 +162,16 @@ let hash_of_encoder encoder =
      Git object).
    check the hash produced by the result of the encoding (see hash_of_encoder)
      and compare with the hash provided by the parsing of the PACK file.
+   check the CRC-32 provided by the IDX file and compare with the CRC-32 produced by
+     the deserialization of the git-object inside the PACK file.
    print the result.
 *)
-let check hash kind raw length consumed offset ?base getter = match getter hash with
+let check hash kind raw length consumed offset crc ?base getter = match getter hash with
   | None ->
     Format.eprintf "Object %s not found\n%!"
       (Hash.to_pp hash);
     assert false
-  | Some offset' ->
+  | Some (crc', offset') ->
     if offset <> offset'
     then begin
       Format.eprintf "Offset of the object %s (%Ld) does not correspond with \
@@ -185,12 +187,19 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
     dual encoder (kind, raw, real_length);
     let hash' = hash_of_encoder encoder in
 
-    if hash <> hash'
+    Format.printf "has: %a, expect: %a\n%!" Crc32.pp crc' Crc32.pp crc;
+
+    if hash <> hash' || crc <> crc'
     then begin
       Format.eprintf "Hash of the object %s does not correspond with the hash \
                       produced by the encoder %s\n%!"
         (Hash.to_pp hash)
         (Hash.to_pp hash');
+
+      Format.eprintf "Or CRC-32 of the IDX (%a) file does not correspond to the \
+                      CRC-32 of the PACK file (%a)\n%!"
+        Crc32.pp crc'
+        Crc32.pp crc;
 
       Format.eprintf "OCaml value: %a\n%!"
         pp (deserialize (kind, raw, real_length));
@@ -204,11 +213,16 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
 
          Format.eprintf "BAD [%s]:\n%a\n%!"
            (Hash.to_pp (Hash.digest raw'))
-           Hex.hexdump (Hex.of_string_fast (Cstruct.to_string raw'));
+           Cstruct.hexdump_pp raw';
+
+         let raw =
+           Cstruct.concat
+             [ (Cstruct.of_string (header_to_string (kind, raw, length)))
+             ; raw ]
+         in
 
          Format.eprintf "OK (without header):\n%a\n%!"
-           Hex.hexdump (Hex.of_string_fast ((header_to_string (kind, raw, length))
-                                            ^ Cstruct.to_string raw));
+           Cstruct.hexdump_pp raw;
 
          `Ok (Cstruct.lenv lst))
       in
@@ -235,9 +249,9 @@ let check hash kind raw length consumed offset ?base getter = match getter hash 
 
 type entry =
   | Commit of Minigit.Commit.t
-  | Tree of Minigit.Tree.t
-  | Tag of Minigit.Tag.t
-  | Blob of Minigit.Blob.t
+  | Tree   of Minigit.Tree.t
+  | Tag    of Minigit.Tag.t
+  | Blob   of Minigit.Blob.t
 
 let unpack ?(chunk = 0x8000) pack_filename get =
   let buf   = BBuffer.create chunk in
@@ -261,13 +275,13 @@ let unpack ?(chunk = 0x8000) pack_filename get =
       let () = BBuffer.add o ~len:n buf in
       loop entries offset (P.flush 0 n t)
     | `End (t, hash) ->
-      Ok (hash, entries)
+      Ok (hash, entries, rap)
     | `Error (t, exn) ->
-      Error (`Pack_error exn)
+      Error (`Unpack_error exn)
     | `Object t ->
       match P.kind t with
       | P.Hunk hunks ->
-        let (rlength, rconsumed, roffset) = P.length t, P.consumed t, P.offset t in
+        let (rlength, rconsumed, roffset, rcrc) = P.length t, P.consumed t, P.offset t, P.crc t in
 
         let rec undelta ?(level = 1) hunks offset =
           match D.delta rap hunks offset z_tmp z_win h_tmp with
@@ -294,11 +308,7 @@ let unpack ?(chunk = 0x8000) pack_filename get =
             | Ok base ->
               let hash = hash_of_object base.D.Base.kind base.D.Base.length base.D.Base.raw in
 
-              check hash base.D.Base.kind base.D.Base.raw rlength rconsumed roffset ~base:(level, base_hash, base.D.Base.length) get;
-
-              (match D.get rap hash z_tmp z_win h_tmp with
-               | Ok base -> Format.printf "%a: [ok]\n%!" Hash.pp hash
-               | Error exn -> Format.eprintf "D.get (delta) fails with: %a\n%!" D.pp_error exn; assert false);
+              check hash base.D.Base.kind base.D.Base.raw rlength rconsumed roffset rcrc ~base:(level, base_hash, base.D.Base.length) get;
 
               (* [check] valids [raw]. *)
               let entry = match base.D.Base.kind with
@@ -316,11 +326,7 @@ let unpack ?(chunk = 0x8000) pack_filename get =
         let raw = BBuffer.contents buf in
         let hash = hash_of_object kind (P.length t) raw in
 
-        check hash kind raw (P.length t) (P.consumed t) (P.offset t) get;
-
-        (match D.get rap hash z_tmp z_win h_tmp with
-         | Ok base -> Format.printf "%a: [ok]\n%!" Hash.pp hash
-         | Error exn -> Format.eprintf "D.get fails with: %a\n%!" D.pp_error exn; assert false);
+        check hash kind raw (P.length t) (P.consumed t) (P.offset t) (P.crc t) get;
 
         (* [check] valids [raw]. *)
         let entry = match kind with
@@ -343,7 +349,7 @@ let cstruct_map filename =
   let m = Bigarray.Array1.map_file i Bigarray.Char Bigarray.c_layout false (-1) in
   Cstruct.of_bigarray m
 
-type error = [ `Pack_error of P.error
+type error = [ `Unoack_error of P.error
              | `Delta_error of D.error
              | `Lazy_index_error of Idx.Lazy.error
              | `Decoder_index_error of Idx.Decoder.error
@@ -390,7 +396,7 @@ let check_idx_implementation refiller rai =
   match Idx.idx_to_tree refiller with
   | Error exn -> Error (`Decoder_index_error exn)
   | Ok tree ->
-    try let () = Radix.fold (fun (key, (_, value)) () -> match getter key with
+    try let () = Radix.fold (fun (key, value) () -> match getter key with
                              | None -> raise Break
                              | Some value' ->
                                if value <> value'
@@ -439,8 +445,10 @@ let zip l1 l2 =
 
   aux [] (l1, l2)
 
-let pack ?(chunk_size = 0x800) entries =
-  let entries, raws = unzip entries in
+let pack ?(chunk_size = 0x800) fmt (entries, rap) =
+  let z_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000) in
+  let h_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000) in
+  let z_win = Decompress.Window.create ~proof:Decompress.B.proof_bigstring in
 
   let entries = Array.of_list
       (List.map (fun (hash, o) -> match o with
@@ -454,16 +462,30 @@ let pack ?(chunk_size = 0x800) entries =
 
   Array.sort Pack.Entry.compare entries;
 
-  let rec loop t = match Pack.P.eval dst t with
-    | `Await t -> ()
+  let rec loop ?(raw = false) t =
+    Format.eprintf "%a\n%!" Pack.P.pp t;
+
+    match Pack.P.eval dst t with
+    | `Await t ->
+      (match Pack.P.expect t with
+       | Some hash ->
+         let base = Result.unsafe_ok (D.get rap hash z_tmp z_win h_tmp) in
+                    (* XXX(dinosaure): previous tests check the [unsafe_ok]. *)
+         loop (Pack.P.raw base.D.Base.raw t)
+       | None ->
+         if raw
+         then loop (Pack.P.finish_raw t)
+         else loop ~raw:true (Pack.P.refill 0 (Cstruct.len (Pack.P.current_raw t)) t))
     | `Flush t ->
       let n = Pack.P.used_out t in
-      Format.eprintf "%s%!" (Cstruct.to_string (Cstruct.sub dst 0 n));
+      Format.fprintf fmt "%s%!" (Cstruct.to_string (Cstruct.sub dst 0 n));
       loop (Pack.P.flush 0 chunk_size t)
-    | `Error (t, exn) -> Format.eprintf "Pack error: %a\n%!" Pack.P.pp_error exn
+    | `Error (t, exn) -> Error (`Pack_error exn)
     | `End t ->
       if Pack.P.used_out t <> 0
-      then Format.eprintf "%s%!" (Cstruct.to_string (Cstruct.sub dst 0 (Pack.P.used_out t)));
+      then Format.fprintf fmt "%s%!" (Cstruct.to_string (Cstruct.sub dst 0 (Pack.P.used_out t)));
+
+      Ok ()
   in
 
   loop (Pack.P.default entries)
@@ -471,6 +493,9 @@ let pack ?(chunk_size = 0x800) entries =
 let () =
   let pack_filename = Sys.argv.(1) in (* alloc *)
   let ii = cstruct_map Sys.argv.(2) in (* alloc *)
+
+  let out = open_out "pack.pack" in
+  let fmt = Format.formatter_of_out_channel out in
 
   let refiller map =
     let pos = ref 0 in
@@ -493,10 +518,13 @@ let () =
                 >>= check_idx_implementation (refiller ii)
                 >>= dual_idx
                 >>| snd (* take the lazy implementation *)
-                >>= (fun rai -> unpack pack_filename (fun hash -> Idx.Lazy.find rai hash))) with
-  | Ok (hash, _) -> Format.printf "End of parsing: %a\n%!" Hash.pp hash
+                >>= (fun rai -> unpack pack_filename (fun hash -> Idx.Lazy.find rai hash))
+                >>= (fun (hash, entries, rap) -> pack fmt (entries, rap))) with
+  | Ok () -> Format.printf "End of parsing\n%!"
+  | Error (`Unpack_error exn) ->
+    Format.eprintf "unpack error: %a\n%!" P.pp_error exn
   | Error (`Pack_error exn) ->
-    Format.eprintf "pack error: %a\n%!" P.pp_error exn
+    Format.eprintf "pack error: %a\n%!" Pack.P.pp_error exn
   | Error (`Delta_error exn) ->
     Format.eprintf "delta error: %a\n%!" D.pp_error exn
   | Error (`Lazy_index_error exn) ->

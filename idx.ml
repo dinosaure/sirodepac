@@ -18,7 +18,7 @@ struct
     ; crcs_offset   : int
     ; values_offset : int
     ; v64_offset    : int option
-    ; cache         : Int64.t LRU.t }
+    ; cache         : (Crc32.t * Int64.t) LRU.t }
 
   let has map off len =
     if (off < 0 || len < 0 || off + len > Cstruct.len map)
@@ -153,12 +153,17 @@ struct
 
   let find t hash =
     match LRU.find t.cache hash with
-    | Some offset -> Some offset
+    | Some (crc, offset) -> Some (crc, offset)
     | None ->
       match fanout_idx t hash with
       | Ok idx ->
-        let off = Cstruct.BE.get_uint32 t.map (t.values_offset + (idx * 4)) in
-        Some (Int64.of_int32 off)
+        let crc = Cstruct.BE.get_uint32 t.map (t.crcs_offset + (idx * 4)) in
+        let off = Int64.of_int32 @@ Cstruct.BE.get_uint32 t.map (t.values_offset + (idx * 4)) in
+        (* XXX(dinosaure): need to check if it's a big offset or not. TODO! *)
+
+        LRU.add t.cache hash (Crc32.of_int32 crc, off);
+
+        Some (Crc32.of_int32 crc,  off)
       | Error _ -> None
 end
 
@@ -183,7 +188,7 @@ struct
     ; i_len   : int
     ; fanout  : Int32.t array
     ; hashes  : string Queue.t
-    ; crcs    : Int32.t Queue.t
+    ; crcs    : Crc32.t Queue.t
     ; offsets : (Int32.t * bool) Queue.t
     ; state   : state }
   and k = Cstruct.t -> t -> res
@@ -200,7 +205,7 @@ struct
     | Wait   of t
     | Error  of t * error
     | Cont   of t
-    | Result of t * (string * Int32.t * Int64.t)
+    | Result of t * (string * Crc32.t * Int64.t)
     | Ok     of t
 
   let await t     = Wait t
@@ -419,7 +424,7 @@ struct
     then offsets 0l 0 max src t
     else KCrcs.get_u32
            (fun crc src t ->
-             Queue.add crc t.crcs;
+             Queue.add (Crc32.of_int32 crc) t.crcs;
              (crcs[@tailcall]) (Int32.succ idx) max src t)
            src t
 
@@ -511,7 +516,7 @@ struct
     ; o_pos    : int
     ; o_len    : int
     ; write    : int
-    ; table    : (int32 * int64) Fanout.t
+    ; table    : (Crc32.t * int64) Fanout.t
     ; boffsets : int64 array
     ; state    : state }
   and k = Cstruct.t -> t -> res
@@ -777,7 +782,7 @@ struct
     then Cont { t with state = Offsets (offsets 0 0) }
     else let rec aux acc dst t = match acc with
            | [] -> Cont { t with state = Hashes (crcs (idx + 1)) }
-           | (_, (crc, _)) :: r -> KCrcs.put_int32 crc (aux r) dst t
+           | (_, (crc, _)) :: r -> KCrcs.put_int32 (Crc32.to_int32 crc) (aux r) dst t
          in
          aux (Fanout.get idx t.table) dst t
 
@@ -846,7 +851,7 @@ struct
                      let the user to use any data structure to store the CRC and
                      the Offset for each hash.
    *)
-  let default : (string * (int32 * int64)) sequence -> t = fun seq ->
+  let default : (string * (Crc32.t * int64)) sequence -> t = fun seq ->
 
     let boffsets = ref [] in
     let table    = Fanout.make () in

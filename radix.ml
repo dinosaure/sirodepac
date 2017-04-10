@@ -180,3 +180,5 @@ let iter f = function
 let to_sequence
     : 'a t -> (string * 'a) sequence
     = fun tree k -> iter k tree
+
+let to_list t = fold (fun (k, v) acc -> (k, v) :: acc) [] t

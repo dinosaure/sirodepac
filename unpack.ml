@@ -425,10 +425,12 @@ struct
                    ; consumed : int
                    ; length   : int
                    ; kind     : kind
+                   ; crc      : Crc32.t
                    ; z        : (Decompress.B.bs, Decompress.B.bs) Decompress.Inflate.t }
     | Hunks     of { offset   : int64
                    ; length   : int
                    ; consumed : int
+                   ; crc      : Crc32.t
                    ; z        : (Decompress.B.bs, Decompress.B.bs) Decompress.Inflate.t
                    ; h        : H.t }
     | Next      of { offset   : int64
@@ -438,6 +440,7 @@ struct
                    (* XXX(dinosaure): we have a problem in the 32-bit architecture,
                                       the [length] can be big! TODO!
                     *)
+                   ; crc      : Crc32.t
                    ; kind     : kind }
     | Checksum  of k
     | End       of string
@@ -644,61 +647,72 @@ struct
       loop 0 src t
   end
 
-  let rec length msb (len, bit) k src t = match msb with
+  let rec length msb (len, bit) crc k src t = match msb with
     | true ->
       KVariableLength.get_byte
         (fun byte src t ->
            let msb = byte land 0x80 <> 0 in
-           (length[@tailcall]) msb (len lor ((byte land 0x7F) lsl bit), bit + 7)
+           let crc = Crc32.digestc crc byte in
+           (length[@tailcall]) msb (len lor ((byte land 0x7F) lsl bit), bit + 7) crc
            k src t)
         src t
-    | false -> k len src t
+    | false -> k len crc src t
 
-  let rec offset msb off k src t = match msb with
+  let rec offset msb off crc k src t = match msb with
     | true ->
       KVariableLength.get_byte
         (fun byte src t ->
            let msb = byte land 0x80 <> 0 in
-           (offset[@tailcall]) msb (Int64.logor (Int64.shift_left (Int64.add off 1L) 7) (Int64.of_int (byte land 0x7F)))
+           let crc = Crc32.digestc crc byte in
+           (offset[@tailcall]) msb (Int64.logor (Int64.shift_left (Int64.add off 1L) 7) (Int64.of_int (byte land 0x7F))) crc
            k src t)
         src t
-    | false -> k off src t
+    | false -> k off crc src t
 
-  let hunks src t offset length consumed z h =
-    match Decompress.Inflate.eval src t.o_z z with
+  let hunks src t offset length consumed crc z h =
+    let open Decompress in
+
+    match Inflate.eval (B.Bigstring (Cstruct.to_bigarray src)) t.o_z z with
     | `Await z ->
-      let consumed = consumed + Decompress.Inflate.used_in z in
-      await { t with state = Hunks { offset; length; consumed; z; h; }
-                   ; i_pos = t.i_pos + Decompress.Inflate.used_in z
-                   ; read = Int64.add t.read (Int64.of_int (Decompress.Inflate.used_in z)) }
+      let consumed = consumed + Inflate.used_in z in
+      let crc = Crc32.digest ~off:(t.i_off + t.i_pos) ~len:(Inflate.used_in z) crc src in
+
+      await { t with state = Hunks { offset; length; consumed; crc; z; h; }
+                   ; i_pos = t.i_pos + Inflate.used_in z
+                   ; read = Int64.add t.read (Int64.of_int (Inflate.used_in z)) }
     | `Error (z, exn) -> error t (Inflate_error exn)
     | `End z ->
-      let ret = if Decompress.Inflate.used_out z <> 0
-                then H.eval (match t.o_z with Decompress.B.Bigstring bs -> Cstruct.of_bigarray bs) (H.refill 0 (Decompress.Inflate.used_out z) h)
-                else H.eval (match t.o_z with Decompress.B.Bigstring bs -> Cstruct.of_bigarray bs) h
+
+      let ret = if Inflate.used_out z <> 0
+                then H.eval (match t.o_z with B.Bigstring bs -> Cstruct.of_bigarray bs) (H.refill 0 (Inflate.used_out z) h)
+                else H.eval (match t.o_z with B.Bigstring bs -> Cstruct.of_bigarray bs) h
       in
+
       (match ret with
        | `Ok (h, hunks) ->
+         let crc = Crc32.digest ~off:(t.i_off + t.i_pos) ~len:(Inflate.used_in z) crc src in
+
          Cont { t with state = Next { length
-                                    ; length' = Decompress.Inflate.write z
+                                    ; length' = Inflate.write z
                                     ; offset
-                                    ; consumed = consumed + Decompress.Inflate.used_in z
+                                    ; consumed = consumed + Inflate.used_in z
+                                    ; crc
                                     ; kind = Hunk hunks }
-                     ; i_pos = t.i_pos + Decompress.Inflate.used_in z
-                     ; read = Int64.add t.read (Int64.of_int (Decompress.Inflate.used_in z)) }
+                     ; i_pos = t.i_pos + Inflate.used_in z
+                     ; read = Int64.add t.read (Int64.of_int (Inflate.used_in z)) }
        | `Await h ->
          error t (Hunk_input (length, H.read h))
        | `Error (h, exn) -> error t (Hunk_error exn))
     | `Flush z ->
-      match H.eval (match t.o_z with Decompress.B.Bigstring bs -> Cstruct.of_bigarray bs) (H.refill 0 (Decompress.Inflate.used_out z) h) with
+      match H.eval (match t.o_z with B.Bigstring bs -> Cstruct.of_bigarray bs) (H.refill 0 (Inflate.used_out z) h) with
       | `Await h ->
-        Cont { t with state = Hunks { offset; length; consumed
-                                    ; z = (Decompress.Inflate.flush 0 (Decompress.B.length t.o_z) z)
+        Cont { t with state = Hunks { offset; length; consumed; crc
+                                    ; z = (Inflate.flush 0 (B.length t.o_z) z)
                                     ; h } }
       | `Error (h, exn) -> error t (Hunk_error exn)
       | `Ok (h, objs) ->
-        Cont { t with state = Hunks { offset; length; consumed
-                                    ; z = (Decompress.Inflate.flush 0 (Decompress.B.length t.o_z) z)
+        Cont { t with state = Hunks { offset; length; consumed; crc
+                                    ; z = (Inflate.flush 0 (B.length t.o_z) z)
                                     ; h } }
 
   let size_of_variable_length vl =
@@ -715,54 +729,62 @@ struct
     in
     loop 1 (Int64.shift_right off 7)
 
-  let switch typ off len src t =
+  let switch typ off len crc src t =
+    let open Decompress in
+
     match typ with
     | 0b000 | 0b101 -> error t (Reserved_kind typ)
     | 0b001 ->
       Cont { t with state = Unzip { offset   = off
                                   ; length   = len
                                   ; consumed = size_of_variable_length len
+                                  ; crc
                                   ; kind = Commit
-                                  ; z = Decompress.Inflate.flush 0 (Decompress.B.length t.o_z)
-                                        @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Decompress.Inflate.default (Decompress.Window.reset t.o_w) } }
+                                  ; z = Inflate.flush 0 (B.length t.o_z)
+                                        @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                        @@ Inflate.default (Window.reset t.o_w) } }
     | 0b010 ->
       Cont { t with state = Unzip { offset   = off
                                   ; length   = len
                                   ; consumed = size_of_variable_length len
-                                  ; kind = Tree
-                                  ; z = Decompress.Inflate.flush 0 (Decompress.B.length t.o_z)
-                                        @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Decompress.Inflate.default (Decompress.Window.reset t.o_w) } }
+                                  ; crc
+                                  ; kind     = Tree
+                                  ; z = Inflate.flush 0 (B.length t.o_z)
+                                        @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                        @@ Inflate.default (Window.reset t.o_w) } }
     | 0b011 ->
       Cont { t with state = Unzip { offset   = off
                                   ; length   = len
                                   ; consumed = size_of_variable_length len
-                                  ; kind = Blob
-                                  ; z = Decompress.Inflate.flush 0 (Decompress.B.length t.o_z)
-                                        @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Decompress.Inflate.default (Decompress.Window.reset t.o_w) } }
+                                  ; crc
+                                  ; kind     = Blob
+                                  ; z = Inflate.flush 0 (B.length t.o_z)
+                                        @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                        @@ Inflate.default (Window.reset t.o_w) } }
     | 0b100 ->
       Cont { t with state = Unzip { offset   = off
                                   ; length   = len
                                   ; consumed = size_of_variable_length len
-                                  ; kind = Tag
-                                  ; z = Decompress.Inflate.flush 0 (Decompress.B.length t.o_z)
-                                        @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Decompress.Inflate.default (Decompress.Window.reset t.o_w) } }
+                                  ; crc
+                                  ; kind     = Tag
+                                  ; z = Inflate.flush 0 (B.length t.o_z)
+                                        @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                        @@ Inflate.default (Window.reset t.o_w) } }
     | 0b110 ->
       KObject.get_byte
         (fun byte src t ->
            let msb = byte land 0x80 <> 0 in
-           offset msb (Int64.of_int (byte land 0x7F))
-             (fun offset src t ->
+           let crc = Crc32.digestc crc byte in
+           offset msb (Int64.of_int (byte land 0x7F)) crc
+             (fun offset crc src t ->
                Cont { t with state = Hunks { offset   = off
                                            ; length   = len
                                            ; consumed = size_of_variable_length len
                                                         + size_of_offset offset
-                                           ; z = Decompress.Inflate.flush 0 (Decompress.B.length t.o_z)
-                                                 @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                                 @@ Decompress.Inflate.default (Decompress.Window.reset t.o_w)
+                                           ; crc
+                                           ; z = Inflate.flush 0 (B.length t.o_z)
+                                                 @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                                 @@ Inflate.default (Window.reset t.o_w)
                                            ; h = H.default len (H.Offset offset) } })
              src t)
         src t
@@ -772,9 +794,10 @@ struct
           Cont { t with state = Hunks { offset   = off
                                       ; length   = len
                                       ; consumed = 20 + size_of_variable_length len
-                                      ; z = Decompress.Inflate.flush 0 (Decompress.B.length t.o_z)
-                                            @@ Decompress.Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                            @@ Decompress.Inflate.default (Decompress.Window.reset t.o_w)
+                                      ; crc
+                                      ; z = Inflate.flush 0 (B.length t.o_z)
+                                            @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                            @@ Inflate.default (Window.reset t.o_w)
                                       ; h = H.default len (H.Hash hash) } })
         src t
     | _  -> error t (Invalid_kind typ)
@@ -791,36 +814,46 @@ struct
       (fun byte src t ->
          let msb = byte land 0x80 <> 0 in
          let typ = (byte land 0x70) lsr 4 in
-         length msb (byte land 0x0F, 4) (switch typ offset) src t)
+         let crc = Crc32.digestc Crc32.default byte in
+         length msb (byte land 0x0F, 4) crc (switch typ offset) src t)
       src t
 
-  let unzip src t offset length consumed kind z =
-    match Decompress.Inflate.eval src t.o_z z with
+  let unzip src t offset length consumed crc kind z =
+    let open Decompress in
+
+    match Inflate.eval (B.Bigstring (Cstruct.to_bigarray src)) t.o_z z with
     | `Await z ->
-      let consumed = consumed + Decompress.Inflate.used_in z in
+      let crc = Crc32.digest ~off:(t.i_off + t.i_pos) ~len:(Inflate.used_in z) crc src in
+      let consumed = consumed + Inflate.used_in z in
+
       await { t with state = Unzip { offset
                                    ; length
                                    ; consumed
+                                   ; crc
                                    ; kind
                                    ; z }
-                   ; i_pos = t.i_pos + Decompress.Inflate.used_in z
-                   ; read = Int64.add t.read (Int64.of_int (Decompress.Inflate.used_in z)) }
+                   ; i_pos = t.i_pos + Inflate.used_in z
+                   ; read = Int64.add t.read (Int64.of_int (Inflate.used_in z)) }
     | `Flush z ->
-      flush { t with state = Unzip { offset; length; consumed
+      flush { t with state = Unzip { offset; length; consumed; crc
                                    ; kind
                                    ; z } }
     | `End z ->
-      if Decompress.Inflate.used_out z <> 0
-      then flush { t with state = Unzip { offset; length; consumed
+      if Inflate.used_out z <> 0
+      then flush { t with state = Unzip { offset; length; consumed; crc
                                         ; kind
                                         ; z } }
-      else Cont { t with state = Next { length
-                                      ; length' = Decompress.Inflate.write z
-                                      ; consumed = consumed + Decompress.Inflate.used_in z
-                                      ; offset
-                                      ; kind }
-                       ; i_pos = t.i_pos + Decompress.Inflate.used_in z
-                       ; read = Int64.add t.read (Int64.of_int (Decompress.Inflate.used_in z)) }
+      else
+        let crc = Crc32.digest ~off:(t.i_off + t.i_pos) ~len:(Inflate.used_in z) crc src in
+
+        Cont { t with state = Next { length
+                                   ; length' = Inflate.write z
+                                   ; consumed = consumed + Inflate.used_in z
+                                   ; offset
+                                   ; crc
+                                   ; kind }
+                    ; i_pos = t.i_pos + Inflate.used_in z
+                    ; read = Int64.add t.read (Int64.of_int (Inflate.used_in z)) }
     | `Error (z, exn) -> error t (Inflate_error exn)
 
   let next src t length length' kind =
@@ -890,22 +923,24 @@ struct
   let refill off len t =
     if (t.i_len - t.i_pos) = 0
     then match t.state with
-         | Unzip { offset; length; consumed; kind; z; } ->
+         | Unzip { offset; length; consumed; crc; kind; z; } ->
            { t with i_off = off
                   ; i_len = len
                   ; i_pos = 0
                   ; state = Unzip { offset
                                   ; length
                                   ; consumed
+                                  ; crc
                                   ; kind
                                   ; z = Decompress.Inflate.refill off len z } }
-         | Hunks { offset; length; consumed; z; h; } ->
+         | Hunks { offset; length; consumed; crc; z; h; } ->
            { t with i_off = off
                   ; i_len = len
                   ; i_pos = 0
                   ; state = Hunks { offset
                                   ; length
                                   ; consumed
+                                  ; crc
                                   ; z = Decompress.Inflate.refill off len z; h; } }
          | _ -> { t with i_off = off
                        ; i_len = len
@@ -913,10 +948,11 @@ struct
     else raise (Invalid_argument (sp "P.refill: you lost something (pos: %d, len: %d)" t.i_pos t.i_len))
 
   let flush off len t = match t.state with
-    | Unzip { offset; length; consumed; kind; z } ->
+    | Unzip { offset; length; consumed; crc; kind; z } ->
       { t with state = Unzip { offset
                              ; length
                              ; consumed
+                             ; crc
                              ; kind
                              ; z = Decompress.Inflate.flush off len z } }
     | _ -> raise (Invalid_argument "P.flush: bad state")
@@ -955,15 +991,19 @@ struct
     | Next { offset; _ } -> offset
     | _ -> raise (Invalid_argument "P.offset: bad state")
 
+  let crc t = match t.state with
+    | Next { crc; _ } -> crc
+    | _ -> raise (Invalid_argument "P.crc: bad state")
+
   let rec eval src t =
     let eval0 t = match t.state with
       | Header k -> k src t
       | Object k -> k src t
       | VariableLength k -> k src t
-      | Unzip { offset; length; consumed; kind; z; } ->
-        unzip (Decompress.B.Bigstring (Cstruct.to_bigarray src)) t offset length consumed kind z
-      | Hunks { offset; length; consumed; z; h; } ->
-        hunks (Decompress.B.Bigstring (Cstruct.to_bigarray src)) t offset length consumed z h
+      | Unzip { offset; length; consumed; crc; kind; z; } ->
+        unzip src t offset length consumed crc kind z
+      | Hunks { offset; length; consumed; crc; z; h; } ->
+        hunks src t offset length consumed crc z h
       | Next { length; length'; kind; } -> next src t length length' kind
       | Checksum k -> k src t
       | End hash -> ok t hash
@@ -1016,7 +1056,7 @@ struct
     { file  : Mapper.fd
     ; max   : int64
     ; win   : Window.t Bucket.t
-    ; idx   : 'a. ('a, [ `SHA1 ]) Hash.t -> int64 option
+    ; idx   : 'a. ('a, [ `SHA1 ]) Hash.t -> (Crc32.t * int64) option
     ; hash  : ([ `PACK ], [ `SHA1 ]) Hash.t }
 
   let is_hunk t = match P.kind t with
@@ -1084,7 +1124,7 @@ struct
         then Ok (Int64.sub offset_of_hunks off)
         else Error (Invalid_offset off)
       | H.Hash hash -> match t.idx hash with
-        | Some off -> Ok off
+        | Some (crc, off) -> Ok off
         | None -> Error (Invalid_hash hash)
     in
 
@@ -1145,7 +1185,7 @@ struct
         | Error exn -> Error exn)
     | Error exn -> Error exn
 
-  let make ?(bulk = 10) file (idx : string -> int64 option) =
+  let make ?(bulk = 10) file (idx : string -> (Crc32.t * int64) option) =
     { file
     ; max  = Mapper.length file
     ; win  = Bucket.make bulk
@@ -1160,7 +1200,7 @@ struct
      *)
 
     match t.idx hash with
-    | Some absolute_offset ->
+    | Some (crc, absolute_offset) ->
       let window, relative_offset = find t absolute_offset in
       let state  = P.from_window window relative_offset z_tmp z_win h_tmp in
       let buffer = BBuffer.create chunk_size in
