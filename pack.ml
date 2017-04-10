@@ -153,17 +153,22 @@ struct
     ; o_pos : int
     ; o_len : int
     ; write : int64
-    ; radix : (int32 * int64) Radix.t
+    ; radix : (Crc32.t * int64) Radix.t
     ; objects : Entry.t array
     ; state : state }
   and k = Cstruct.t -> t -> res
   and state =
     | Header of k
     | Object of k
-    | Raw    of int
+    | Raw    of int * int64 * Crc32.t (* idx, off, crc *)
     | Zip of { idx : int
              ; raw : Cstruct.t
+             ; off : int64
+             ; crc : Crc32.t
              ; z   : (Decompress.B.bs, Decompress.B.bs) Decompress.Deflate.t }
+    | Epilogue of { idx : int
+                  ; off : int64
+                  ; crc : Crc32.t }
     | End
     | Exception of error
   and res =
@@ -178,12 +183,19 @@ struct
   let pp_state fmt = function
     | Header _ -> pp fmt "(Header #k)"
     | Object _ -> pp fmt "(Object #k)"
-    | Raw idx  -> pp fmt "(Raw idx:%d)" idx
-    | Zip { idx; raw; z; } ->
+    | Raw (idx, off, crc)  -> pp fmt "(Raw idx:%d, off:%Ld, crc:%a)" idx off Crc32.pp crc
+    | Zip { idx; off; crc; raw; z; } ->
       pp fmt "(Zip { @[<hov>idx = %d;@ \
                             raw = #raw;@ \
+                            off = %Ld;@ \
+                            crc = %a;@ \
                             z = %a;@] })"
-        idx Decompress.Deflate.pp z
+        idx off Crc32.pp crc Decompress.Deflate.pp z
+    | Epilogue { idx; off; crc; } ->
+      pp fmt "(Epilogue { @[<hov>idx = %d;@ \
+                                 off = %Ld;@ \
+                                 crc = %a;@] })"
+        idx off Crc32.pp crc
     | End -> pp fmt "End"
     | Exception exn -> pp fmt "(Exception %a)" pp_error exn
 
@@ -253,20 +265,19 @@ struct
                      ; write = Int64.add t.write 1L }
       end else Flush { t with state = Object (put_byte byte k) }
 
-    let rec length n k dst t =
+    let rec length n crc k dst t =
       let byte = Int64.(to_int (n && 0x7FL)) in
       let rest = Int64.(n >> 7) in
 
       if rest <> 0L
-      then put_byte (byte lor 0x80) (length rest k) dst t
-      else put_byte byte k dst t
+      then put_byte (byte lor 0x80) (length rest (Crc32.digestc crc (byte lor 0x80)) k) dst t
+      else put_byte byte (k (Crc32.digestc crc byte)) dst t
   end
 
   let header_entry idx dst t =
     if idx = Array.length t.objects
     then ok t
     else
-      let crc    = 0l in (* TODO: calculate crc. *)
       let offset = t.write in
 
       let entry  = Array.get t.objects idx in
@@ -280,30 +291,38 @@ struct
         else byte, false
       in
 
-      (* save the entry in the radix tree. *)
-      let t = { t with radix = Radix.bind t.radix entry.Entry.hash_object (crc, offset) } in
+      let crc    = Crc32.digestc Crc32.default byte in
 
       if continue
       then (KObject.put_byte byte
-            @@ KObject.length Int64.(length >> 4)
-            @@ fun dst t -> await { t with state = Raw idx })
+            @@ KObject.length Int64.(length >> 4) crc
+            @@ fun crc dst t -> await { t with state = Raw (idx, offset, crc) })
           dst t
-      else await { t with state = Raw idx }
+      else await { t with state = Raw (idx, offset, crc)}
 
-  let raw_entry dst t idx raw z =
-    let raw' = Decompress.B.from_bigstring (Cstruct.to_bigarray raw) in
-    let dst' = Decompress.B.from_bigstring (Cstruct.to_bigarray dst) in
+  let epilogue_entry dst t idx offset crc =
+    Cont { t with state = Object (header_entry (idx + 1))
+                ; radix = Radix.bind t.radix (Array.get t.objects idx).Entry.hash_object (crc, offset) }
 
-    match Decompress.Deflate.eval raw' dst' z with
+  let raw_entry dst t idx raw off crc z =
+    let open Decompress in
+
+    let raw' = B.from_bigstring (Cstruct.to_bigarray raw) in
+    let dst' = B.from_bigstring (Cstruct.to_bigarray dst) in
+
+    match Deflate.eval raw' dst' z with
     | `Await z ->
-      Format.eprintf "PACK AWAIT: %a\n%!" Decompress.Deflate.pp z;
-      await { t with state = Zip { idx; raw; z; } }
+      await { t with state = Zip { idx; raw; off; crc; z; } }
     | `Flush z ->
-      Format.eprintf "PACK FLUSH: %a\n%!" Decompress.Deflate.pp z;
-      flush { t with state = Zip { idx; raw; z; }
+      let crc = Crc32.digest ~off:0 ~len:(Deflate.used_out z) crc dst in
+
+      flush { t with state = Zip { idx; raw; off; crc; z; }
                    ; o_pos = t.o_pos + (Decompress.Deflate.used_out z) }
-    | `End z -> Cont { t with state = Object (header_entry (idx + 1))
-                            ; o_pos = t.o_pos + (Decompress.Deflate.used_out z) }
+    | `End z ->
+      let crc = Crc32.digest ~off:0 ~len:(Deflate.used_out z) crc dst in
+
+      Cont { t with state = Epilogue { idx; off; crc; }
+                  ; o_pos = t.o_pos + (Decompress.Deflate.used_out z) }
     | `Error (z, exn) -> error t (Deflate_error exn)
 
   let number dst t =
@@ -324,12 +343,12 @@ struct
       dst t
 
   let raw raw t = match t.state with
-    | Raw idx ->
+    | Raw (idx, off, crc) ->
       let z =
         Decompress.Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos)
         @@ Decompress.Deflate.default ~proof:Decompress.B.proof_bigstring 4
       in
-      { t with state = Zip { idx; raw; z; } }
+      { t with state = Zip { idx; raw; off; crc; z; } }
     | _ -> raise (Invalid_argument "P.raw: bad state")
 
   let current_raw t = match t.state with
@@ -337,29 +356,27 @@ struct
     | _ -> raise (Invalid_argument "P.current_raw: bad state")
 
   let finish_raw t = match t.state with
-    | Zip { idx; raw; z; } ->
-      { t with state = Zip { idx; raw; z = Decompress.Deflate.finish z }}
+    | Zip { idx; raw; off; crc; z; } ->
+      { t with state = Zip { idx; raw; off; crc; z = Decompress.Deflate.finish z }}
     | _ -> raise (Invalid_argument "P.finish_raw: bad state")
 
-  let refill off len ?raw t = match t.state, raw with
-    | Zip { idx; raw; z; }, Some new_raw ->
-      Format.eprintf "PACK REFILL: %a\n%!" Decompress.Deflate.pp z;
-      { t with state = Zip { idx; raw = new_raw; z = Decompress.Deflate.no_flush off len z } }
-    | Zip { idx; raw; z; }, None ->
-      Format.eprintf "PACK REFILL: %a\n%!" Decompress.Deflate.pp z;
-      { t with state = Zip { idx; raw; z = Decompress.Deflate.no_flush off len z } }
+  let refill offset len ?raw t = match t.state, raw with
+    | Zip { idx; raw; off; crc; z; }, Some new_raw ->
+      { t with state = Zip { idx; raw = new_raw; off; crc; z = Decompress.Deflate.no_flush offset len z } }
+    | Zip { idx; raw; off; crc; z; }, None ->
+      { t with state = Zip { idx; raw; off; crc; z = Decompress.Deflate.no_flush offset len z } }
     | _ -> raise (Invalid_argument "P.refill: bad state")
 
-  let flush off len t =
+  let flush offset len t =
     if (t.o_len - t.o_pos) = 0
     then match t.state with
-      | Zip { idx; raw; z; } ->
-        { t with o_off = off
+      | Zip { idx; raw; off; crc; z; } ->
+        { t with o_off = offset
               ; o_len = len
               ; o_pos = 0
-              ; state = Zip { idx; raw; z = Decompress.Deflate.flush off len z } }
+               ; state = Zip { idx; raw; off; crc; z = Decompress.Deflate.flush offset len z } }
       | _ ->
-        { t with o_off = off
+        { t with o_off = offset
              ; o_len = len
              ; o_pos = 0 }
     else raise (Invalid_argument (sp "P.flush: you lost something (pos: %d, len: %d)" t.o_pos t.o_len))
@@ -367,7 +384,7 @@ struct
   let used_out t = t.o_pos
 
   let expect t = match t.state with
-    | Raw idx ->
+    | Raw (idx, off, crc) ->
       (try
          let hash = (Array.get t.objects idx).Entry.hash_object in
          Some hash
@@ -378,8 +395,9 @@ struct
     let eval0 t = match t.state with
       | Header k -> k dst t
       | Object k -> k dst t
-      | Raw idx  -> await t
-      | Zip { idx; raw; z; } -> raw_entry dst t idx raw z
+      | Raw (idx, off, crc)  -> await t
+      | Zip { idx; raw; off; crc; z; } -> raw_entry dst t idx raw off crc z
+      | Epilogue { idx; off; crc; } -> epilogue_entry dst t idx off crc
       | Exception exn -> error t exn
       | End -> Ok t
     in
