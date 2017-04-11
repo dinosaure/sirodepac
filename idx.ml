@@ -174,6 +174,7 @@ struct
   type error += Invalid_version of Int32.t
   type error += Invalid_index_of_bigoffset of int
   type error += Expected_bigoffset_table
+  type error += Invalid_hash of string * string
 
   let pp = Format.fprintf
   let pp_error fmt = function
@@ -181,16 +182,18 @@ struct
     | Invalid_version version -> pp fmt "(Invalid_version %ld)" version
     | Invalid_index_of_bigoffset idx -> pp fmt "(Invalid_index_of_bigoffset %d)" idx
     | Expected_bigoffset_table -> pp fmt "Expected_bigoffset_table"
+    | Invalid_hash (has, expect) -> pp fmt "(Invalid_hash (%a, %a))" Hash.pp has Hash.pp expect
 
   type t =
-    { i_off   : int
-    ; i_pos   : int
-    ; i_len   : int
-    ; fanout  : Int32.t array
-    ; hashes  : string Queue.t
-    ; crcs    : Crc32.t Queue.t
-    ; offsets : (Int32.t * bool) Queue.t
-    ; state   : state }
+    { i_off     : int
+    ; i_pos     : int
+    ; i_len     : int
+    ; fanout    : Int32.t array
+    ; hashes    : string Queue.t
+    ; crcs      : Crc32.t Queue.t
+    ; offsets   : (Int32.t * bool) Queue.t
+    ; hash      : Hash.ctx
+    ; state     : state }
   and k = Cstruct.t -> t -> res
   and state =
     | Header    of k
@@ -198,19 +201,45 @@ struct
     | Hashes    of k
     | Crcs      of k
     | Offsets   of k
-    | Ret
-    | End
+    | Hash      of k
+    | Ret       of string * string
+    | End       of string
     | Exception of error
   and res =
     | Wait   of t
     | Error  of t * error
     | Cont   of t
     | Result of t * (string * Crc32.t * Int64.t)
-    | Ok     of t
+    | Ok     of t * string
 
-  let await t     = Wait t
+  let pp_state fmt = function
+    | Header _ -> pp fmt "(Header #k)"
+    | Fanout _ -> pp fmt "(Fanout #k)"
+    | Hashes _ -> pp fmt "(Hashes #k)"
+    | Crcs _ -> pp fmt "(Crcs #k)"
+    | Offsets _ -> pp fmt "(Offsets #k)"
+    | Hash _ -> pp fmt "(Hash #k)"
+    | Ret (hash_idx, hash_pack) -> pp fmt "(Ret (idx:%a, pack:%a))" Hash.pp hash_idx Hash.pp hash_pack
+    | End hash_pack -> pp fmt "(End %a)" Hash.pp hash_pack
+    | Exception exn -> pp fmt "(Exception %a)" pp_error exn
+
+  let pp fmt t =
+    pp fmt "{ @[<hov>i_off = %d;@ \
+                     i_pos = %d;@ \
+                     i_len = %d;@ \
+                     fanout = #table;@ \
+                     hashes = #queue;@ \
+                     crcs = #queue;@ \
+                     offsets = #queue;@ \
+                     hash = #ctx;@ \
+                     state = %a;@] }"
+      t.i_off t.i_pos t.i_len pp_state t.state
+
+  let await src t =
+    let () = Hash.feed t.hash (Cstruct.to_string (Cstruct.sub src t.i_off t.i_pos)) in
+    Wait t
   let error t exn = Error ({ t with state = Exception exn }, exn)
-  let ok t        = Ok { t with state = End }
+  let ok t hash   = Ok ({ t with state = End hash }, hash)
 
   let to_int32 b0 b1 b2 b3 =
     let ( << ) = Int32.shift_left in (* >> *)
@@ -238,7 +267,7 @@ struct
       if (t.i_len - t.i_pos) > 0 && Cstruct.get_char src (t.i_off + t.i_pos) = chr
       then k src { t with i_pos = t.i_pos + 1 }
       else if (t.i_len - t.i_pos) = 0
-      then await { t with state = Header (fun src t -> (check_byte[@tailcall]) chr k src t) }
+      then await src { t with state = Header (fun src t -> (check_byte[@tailcall]) chr k src t) }
       else error { t with i_pos = t.i_pos + 1 }
                  (Invalid_byte (Cstruct.get_uint8 src (t.i_off + t.i_pos)))
 
@@ -246,7 +275,7 @@ struct
       if (t.i_len - t.i_pos) > 0
       then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
-      else await { t with state = Header (fun src t -> (get_byte[@tailcall]) k src t) }
+      else await src { t with state = Header (fun src t -> (get_byte[@tailcall]) k src t) }
 
     let rec get_u32 k src t =
       if (t.i_len - t.i_pos) > 3
@@ -261,7 +290,7 @@ struct
             @@ fun byte3 src t ->
                k (to_int32 byte0 byte1 byte2 byte3) src t)
             src t
-      else await { t with state = Header (fun src t -> (get_u32[@tailcall]) k src t) }
+      else await src { t with state = Header (fun src t -> (get_u32[@tailcall]) k src t) }
   end
 
   module KFanoutTable =
@@ -270,7 +299,7 @@ struct
       if (t.i_len - t.i_pos) > 0
       then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
-      else await { t with state = Fanout (fun src t -> (get_byte[@tailcall]) k src t) }
+      else await src { t with state = Fanout (fun src t -> (get_byte[@tailcall]) k src t) }
 
     let rec get_u32 k src t =
       if (t.i_len - t.i_pos) > 3
@@ -285,7 +314,7 @@ struct
             @@ fun byte3 src t ->
                k (to_int32 byte0 byte1 byte2 byte3) src t)
             src t
-      else await { t with state = Fanout (fun src t -> (get_u32[@tailcall]) k src t) }
+      else await src { t with state = Fanout (fun src t -> (get_u32[@tailcall]) k src t) }
   end
 
   module KHashes =
@@ -294,7 +323,7 @@ struct
       if (t.i_len - t.i_pos) > 0
       then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
-      else await { t with state = Hashes (fun src t -> (get_byte[@tailcall]) k src t) }
+      else await src { t with state = Hashes (fun src t -> (get_byte[@tailcall]) k src t) }
 
     let get_hash k src t =
       let buf = Buffer.create 20 in
@@ -318,7 +347,7 @@ struct
       if (t.i_len - t.i_pos) > 0
       then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
-      else await { t with state = Crcs (fun src t -> (get_byte[@tailcall]) k src t) }
+      else await src { t with state = Crcs (fun src t -> (get_byte[@tailcall]) k src t) }
 
     let rec get_u32 k src t =
       if (t.i_len - t.i_pos) > 3
@@ -333,7 +362,7 @@ struct
             @@ fun byte3 src t ->
                k (to_int32 byte0 byte1 byte2 byte3) src t)
             src t
-      else await { t with state = Crcs (fun src t -> (get_u32[@tailcall]) k src t) }
+      else await src { t with state = Crcs (fun src t -> (get_u32[@tailcall]) k src t) }
   end
 
   module KOffsets =
@@ -342,7 +371,7 @@ struct
       if (t.i_len - t.i_pos) > 0
       then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
            k byte src { t with i_pos = t.i_pos + 1 }
-      else await { t with state = Offsets (fun src t -> (get_byte[@tailcall]) k src t) }
+      else await src { t with state = Offsets (fun src t -> (get_byte[@tailcall]) k src t) }
 
     let rec get_u32 k src t =
       if (t.i_len - t.i_pos) > 3
@@ -357,7 +386,7 @@ struct
             @@ fun byte3 src t ->
                k (to_int32 byte0 byte1 byte2 byte3) src t)
             src t
-      else await { t with state = Offsets (fun src t -> (get_u32[@tailcall]) k src t) }
+      else await src { t with state = Offsets (fun src t -> (get_u32[@tailcall]) k src t) }
 
     let get_u32 k src t =
       get_u32
@@ -382,24 +411,65 @@ struct
             @@ fun byte7 src t ->
                k (to_int64 byte0 byte1 byte2 byte3 byte4 byte5 byte6 byte7) src t)
             src t
-      else await { t with state = Offsets (fun src t -> (get_u64[@tailcall]) k src t) }
+      else await src { t with state = Offsets (fun src t -> (get_u64[@tailcall]) k src t) }
   end
 
-  let rest ?boffsets src t =
+  module KHash =
+  struct
+    let rec get_byte k src t =
+      if (t.i_len - t.i_pos) > 0
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
+           k byte src { t with i_pos = t.i_pos + 1 }
+      else Wait { t with state = Hash (fun src t -> (get_byte[@tailcall]) k src t) }
+           (* don't use [await] function. *)
+
+    let get_hash k src t =
+      let buf = Buffer.create 20 in
+
+      let rec loop i src t =
+        if i = 20
+        then k (Buffer.contents buf) src t
+        else
+          get_byte (fun byte src t ->
+                     Buffer.add_char buf (Char.chr byte);
+                     (loop[@tailcall]) (i + 1) src t)
+            src t
+      in
+
+      loop 0 src t
+  end
+
+  let rest ?boffsets (hash_idx, hash_pack) src t =
     match Queue.pop t.hashes, Queue.pop t.crcs, Queue.pop t.offsets with
-    | hash, crc, (offset, true) -> Result ({ t with state = Ret }, (hash, crc, Int64.of_int32 offset))
-    | exception Queue.Empty -> ok t
+    | hash, crc, (offset, true) -> Result ({ t with state = Ret (hash_idx, hash_pack) }, (hash, crc, Int64.of_int32 offset))
+    | exception Queue.Empty -> ok t hash_pack
     | hash, crc, (offset, false) -> match boffsets with
       | None -> error t (Expected_bigoffset_table)
       | Some arr ->
         let idx = Int32.to_int (Int32.logand offset 0x7FFFFFFFl) in
         if idx >= 0 && idx < Array.length arr
-        then Result ({ t with state = Ret }, (hash, crc, Array.get arr idx))
+        then Result ({ t with state = Ret (hash_idx, hash_pack) }, (hash, crc, Array.get arr idx))
         else error t (Invalid_index_of_bigoffset idx)
+
+  let rec hash ?boffsets src t =
+    let aux k src t =
+      let () = Hash.feed t.hash (Cstruct.to_string (Cstruct.sub src t.i_off t.i_pos)) in
+      KHash.get_hash k src t
+    in
+
+    (KHash.get_hash
+     @@ fun hash_pack -> aux
+     @@ fun hash_idx src t ->
+     let produce = Hash.get t.hash in
+
+     if hash_idx <> produce
+     then error t (Invalid_hash (Hash.get t.hash, hash_idx))
+     else rest ?boffsets (hash_idx, hash_pack) src t)
+    src t
 
   let rec boffsets arr idx max src t =
     if idx >= max
-    then rest ~boffsets:arr src t
+    then hash ~boffsets:arr src t
     else KOffsets.get_u64
            (fun offset src t ->
               Array.set arr idx offset;
@@ -408,7 +478,7 @@ struct
 
   let rec offsets idx boffs max src t =
     if Int32.compare idx max >= 0
-    then (if boffs > 0 then boffsets (Array.make boffs 0L) 0 boffs src t else rest src t)
+    then (if boffs > 0 then boffsets (Array.make boffs 0L) 0 boffs src t else hash src t)
     else KOffsets.get_u32
            (fun (offset, msb) src t ->
              Queue.add (offset, msb) t.offsets;
@@ -468,6 +538,7 @@ struct
     ; hashes  = Queue.create ()
     ; crcs    = Queue.create ()
     ; offsets = Queue.create ()
+    ; hash    = Hash.init ()
     ; state   = Header header }
 
   let sp = Format.sprintf
@@ -487,8 +558,9 @@ struct
       | Hashes k -> k src t
       | Crcs k -> k src t
       | Offsets k -> k src t
-      | Ret -> rest src t
-      | End -> ok t
+      | Ret (hash_idx, hash_pack) -> rest (hash_idx, hash_pack) src t
+      | Hash k -> k src t
+      | End hash -> ok t hash
       | Exception exn -> error t exn
     in
 
@@ -496,7 +568,7 @@ struct
       match eval0 t with
       | Cont t -> loop t
       | Wait t -> `Await t
-      | Ok t -> `End t
+      | Ok (t, hash) -> `End (t, hash)
       | Result (t, hash) -> `Hash (t, hash)
       | Error (t, exn) -> `Error (t, exn)
     in
@@ -518,6 +590,8 @@ struct
     ; write    : int
     ; table    : (Crc32.t * int64) Fanout.t
     ; boffsets : int64 array
+    ; hash     : Hash.ctx
+    ; pack     : ([ `PACK ], [ `SHA1 ]) Hash.t
     ; state    : state }
   and k = Cstruct.t -> t -> res
   and state =
@@ -527,6 +601,7 @@ struct
     | Crcs       of k
     | Offsets    of k
     | BigOffsets of k
+    | Hash       of k
     | End
   and res =
     | Error  of t * error
@@ -538,6 +613,34 @@ struct
                      the serialization with an hot loop (like Decompress). But
                      the first goal is to work!
    *)
+
+  let pp = Format.fprintf
+
+  let pp_state fmt = function
+    | Header _ -> pp fmt "(Header #k)"
+    | Fanout _ -> pp fmt "(Fanout #k)"
+    | Hashes _ -> pp fmt "(Hashes #k)"
+    | Crcs _ -> pp fmt "(Crcs #k)"
+    | Offsets _ -> pp fmt "(Offsets #k)"
+    | BigOffsets _ -> pp fmt "(BigOffsets #k)"
+    | Hash _ -> pp fmt "(Hash #k)"
+    | End -> pp fmt "End"
+
+  let pp fmt { o_off; o_pos; o_len; write; table; boffsets; hash; pack; state; } =
+    pp fmt "{ @[<hov>o_off = %d;@ \
+                     o_pos = %d;@ \
+                     o_len = %d;@ \
+                     write = %d;@ \
+                     table = #table;@ \
+                     boffsets = #table;@ \
+                     hash = #ctx;@ \
+                     pack = %a;@ \
+                     state = %a;@] }"
+      o_off o_pos o_len write Hash.pp pack pp_state state
+
+  let flush dst t =
+    let () = Hash.feed t.hash (Cstruct.to_string (Cstruct.sub dst t.o_off t.o_pos)) in
+    Flush t
 
   module Int32 =
   struct
@@ -558,7 +661,7 @@ struct
         Cstruct.set_char dst (t.o_off + t.o_pos) chr;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = t.write + 1 }
-      end else Flush { t with state = Header (put_byte chr k) }
+      end else flush dst { t with state = Header (put_byte chr k) }
 
     (* XXX(dinosaure): we can abstract the constructor of the state and provide
                        only one implementation of [put_int32] for all [K*]
@@ -581,7 +684,7 @@ struct
             @@ put_byte i3
             @@ put_byte i4 k)
            dst t
-      else Flush { t with state = Header (put_int32 integer k) }
+      else flush dst { t with state = Header (put_int32 integer k) }
   end
 
   module Int64 =
@@ -603,7 +706,7 @@ struct
         Cstruct.set_char dst (t.o_off + t.o_pos) chr;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = t.write + 1 }
-      end else Flush { t with state = Fanout (put_byte chr k) }
+      end else flush dst { t with state = Fanout (put_byte chr k) }
 
     let rec put_int32 integer k dst t =
       if (t.o_len - t.o_pos) >= 4
@@ -622,36 +725,35 @@ struct
             @@ put_byte i3
             @@ put_byte i4 k)
            dst t
-      else Flush { t with state = Fanout (put_int32 integer k) }
+      else flush dst { t with state = Fanout (put_int32 integer k) }
   end
 
   module KHashes =
   struct
-    let rec put_byte chr k dst t =
-      if (t.o_len - t.o_pos) > 0
+    let put_hash hash k dst t =
+      if t.o_len - t.o_pos >= Hash.size
       then begin
-        Cstruct.set_char dst (t.o_off + t.o_pos) chr;
-        k dst { t with o_pos = t.o_pos + 1
-                     ; write = t.write + 1 }
-      end else Flush { t with state = Hashes (put_byte chr k) }
+        Cstruct.blit_from_string hash 0 dst (t.o_off + t.o_pos) Hash.size;
+        k dst { t with o_pos = t.o_pos + Hash.size
+                     ; write = t.write + Hash.size }
+      end else
+        let rec loop rest dst t =
+          if rest = 0
+          then k dst t
+          else
+            let n = min rest (t.o_len - t.o_pos) in
 
-    let rec put_hash hash k dst t =
-      if (t.o_len - t.o_pos) >= 20
-      then begin
-        Cstruct.blit_from_string hash 0 dst (t.o_off + t.o_pos) 20;
-        k dst { t with o_pos = t.o_pos + 20
-                     ; write = t.write + 20 }
-      end else if (t.o_len - t.o_pos) > 0
-      then let rec aux rest hash k dst t =
-             if rest <> 0
-             then let n = min (t.o_len - t.o_pos) rest in
-                  Cstruct.blit_from_string hash (20 - rest) dst (t.o_off + t.o_pos)  n;
-                  Flush { t with state = Hashes (aux (rest - n) hash k)
+            if n = 0
+            then flush dst { t with state = Hashes (loop rest) }
+            else begin
+              Cstruct.blit_from_string hash (Hash.size - rest) dst (t.o_off + t.o_pos) n;
+              flush dst { t with state = Hashes (loop (rest - n))
                                ; o_pos = t.o_pos + n
                                ; write = t.write + n }
-             else k dst t
-           in aux 20 hash k dst t
-      else Flush { t with state = Hashes (put_hash hash k) }
+            end
+        in
+
+        loop Hash.size dst t
   end
 
   module KCrcs =
@@ -662,7 +764,7 @@ struct
         Cstruct.set_char dst (t.o_off + t.o_pos) chr;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = t.write + 1 }
-      end else Flush { t with state = Crcs (put_byte chr k) }
+      end else flush dst { t with state = Crcs (put_byte chr k) }
 
     let rec put_int32 integer k dst t =
       if (t.o_len - t.o_pos) >= 4
@@ -681,7 +783,7 @@ struct
             @@ put_byte i3
             @@ put_byte i4 k)
            dst t
-      else Flush { t with state = Crcs (put_int32 integer k) }
+      else flush dst { t with state = Crcs (put_int32 integer k) }
   end
 
   module KOffsets =
@@ -692,7 +794,7 @@ struct
         Cstruct.set_char dst (t.o_off + t.o_pos) chr;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = t.write + 1 }
-      end else Flush { t with state = Offsets (put_byte chr k) }
+      end else flush dst { t with state = Offsets (put_byte chr k) }
 
     let rec put_int32 integer k dst t =
       if (t.o_len - t.o_pos) >= 4
@@ -711,7 +813,7 @@ struct
             @@ put_byte i3
             @@ put_byte i4 k)
            dst t
-      else Flush { t with state = Offsets (put_int32 integer k) }
+      else flush dst { t with state = Offsets (put_int32 integer k) }
   end
 
   module KBOffsets =
@@ -722,7 +824,7 @@ struct
         Cstruct.set_char dst (t.o_off + t.o_pos) chr;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = t.write + 1 }
-      end else Flush { t with state = BigOffsets (put_byte chr k) }
+      end else flush dst { t with state = BigOffsets (put_byte chr k) }
 
     let rec put_int64 integer k dst t =
       if (t.o_len - t.o_pos) >= 8
@@ -749,7 +851,38 @@ struct
             @@ put_byte i7
             @@ put_byte i8 k)
            dst t
-      else Flush { t with state = BigOffsets (put_int64 integer k) }
+      else flush dst { t with state = BigOffsets (put_int64 integer k) }
+  end
+
+  module KHash =
+  struct
+    let put_hash ?(digest = true) hash k dst t =
+      if t.o_len - t.o_pos >= Hash.size
+      then begin
+        Cstruct.blit_from_string hash 0 dst (t.o_off + t.o_pos) Hash.size;
+        k dst { t with o_pos = t.o_pos + Hash.size
+                     ; write = t.write + Hash.size }
+      end else
+        let rec loop rest dst t =
+          if rest = 0
+          then k dst t
+          else
+            let n = min Hash.size (t.o_len - t.o_pos) in
+
+            if n = 0
+            then let t = { t with state = Hash (loop rest) } in
+                 if digest then flush dst t else Flush t
+            else begin
+              Cstruct.blit_from_string hash (Hash.size - rest) dst (t.o_off + t.o_pos) n;
+              let t = { t with state = Hash (loop rest)
+                             ; o_pos = t.o_pos + n
+                             ; write = t.write + n }
+              in
+              if digest then flush dst t else Flush t
+            end
+        in
+
+        loop Hash.size dst t
   end
 
   let ok t = Ok { t with state = End }
@@ -757,9 +890,17 @@ struct
   let is_big_offset integer =
     Int64.(integer >> 31) <> 0L
 
+  let hash dst t =
+    (KHash.put_hash t.pack
+     @@ fun dst t ->
+     Hash.feed t.hash (Cstruct.to_string (Cstruct.sub dst t.o_off t.o_pos));
+     let hash = Hash.get t.hash in
+     KHash.put_hash ~digest:false hash (fun _ t -> ok t) dst t)
+    dst t
+
   let rec boffsets idx dst t =
     if idx = Array.length t.boffsets
-    then ok t
+    then Cont { t with state = Hash hash }
     else KBOffsets.put_int64 (Array.get t.boffsets idx)
            (boffsets (idx + 1)) dst t
 
@@ -830,6 +971,7 @@ struct
       | Crcs   k     -> k dst t
       | Offsets k    -> k dst t
       | BigOffsets k -> k dst t
+      | Hash k       -> k dst t
       | End -> ok t
     in
 
@@ -851,7 +993,7 @@ struct
                      let the user to use any data structure to store the CRC and
                      the Offset for each hash.
    *)
-  let default : (string * (Crc32.t * int64)) sequence -> t = fun seq ->
+  let default : (string * (Crc32.t * int64)) sequence -> string -> t = fun seq hash ->
 
     let boffsets = ref [] in
     let table    = Fanout.make () in
@@ -872,18 +1014,21 @@ struct
     ; write = 0
     ; table
     ; boffsets = Array.of_list (List.rev !boffsets)
+    ; hash = Hash.init ()
+    ; pack = hash
     ; state = Header header }
 end
 
 let idx_to_tree refiller =
   let input = Cstruct.create 0x8000 in
 
-  let rec loop tree t = match Decoder.eval input t with
+  let rec loop tree t =
+    match Decoder.eval input t with
     | `Await t ->
       let n = refiller input in
       let t = Decoder.refill 0 n t in
       loop tree t
-    | `End t -> Ok tree
+    | `End (t, hash) -> Ok (tree, hash)
     | `Hash (t, (hash, crc, offset)) ->
       loop (Radix.bind tree hash (crc, offset)) t
     | `Error (t, exn) -> Error exn
