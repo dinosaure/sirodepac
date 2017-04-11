@@ -25,8 +25,11 @@ struct
     | Blob -> 2
     | Tag -> 3
 
-  let to_bin x =
-    (to_int x) land 0b111
+  let to_bin = function
+    | Commit -> 0b001
+    | Tree -> 0b010
+    | Blob -> 0b011
+    | Tag -> 0b100
 
   let pp fmt = function
     | Commit -> Format.fprintf fmt "Commit"
@@ -80,25 +83,22 @@ struct
       { hash_name
       ; hash_object
       ; kind = Kind.Tag
-      ; length = Int64.of_int @@ Minigit.Tag.raw_length tag }
-      (* git considers than a git object can be huge. But we have the
-          limitation of the integer in OCaml (depends on the architecture). So
-          we need to fix [raw_length] and returns a [int64]. *)
+      ; length = Minigit.Tag.raw_length tag }
     | Commit commit ->
       { hash_name
       ; hash_object
       ; kind = Kind.Commit
-      ; length = Int64.of_int @@ Minigit.Commit.raw_length commit }
+      ; length = Minigit.Commit.raw_length commit }
     | Tree tree ->
       { hash_name
       ; hash_object
       ; kind = Kind.Tree
-      ; length = Int64.of_int @@ Minigit.Tree.raw_length tree }
+      ; length = Minigit.Tree.raw_length tree }
     | Blob blob ->
       { hash_name
       ; hash_object
       ; kind = Kind.Blob
-      ; length = Int64.of_int @@ Minigit.Blob.raw_length blob }
+      ; length = Minigit.Blob.raw_length blob }
 
   let compare = Compare.lexicographic
     [ (fun a b -> Compare.int (Kind.to_int a.kind) (Kind.to_int b.kind))
@@ -293,31 +293,25 @@ struct
 
     let put_hash hash k dst t =
       if t.o_len - t.o_pos >= Hash.size
-      then
-        begin
-          Cstruct.blit_from_string hash 0 dst (t.o_off + t.o_pos) Hash.size;
-          k dst t
-        end
-      else
+      then begin
+        Cstruct.blit_from_string hash 0 dst (t.o_off + t.o_pos) Hash.size;
+        k dst { t with o_pos = t.o_pos + Hash.size
+                     ; write = Int64.add t.write (Int64.of_int Hash.size) }
+      end else
         let rec loop rest dst t =
           if rest = 0
           then k dst t
           else
-            let n = min Hash.size (t.o_len - t.o_pos) in
+            let n = min rest (t.o_len - t.o_pos) in
 
             if n = 0
             then Flush { t with state = Hash (loop rest) }
-
-                 (* XXX(dinosaure): don't use the [flush] function, this function
-                                   computes the hash with the output. *)
-            else
-              begin
-                Cstruct.blit_from_string hash (Hash.size - rest) dst (t.o_off + t.o_pos) n;
-                Flush { t with state = Hash (loop rest) }
-
-                (* XXX(dinosaure): don't use the [flush] function, this function
-                                   computes the hash with the output. *)
-              end
+            else begin
+              Cstruct.blit_from_string hash (Hash.size - rest) dst (t.o_off + t.o_pos) n;
+              Flush { t with state = Hash (loop (rest - n))
+                           ; o_pos = t.o_pos + n
+                           ; write = Int64.add t.write (Int64.of_int n) }
+            end
         in
 
         loop Hash.size dst t
@@ -334,7 +328,7 @@ struct
       let entry  = Array.get t.objects idx in
       let length = entry.Entry.length in
 
-      let byte   = ((Kind.to_bin entry.Entry.kind) lsl 0x1F) in (* kind *)
+      let byte   = ((Kind.to_bin entry.Entry.kind) lsl 4) in (* kind *)
       let byte   = byte lor Int64.(to_int (length && 0x0FL)) in (* part of the size *)
 
       let byte, continue =
@@ -366,15 +360,17 @@ struct
     | `Await z ->
       await { t with state = Zip { idx; raw; off; crc; z; } }
     | `Flush z ->
-      let crc = Crc32.digest ~off:0 ~len:(Deflate.used_out z) crc dst in
+      let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
 
       flush dst { t with state = Zip { idx; raw; off; crc; z; }
-                   ; o_pos = t.o_pos + (Decompress.Deflate.used_out z) }
+                       ; o_pos = t.o_pos + (Deflate.used_out z)
+                       ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
     | `End z ->
-      let crc = Crc32.digest ~off:0 ~len:(Deflate.used_out z) crc dst in
+      let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
 
       Cont { t with state = Epilogue { idx; off; crc; }
-                  ; o_pos = t.o_pos + (Decompress.Deflate.used_out z) }
+                  ; o_pos = t.o_pos + (Deflate.used_out z)
+                  ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
     | `Error (z, exn) -> error t (Deflate_error exn)
 
   let number dst t =
@@ -446,6 +442,16 @@ struct
          Some hash
        with exn -> raise (Invalid_argument "P.expect: invalid index"))
     | _ -> None
+
+  let entry t = match t.state with
+    | Raw (idx, off, crc) ->
+      (try Array.get t.objects idx
+       with exn -> raise (Invalid_argument "P.entry: invalid index"))
+    | _ -> raise (Invalid_argument "P.entry: bad state")
+
+  let idx t = t.radix
+
+  let hash t = Hash.get t.hash
 
   let eval dst t =
     let eval0 t = match t.state with
