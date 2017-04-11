@@ -66,6 +66,16 @@ type 'a node =
 type 'a t = 'a node option
 type 'a sequence = ('a -> unit) -> unit
 
+let pp = Format.fprintf
+
+let pp_list ?sep:(pp_sep = (fun fmt () -> ())) pp_data fmt lst =
+  let rec aux = function
+    | [] -> ()
+    | [ x ] -> pp_data fmt x
+    | x :: r -> pp_data fmt x; pp_sep fmt (); aux r
+  in
+  aux lst
+
 let empty = None
 
 let is_empty = function
@@ -182,3 +192,7 @@ let to_sequence
     = fun tree k -> iter k tree
 
 let to_list t = fold (fun (k, v) acc -> (k, v) :: acc) [] t
+
+let pp pp_data fmt radix =
+  pp fmt "[ @[<hov>%a@] ]"
+    (pp_list ~sep:(fun fmt () -> pp fmt ";@ ") (fun fmt (k, v) -> pp_data fmt k v)) (to_list radix)
