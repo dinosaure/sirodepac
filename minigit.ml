@@ -19,6 +19,14 @@ let pp_option pp_data fmt = function
   | Some v -> pp_data fmt v
   | None -> Format.pp_print_string fmt "<none>"
 
+module Int64 =
+struct
+  include Int64
+
+  let ( + ) = Int64.add
+  let string x = Int64.of_int (String.length x)
+end
+
 module User =
 struct
   type tz_offset =
@@ -49,9 +57,10 @@ struct
       name email second (pp_option pp_tz_offset) tz_offset
 
   let raw_length t =
-    let tz_offset_length = 5 in
-    (String.length t.name) + 1 + 1 + (String.length t.email) + 1 + 1 + (String.length (Int64.to_string (fst t.date))) + 1 + tz_offset_length
-    (*                      ' ' '<'                           '>' ' '                                                  ' '                *)
+    let open Int64 in
+
+    let tz_offset_length = 5L in
+    (string t.name) + 1L + 1L + (string t.email) + 1L + 1L + (string (Int64.to_string (fst t.date))) + 1L + tz_offset_length
 
   module Decoder =
   struct
@@ -154,18 +163,16 @@ struct
       Format.pp_print_text message
 
   let raw_length t =
+    let open Int64 in
+
     let parents =
-      List.fold_left (fun acc _ -> (String.length "parent") + 1 + Hash.size + 1 + acc) 0 t.parents
-                                   (*                        ' '             1LF    *)
+      List.fold_left (fun acc _ -> (string "parent") + 1L + (of_int (Hash.size * 2)) + 1L + acc) 0L t.parents
     in
-    (String.length "tree") + 1 + Hash.size + 1
-    (*                      ' '             1LF *)
+    (string "tree") + 1L + (of_int (Hash.size * 2)) + 1L
     + parents
-    + (String.length "author") + 1 + (User.raw_length t.author) + 1
-    (*                          ' '                              1LF *)
-    + (String.length "committer") + 1 + (User.raw_length t.committer)
-    (*                             ' '                             *)
-    + (String.length t.message)
+    + (string "author") + 1L + (User.raw_length t.author) + 1L
+    + (string "committer") + 1L + (User.raw_length t.committer) + 1L
+    + (string t.message)
 
   module Decoder =
   struct
@@ -294,11 +301,12 @@ struct
     | s -> raise (Invalid_argument "perm_of_string")
 
   let raw_length t =
+    let open Int64 in
+
     let entry acc x =
-      (String.length (string_of_perm x.perm)) + 1 + (String.length x.name) + 1 + Hash.size + acc
-      (*                                       ' '                          1NL               *)
+      (string (string_of_perm x.perm)) + 1L + (string x.name) + 1L + (of_int Hash.size) + acc
     in
-    List.fold_left entry 0 t
+    List.fold_left entry 0L t
 
   module Decoder =
   struct
@@ -394,7 +402,7 @@ module Blob =
 struct
   type t = { content : Cstruct.t }
 
-  let raw_length t = Cstruct.len t.content
+  let raw_length t = Int64.of_int (Cstruct.len t.content) (* TODO: fix, need to avoid the cast with [int64]. *)
 
   module Decoder =
   struct
@@ -447,20 +455,17 @@ struct
     | Blob -> "blob"
 
   let raw_length t =
+    let open Int64 in
+
     let user_length = match t.tagger with
-      | Some user -> (String.length "tagger") + 1 + (User.raw_length user) + 1
-                     (*                        ' '                          1LF *)
-      | None -> 0
+      | Some user -> (string "tagger") + 1L + (User.raw_length user) + 1L
+      | None -> 0L
     in
-    (String.length "object") + 1 + (Hash.size * 2) + 1
-    (*                        ' '                   1LF *)
-    + (String.length "type") + 1 + (String.length (string_of_kind t.kind)) + 1
-    (*                        ' '                                           1LF *)
-    + (String.length "tag") + 1 + (String.length t.tag) + 1
-    (*                       ' '                         1LF *)
+    (string "object") + 1L + (of_int (Hash.size * 2)) + 1L
+    + (string "type") + 1L + (string (string_of_kind t.kind)) + 1L
+    + (string "tag") + 1L + (string t.tag) + 1L
     + user_length
-    + 1 + (String.length t.message)
-  (* 1LF *)
+    + 1L + (string t.message)
 
   module Decoder =
   struct
