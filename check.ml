@@ -172,22 +172,25 @@ let check hash kind raw length consumed offset crc ?base getter = match getter h
       (Hash.to_pp hash);
     assert false
   | Some (crc', offset') ->
+    let real_length = match base with Some (_, _, x) -> x | None -> length in
+
     if offset <> offset'
     then begin
       Format.eprintf "Offset of the object %s (%Ld) does not correspond with \
                       the IDX file (%Ld)\n%!"
         (Hash.to_pp hash)
         offset offset';
+
+      Format.eprintf "OCaml value: %a\n%!"
+        pp (deserialize (kind, raw, real_length));
+
       assert false
     end;
 
-    let real_length = match base with Some (_, _, x) -> x | None -> length in
     let encoder = Faraday.create (real_length + size_of_header (kind, raw, real_length)) in
 
     dual encoder (kind, raw, real_length);
     let hash' = hash_of_encoder encoder in
-
-    Format.printf "has: %a, expect: %a\n%!" Crc32.pp crc' Crc32.pp crc;
 
     if hash <> hash' || crc <> crc'
     then begin
@@ -253,12 +256,12 @@ type entry =
   | Tag    of Minigit.Tag.t
   | Blob   of Minigit.Blob.t
 
-let unpack ?(chunk = 0x8000) pack_filename get =
-  let buf   = BBuffer.create chunk in
-  let z_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000) in
-  let h_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000) in
-  let z_win = Decompress.Window.create ~proof:Decompress.B.proof_bigstring in
+let z_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000)
+let h_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000)
+let z_win = Decompress.Window.create ~proof:Decompress.B.proof_bigstring
 
+let unpack ?(chunk = 0x8000) pack_filename get =
+  let buf     = BBuffer.create chunk in
   let pack_fd = Unix.openfile pack_filename [ Unix.O_RDONLY ] 0o644 in
   let map     = Cstruct.of_bigarray @@ Bigarray.Array1.map_file pack_fd Bigarray.Char Bigarray.c_layout false (-1) in
   let rap     = D.make pack_fd get in
@@ -362,12 +365,25 @@ let lazy_index_err exn = `Lazy_index_error exn
 let dual_index_err ()  = `Dual_index_error
 
 (* serialization of a IDX tree. *)
-let serialize_idx_file tree =
-  let state  = Idx.Encoder.default (Radix.to_sequence tree) in
+let serialize_idx_file tree hash =
+  Format.eprintf "Start serialization of the IDX file\n%!";
+
+  let state  = Idx.Encoder.default (Radix.to_sequence tree) hash in (* TODO: hash of the pack file. *)
   let output = Cstruct.create 0x800 in
   let result = BBuffer.create 0x800 in
 
-  let rec loop t = match Idx.Encoder.eval output t with
+  (*
+  letx pp_data fmt hash (crc, offset) =
+    Format.fprintf fmt "@[<hov>%a@ =>@ (crc:%a, offset:%Ld)@]"
+      Hash.pp hash
+      Crc32.pp crc offset
+  in
+
+  Format.eprintf "Serialize: %a\n%!" (Radix.pp pp_data) tree;
+  *)
+
+  let rec loop t =
+    match Idx.Encoder.eval output t with
     | `Flush t ->
       let len = Idx.Encoder.used_out t in
       BBuffer.add output ~off:0 ~len result;
@@ -389,13 +405,15 @@ exception Break
      non-blocking implementation.
 *)
 let check_idx_implementation refiller rai =
-  Format.eprintf "check_idx_implementation\n%!";
+  Format.eprintf "Check idx implementation\n%!";
 
   let getter hash = Idx.Lazy.find rai hash in
 
   match Idx.idx_to_tree refiller with
   | Error exn -> Error (`Decoder_index_error exn)
-  | Ok tree ->
+  | Ok (tree, hash) ->
+    Format.eprintf "Tree generated\n%!";
+
     try let () = Radix.fold (fun (key, value) () -> match getter key with
                              | None -> raise Break
                              | Some value' ->
@@ -403,17 +421,19 @@ let check_idx_implementation refiller rai =
                                then raise Break
                                else ())
                  () tree
-        in Ok (tree, rai)
+        in (Format.eprintf "Tree correspond to the Lazy implementation\n%!"; Ok (tree, rai, hash))
     with Break -> Error `Implementation_index_error
 
 (* check the serialization of the IDX file.
    check the deserialization of the serialization of the IDX file.
    check the value provided by the serialization of the IDX file with the lazy implementation.
  *)
-let dual_idx (tree, rai) =
+let dual_idx (tree, rai, hash) =
+  Format.eprintf "Dual IDX implementation (serialization/deserialization)\n%!";
+
   let open Result in
 
-  serialize_idx_file tree
+  serialize_idx_file tree hash
   >>! encoder_index_err
   >>= fun map ->
 
@@ -445,10 +465,8 @@ let zip l1 l2 =
 
   aux [] (l1, l2)
 
-let pack ?(chunk_size = 0x800) fmt (entries, rap) =
-  let z_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000) in
-  let h_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000) in
-  let z_win = Decompress.Window.create ~proof:Decompress.B.proof_bigstring in
+let pack ?(chunk_size = 0x800) pack_fmt idx_fmt (entries, rap) =
+  Format.eprintf "Start to serialize again the PACK file and produce a new IDX file.\n%!";
 
   let entries = Array.of_list
       (List.map (fun (hash, o) -> match o with
@@ -461,16 +479,26 @@ let pack ?(chunk_size = 0x800) fmt (entries, rap) =
   let dst = Cstruct.create chunk_size in
 
   Array.sort Pack.Entry.compare entries;
+  Format.eprintf "Entries sorted.\n%!";
 
   let rec loop ?(raw = false) t =
-    Format.eprintf "%a\n%!" Pack.P.pp t;
-
     match Pack.P.eval dst t with
     | `Await t ->
       (match Pack.P.expect t with
        | Some hash ->
+         Format.eprintf "Pack the git object: %a\n%!" Hash.pp hash;
+
          let base = Result.unsafe_ok (D.get rap hash z_tmp z_win h_tmp) in
-                    (* XXX(dinosaure): previous tests check the [unsafe_ok]. *)
+         (* XXX(dinosaure): previous tests check the [unsafe_ok]. *)
+
+         let entry = Pack.P.entry t in
+
+         if entry.Pack.Entry.length <> (Int64.of_int base.D.Base.length)
+         then begin
+           Format.eprintf "The length of the entry (%Ld) does not correspond to the length of the git object (%d).\n%!"
+             entry.Pack.Entry.length base.D.Base.length;
+         end;
+
          loop (Pack.P.raw base.D.Base.raw t)
        | None ->
          if raw
@@ -478,24 +506,59 @@ let pack ?(chunk_size = 0x800) fmt (entries, rap) =
          else loop ~raw:true (Pack.P.refill 0 (Cstruct.len (Pack.P.current_raw t)) t))
     | `Flush t ->
       let n = Pack.P.used_out t in
-      Format.fprintf fmt "%s%!" (Cstruct.to_string (Cstruct.sub dst 0 n));
+      Format.fprintf pack_fmt "%s%!" (Cstruct.to_string (Cstruct.sub dst 0 n));
       loop (Pack.P.flush 0 chunk_size t)
     | `Error (t, exn) -> Error (`Pack_error exn)
     | `End t ->
       if Pack.P.used_out t <> 0
-      then Format.fprintf fmt "%s%!" (Cstruct.to_string (Cstruct.sub dst 0 (Pack.P.used_out t)));
+      then Format.fprintf pack_fmt "%s%!" (Cstruct.to_string (Cstruct.sub dst 0 (Pack.P.used_out t)));
 
-      Ok ()
+      match serialize_idx_file (Pack.P.idx t) (Pack.P.hash t) with
+      | Ok content ->
+        Format.fprintf idx_fmt "%s%!" content;
+        Ok ()
+      | Error exn -> Error (`Encoder_index_error exn)
   in
 
   loop (Pack.P.default entries)
+
+let new_idx_filename = "pack.idx"
+let new_pack_filename = "pack.pack"
+
+let check_generated_idx_file () =
+  Format.eprintf "Start to check the generated IDX and PACK file.\n%!";
+
+  let ii = cstruct_map new_idx_filename in
+
+  let refiller map =
+    let pos = ref 0 in
+    let len = Cstruct.len map in
+
+    fun buffer ->
+      let n = min (len - !pos) (Cstruct.len buffer) in
+      Cstruct.blit map !pos buffer 0 n;
+      pos := !pos + n;
+      n
+  in
+
+  let open Result in
+
+  Idx.Lazy.make ii
+  >>! lazy_index_err
+  >>= check_idx_implementation (refiller ii)
+  >>= dual_idx
+  >>| (fun (_, rai, _) -> rai)
+  >>= (fun rai -> unpack new_pack_filename (fun hash -> Idx.Lazy.find rai hash))
+  >>= (fun (hash, entries, rap) -> Ok ())
 
 let () =
   let pack_filename = Sys.argv.(1) in (* alloc *)
   let ii = cstruct_map Sys.argv.(2) in (* alloc *)
 
-  let out = open_out "pack.pack" in
-  let fmt = Format.formatter_of_out_channel out in
+  let pack_out = open_out new_pack_filename in
+  let pack_fmt = Format.formatter_of_out_channel pack_out in
+  let idx_out  = open_out new_idx_filename in
+  let idx_fmt  = Format.formatter_of_out_channel idx_out in
 
   let refiller map =
     let pos = ref 0 in
@@ -512,14 +575,19 @@ let () =
      check the non-blocking deserialization of the IDX file.
      check the non-blocking serialization of the IDX file.
      check the non-blocking deserialization of the PACK file.
+     pack entries (produce 2 files, [new_idx_filename] and [new_pack_filename]).
+     close out channels
    *)
   match Result.(Idx.Lazy.make ii
                 >>! lazy_index_err
                 >>= check_idx_implementation (refiller ii)
                 >>= dual_idx
-                >>| snd (* take the lazy implementation *)
+                >>| (fun (_, rai, _) -> rai) (* take the lazy implementation *)
                 >>= (fun rai -> unpack pack_filename (fun hash -> Idx.Lazy.find rai hash))
-                >>= (fun (hash, entries, rap) -> pack fmt (entries, rap))) with
+                >>= (fun (hash, entries, rap) -> pack pack_fmt idx_fmt (entries, rap))
+                >>| (fun () -> close_out pack_out)
+                >>| (fun () -> close_out idx_out)
+                >>= check_generated_idx_file) with
   | Ok () -> Format.printf "End of parsing\n%!"
   | Error (`Unpack_error exn) ->
     Format.eprintf "unpack error: %a\n%!" P.pp_error exn
