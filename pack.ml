@@ -344,7 +344,7 @@ struct
             @@ KObject.length Int64.(length >> 4) crc
             @@ fun crc dst t -> await { t with state = Raw (idx, offset, crc) })
           dst t
-      else await { t with state = Raw (idx, offset, crc)}
+      else KObject.put_byte byte (fun dst t -> await { t with state = Raw (idx, offset, crc) }) dst t
 
   let epilogue_entry dst t idx offset crc =
     Cont { t with state = Object (header_entry (idx + 1))

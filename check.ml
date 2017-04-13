@@ -489,14 +489,17 @@ let pack ?(chunk_size = 0x800) pack_fmt idx_fmt (entries, rap) =
          Format.eprintf "Pack the git object: %a\n%!" Hash.pp hash;
 
          let base = Result.unsafe_ok (D.get rap hash z_tmp z_win h_tmp) in
+         let entry = Pack.P.entry t in
          (* XXX(dinosaure): previous tests check the [unsafe_ok]. *)
 
-         let entry = Pack.P.entry t in
+         let hash' = hash_of_object base.D.Base.kind (Int64.to_int entry.Pack.Entry.length) base.D.Base.raw in
 
-         if entry.Pack.Entry.length <> (Int64.of_int base.D.Base.length)
+         if hash <> hash'
          then begin
-           Format.eprintf "The length of the entry (%Ld) does not correspond to the length of the git object (%d).\n%!"
-             entry.Pack.Entry.length base.D.Base.length;
+           Format.eprintf "The function [D.get] returns a bad object (%a), the hash is different than what the serializer expect (%a).\n%!"
+             Hash.pp hash' Hash.pp hash;
+
+           assert false
          end;
 
          loop (Pack.P.raw base.D.Base.raw t)

@@ -854,7 +854,8 @@ struct
                                    ; kind }
                     ; i_pos = t.i_pos + Inflate.used_in z
                     ; read = Int64.add t.read (Int64.of_int (Inflate.used_in z)) }
-    | `Error (z, exn) -> error t (Inflate_error exn)
+    | `Error (z, exn) ->
+      error t (Inflate_error exn)
 
   let next src t length length' kind =
     if length = length'
