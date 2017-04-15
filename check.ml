@@ -96,7 +96,9 @@ let pp fmt = function
   | `Tree tree -> Minigit.Tree.pp fmt tree
   | `Blob blob -> Format.fprintf fmt "#blob"
 
-let dual encoder (kind, raw, length) =
+let names = Hashtbl.create 100
+
+let dual encoder hash (kind, raw, length) =
   write_header encoder (kind, raw, length);
 
   match kind with
@@ -110,7 +112,15 @@ let dual encoder (kind, raw, length) =
        assert false)
   | P.Tree ->
     (match Minigit.Tree.Decoder.to_result raw with
-     | Ok tree -> Minigit.Tree.Encoder.tree encoder tree
+     | Ok tree ->
+       let path = try Hashtbl.find names hash with exn -> "" in
+
+       List.iter
+         (fun entry ->
+            Format.eprintf "%a: %s\n%!" Hash.pp entry.Minigit.Tree.node (Filename.concat path entry.Minigit.Tree.name);
+            Hashtbl.add names entry.Minigit.Tree.node (Filename.concat path entry.Minigit.Tree.name))
+         tree;
+       Minigit.Tree.Encoder.tree encoder tree
      | Error exn ->
        Format.eprintf "Invalid tree: %s\n%!" exn;
        Format.eprintf "%a\n%!" Cstruct.hexdump_pp raw;
@@ -189,7 +199,7 @@ let check hash kind raw length consumed offset crc ?base getter = match getter h
 
     let encoder = Faraday.create (real_length + size_of_header (kind, raw, real_length)) in
 
-    dual encoder (kind, raw, real_length);
+    dual encoder hash (kind, raw, real_length);
     let hash' = hash_of_encoder encoder in
 
     if hash <> hash' || crc <> crc'
@@ -207,7 +217,7 @@ let check hash kind raw length consumed offset crc ?base getter = match getter h
       Format.eprintf "OCaml value: %a\n%!"
         pp (deserialize (kind, raw, real_length));
 
-      dual encoder (kind, raw, real_length);
+      dual encoder hash (kind, raw, real_length);
 
       let _ = Faraday.serialize encoder
         (fun lst ->
@@ -255,6 +265,7 @@ type entry =
   | Tree   of Minigit.Tree.t
   | Tag    of Minigit.Tag.t
   | Blob   of Minigit.Blob.t
+
 
 let z_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000)
 let h_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000)
@@ -465,15 +476,22 @@ let zip l1 l2 =
 
   aux [] (l1, l2)
 
+let pp_option pp_data fmt = function
+  | Some x -> pp_data fmt x
+  | None -> Format.fprintf fmt "<none>"
+
 let pack ?(chunk_size = 0x800) pack_fmt idx_fmt (entries, rap) =
   Format.eprintf "Start to serialize again the PACK file and produce a new IDX file.\n%!";
 
   let entries = Array.of_list
-      (List.map (fun (hash, o) -> match o with
+      (List.map (fun (hash, o) ->
+           let path = try Some (Hashtbl.find names hash) with exn -> None in
+
+           match o with
            | Tag o -> Pack.Entry.from_tag hash o
            | Commit o -> Pack.Entry.from_commit hash o
-           | Tree o -> Pack.Entry.from_tree hash o
-           | Blob o -> Pack.Entry.from_blob hash o)
+           | Tree o -> Pack.Entry.from_tree ?path hash o
+           | Blob o -> Pack.Entry.from_blob ?path hash o)
           entries)
   in
   let dst = Cstruct.create chunk_size in
@@ -486,10 +504,11 @@ let pack ?(chunk_size = 0x800) pack_fmt idx_fmt (entries, rap) =
     | `Await t ->
       (match Pack.P.expect t with
        | Some hash ->
-         Format.eprintf "Pack the git object: %a\n%!" Hash.pp hash;
+         let entry = Pack.P.entry t in
+
+         Format.eprintf "Pack the git object (name = %a): %a\n%!" (pp_option Format.pp_print_string) (Pack.Entry.name entry) Hash.pp hash;
 
          let base = Result.unsafe_ok (D.get rap hash z_tmp z_win h_tmp) in
-         let entry = Pack.P.entry t in
          (* XXX(dinosaure): previous tests check the [unsafe_ok]. *)
 
          let hash' = hash_of_object base.D.Base.kind (Int64.to_int entry.Pack.Entry.length) base.D.Base.raw in
