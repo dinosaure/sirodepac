@@ -49,6 +49,8 @@ let blit_from t src o len =
         min (t.len + 1) desired
       in
       resize t len' (Array.get src 0);
+      let good = capacity t = t.len || capacity t - length t >= len in
+      assert good;
     end;
 
     let sub = Array.sub src o len in
@@ -90,19 +92,53 @@ let take_front_exn t =
 
   c
 
-let junk_front t =
+let junk_front_exn t =
   if t.a = t.b then raise Empty;
 
   if t.a + 1 = Array.length t.buf
   then t.a <- 0
   else t.a <- t.a + 1
 
+let junk_front t =
+  try junk_front_exn t
+  with Empty -> ()
+
 let iter t f =
   if t.b >= t.a
-  then for i = 0 to t.b - 1 do f (Array.get t.buf i) done
+  then for i = t.a to t.b - 1 do f (Array.get t.buf i) done
   else begin
     for i = t.a to Array.length t.buf - 1 do f (Array.get t.buf i) done;
     for i = 0 to t.b - 1 do f (Array.get t.buf i) done;
   end
 
+let iteri t f =
+  let idx = ref 0 in
+
+  if t.b >= t.a
+  then for i = t.a to t.b - 1 do f !idx (Array.get t.buf i); incr idx done
+  else begin
+    for i = t.a to Array.length t.buf - 1 do f !idx (Array.get t.buf i); incr idx done;
+    for i = 0 to t.b - 1 do f !idx (Array.get t.buf i); incr idx done;
+  end
+
+let fold t f a =
+  let a = ref a in
+
+  iter t (fun x -> a := f !a x);
+  !a
+
+let foldi t f a =
+  let a = ref a in
+
+  iteri t (fun i x -> a := f !a i x);
+  !a
+
 let push_back t e = blit_from t (Array.make 1 e) 0 1
+
+let nth_exn t i =
+  if t.b >= t.a
+  then Array.get t.buf (t.a + i)
+  else
+    if t.a + i < Array.length t.buf
+    then Array.get t.buf (t.a + i)
+    else Array.get t.buf (i - (Array.length t.buf - t.a))

@@ -10,4 +10,8 @@ val reset : 'a t -> unit
 val take_front_exn : 'a t -> 'a
 val junk_front : 'a t -> unit
 val iter : 'a t -> ('a -> unit) -> unit
+val iteri : 'a t -> (int -> 'a -> unit) -> unit
+val fold : 'a t -> ('b -> 'a -> 'b) -> 'b -> 'b
+val foldi : 'a t -> ('b -> int -> 'a -> 'b) -> 'b -> 'b
+val nth_exn : 'a t -> int -> 'a
 val push_back : 'a t -> 'a -> unit
