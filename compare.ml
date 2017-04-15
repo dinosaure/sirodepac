@@ -14,3 +14,5 @@ let int : int -> int -> int = Pervasives.compare
 
 (* specialization with [int64]. *)
 let int64 : int64 -> int64 -> int = Int64.compare
+
+let char : char -> char -> int = Char.compare
