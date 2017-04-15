@@ -4,6 +4,8 @@ sig
     { a_start : int
     ; b_start : int
     ; length  : int }
+
+  val pp : Format.formatter -> t -> unit
 end
 
 val get_matching_blocks :
@@ -11,6 +13,12 @@ val get_matching_blocks :
   -> compare:('b -> 'b -> int)
   -> a:'a array
   -> b:'a array
+  -> MatchingBlock.t list
+
+val get_matching_blocks_bigarray :
+  compare:(char -> char -> int)
+  -> a:(char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
+  -> b:(char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
   -> MatchingBlock.t list
 
 val matches :

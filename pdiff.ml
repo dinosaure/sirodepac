@@ -1,5 +1,7 @@
 let () = Printexc.record_backtrace true
 
+module A = Bigarray.Array1
+
 (* XXX(dinosaure): semantically, [j] is an index. *)
 let ( <|> ) ar (i, j) =
   if j <= i
@@ -314,6 +316,40 @@ let unique_lcs (alpha, alo, ahi) (bravo, blo, bhi) =
 
   Patience.longest_increasing_subsequence diff
 
+let unique_lcs_bigarray (alpha, alo, ahi) (bravo, blo, bhi) =
+  let unique = Hashtbl.create (min (ahi - alo) (bhi - blo)) in
+
+  for i = alo to ahi - 1
+  do
+    let x = A.get alpha (i) in
+    try let _ = Hashtbl.find unique x in
+      Hashtbl.replace unique x `Neg
+    with Not_found -> Hashtbl.replace unique x (`UIA i)
+  done;
+
+  for i = blo to bhi - 1
+  do
+    let x = A.get bravo (i) in
+    try match Hashtbl.find unique x with
+      | `Neg -> ()
+      | `UIA i_a -> Hashtbl.replace unique x (`UIAB (i_a, i))
+      | `UIAB (i_a, i_b) -> Hashtbl.replace unique x `Neg
+    with Not_found -> ()
+  done;
+
+  let diff =
+    let unique = Hashtbl.fold
+        (fun key value acc -> match value with
+           | `UIAB i_a_b -> i_a_b :: acc
+           | `Neg | `UIA _ -> acc)
+        unique []
+    in
+
+    OrderedSequence.create unique
+  in
+
+  Patience.longest_increasing_subsequence diff
+
 (* [matches a b] returns a list of pairs (i, j) such that a.(i) = b.(j) and such
    that the list is strictly increasing in both its first and second
    coordinates.contents
@@ -394,12 +430,85 @@ let matches ~compare alpha bravo =
   recurse_matches 0 0 (Array.length alpha) (Array.length bravo);
   List.rev !matches_ref
 
+let matches_bigarray ~compare alpha bravo =
+  let matches_ref_length = ref 0 in
+  let matches_ref        = ref [] in
+
+  let add_match m =
+    incr matches_ref_length;
+    matches_ref := m :: !matches_ref
+  in
+
+  let rec recurse_matches alo blo ahi bhi =
+    let old_left = !matches_ref_length in
+
+    if not (alo >= ahi || blo >= bhi)
+    then begin
+      let last_a_pos = ref (alo - 1) in
+      let last_b_pos = ref (blo - 1) in
+
+      unique_lcs_bigarray (alpha, alo, ahi) (bravo, blo, bhi)
+      |> List.iter
+        (fun (apos, bpos) ->
+           if !last_a_pos + 1 <> apos || !last_b_pos + 1 <> bpos
+           then recurse_matches (!last_a_pos + 1) (!last_b_pos + 1) apos bpos;
+
+           last_a_pos := apos;
+           last_b_pos := bpos;
+           add_match (apos, bpos));
+
+      if !matches_ref_length > old_left
+      then recurse_matches (!last_a_pos + 1) (!last_b_pos + 1) ahi bhi
+      else if (compare (A.get alpha (alo)) (A.get bravo (blo)) = 0)
+      then begin
+        let alo = ref alo in
+        let blo = ref blo in
+
+        while (!alo < ahi && !blo < bhi && (compare (A.get alpha (!alo)) (A.get bravo (!blo)) = 0))
+        do
+          add_match (!alo, !blo);
+          incr alo;
+          incr blo;
+        done;
+
+        recurse_matches !alo !blo ahi bhi
+      end else if (compare (A.get alpha (ahi - 1)) (A.get bravo (bhi - 1)) = 0)
+      then begin
+        let nahi = ref (ahi - 1) in
+        let nbhi = ref (bhi - 1) in
+
+        while (!nahi > alo && !nbhi > blo && compare (A.get alpha (!nahi - 1)) (A.get bravo (!nbhi - 1)) = 0)
+        do
+          decr nahi;
+          decr nbhi;
+        done;
+
+        recurse_matches (!last_a_pos + 1) (!last_b_pos + 1) !nahi !nbhi;
+
+        for i = 0 to (ahi - !nahi - 1)
+        do add_match (!nahi + i, !nbhi + i) done
+      end else
+        PlainDiff.iter_matches_bigarray
+          (A.sub alpha alo (ahi - alo))
+          (A.sub bravo blo (bhi - blo))
+          (fun (i1, i2) -> add_match (alo + i1, blo + i2))
+    end
+  in
+  recurse_matches 0 0 (A.dim alpha) (A.dim bravo);
+  List.rev !matches_ref
+
 module MatchingBlock =
 struct
   type t =
     { a_start : int
     ; b_start : int
     ; length  : int }
+
+  let pp fmt { a_start; b_start; length; } =
+    Format.fprintf fmt "{ @[<hov>a_start = %d; \
+                                 b_start = %d; \
+                                 length = %d;@] }"
+      a_start b_start length
 end
 
 let collapse_sequences matches =
@@ -456,6 +565,16 @@ let get_matching_blocks ~transform ~compare ~a ~b =
 
   List.append matches [ last ]
 
+let get_matching_blocks_bigarray ~compare ~a ~b =
+  let matches = matches_bigarray ~compare a b |> collapse_sequences in
+  let last =
+    { MatchingBlock.a_start = A.dim a
+    ; b_start = A.dim b
+    ; length = 0 }
+  in
+
+  List.append matches [ last ]
+
 module Range =
 struct
   type 'a t =
@@ -466,7 +585,7 @@ struct
 
   let pp ?(sep = (fun fmt -> ())) pp_data fmt = function
     | Same ar ->
-      Format.fprintf fmt "  %a" pp_data (Array.map fst ar);
+      Format.fprintf fmt "= %a" pp_data (Array.map fst ar);
       sep fmt
     | Old ar ->
       Format.fprintf fmt "< %a" pp_data ar;
@@ -475,9 +594,9 @@ struct
       Format.fprintf fmt "> %a" pp_data ar;
       sep fmt
     | Replace (a, b) ->
-      Format.fprintf fmt "< %a" pp_data a;
+      Format.fprintf fmt "<r%a" pp_data a;
       sep fmt;
-      Format.fprintf fmt "> %a" pp_data b;
+      Format.fprintf fmt "r>%a" pp_data b;
       sep fmt
 
   let all_same ranges =

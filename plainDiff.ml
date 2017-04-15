@@ -29,6 +29,8 @@
    algorithm described by Eugene W.Myers in: "An O(ND) Difference Algorithm and
    Its Variations" *)
 
+module A = Bigarray.Array1
+
 exception DiagReturn of int
 
 let diag fd bd sh xv yv xoff xlim yoff ylim = begin
@@ -108,6 +110,83 @@ let diag fd bd sh xv yv xoff xlim yoff ylim = begin
   with DiagReturn i -> i
 end
 
+let diag_bigarray fd bd sh xv yv xoff xlim yoff ylim = begin
+  let dmin = xoff - ylim in
+  let dmax = xlim - yoff in
+  let fmid = xoff - yoff in
+  let bmid = xlim - ylim in
+  let odd = (fmid - bmid) land 1 <> 0 in
+  A.set fd (sh+fmid) xoff;
+  A.set bd (sh+bmid) xlim;
+  try
+    let rec loop fmin fmax bmin bmax = begin
+      let fmin =
+        if fmin > dmin then begin A.set fd (sh+fmin-2) (-1); fmin - 1 end
+        else fmin + 1
+      in
+      let fmax =
+        if fmax < dmax then begin A.set fd (sh+fmax+2) (-1); fmax + 1 end
+        else fmax - 1
+      in
+      begin
+        let rec loop d =
+          if d < fmin then ()
+          else begin
+            let tlo = A.get fd (sh+d-1) in
+            let thi = A.get fd (sh+d+1) in
+            let x = if tlo >= thi then tlo + 1 else thi in
+            let x =
+              let rec loop xv yv xlim ylim x y =
+                if x < xlim && y < ylim && xv x == yv y then
+                  loop xv yv xlim ylim (x + 1) (y + 1)
+                else x
+              in
+              loop xv yv xlim ylim x (x - d)
+            in
+            A.set fd (sh+d) x;
+            if odd && bmin <= d && d <= bmax && A.get bd (sh+d) <= A.get fd (sh+d) then
+              raise (DiagReturn d)
+            else loop (d - 2)
+          end
+        in loop fmax
+      end;
+      let bmin =
+        if bmin > dmin then begin A.set bd (sh+bmin-2) max_int; bmin - 1 end
+        else bmin + 1
+      in
+      let bmax =
+        if bmax < dmax then begin A.set bd (sh+bmax+2) max_int; bmax + 1 end
+        else bmax - 1
+      in
+      begin
+        let rec loop d =
+          if d < bmin then ()
+          else begin
+            let tlo = A.get bd (sh+d-1) in
+            let thi = A.get bd (sh+d+1) in
+            let x = if tlo < thi then tlo else thi - 1 in
+            let x =
+              let rec loop xv yv xoff yoff x y =
+                if x > xoff && y > yoff && xv (x - 1) == yv (y - 1) then
+                  loop xv yv xoff yoff (x - 1) (y - 1)
+                else x
+              in
+              loop xv yv xoff yoff x (x - d)
+            in
+            A.set bd (sh+d) x;
+            if not odd && fmin <= d && d <= fmax && A.get bd (sh+d) <= A.get fd (sh+d) then
+              raise (DiagReturn d)
+            else loop (d - 2)
+          end
+        in
+        loop bmax
+      end;
+      loop fmin fmax bmin bmax
+    end in
+    loop fmid fmid bmid bmid
+  with DiagReturn i -> i
+end
+
 let diff_loop a ai b bi n m = begin
   let fd = Array.make (n + m + 3) 0 in
   let bd = Array.make (n + m + 3) 0 in
@@ -141,6 +220,53 @@ let diff_loop a ai b bi n m = begin
     else begin
       let d = diag fd bd sh xvec yvec xoff xlim yoff ylim in
       let b = bd.(sh+d) in
+      loop xoff b yoff (b - d);
+      loop b xlim (b - d) ylim
+    end
+  in loop 0 n 0 m;
+  (chng1, chng2)
+end
+
+let bigarray_make size value =
+  let ar = A.create Bigarray.Int Bigarray.c_layout size in
+
+  A.fill ar value;
+
+  ar
+
+let diff_loop_bigarray a ai b bi n m = begin
+  let fd = bigarray_make (n + m + 3) 0 in
+  let bd = bigarray_make (n + m + 3) 0 in
+  let sh = m + 1 in
+  let xvec i = A.get a (A.get ai (i)) in
+  let yvec j = A.get b (A.get bi (j)) in
+  let chng1 = bigarray_make (A.dim a) 1 in
+  let chng2 = bigarray_make (A.dim b) 1 in
+  for i = 0 to n - 1 do A.set chng1 (A.get ai (i)) 0 done;
+  for j = 0 to m - 1 do A.set chng2 (A.get bi (j)) 0 done;
+  let rec loop xoff xlim yoff ylim =
+    let (xoff, yoff) =
+      let rec loop xoff yoff =
+        if xoff < xlim && yoff < ylim && xvec xoff == yvec yoff then
+          loop (xoff + 1) (yoff + 1)
+        else (xoff, yoff)
+      in loop xoff yoff
+    in
+    let (xlim, ylim) =
+      let rec loop xlim ylim =
+        if xlim > xoff && ylim > yoff && xvec (xlim - 1) == yvec (ylim - 1)
+        then
+          loop (xlim - 1) (ylim - 1)
+        else (xlim, ylim)
+      in loop xlim ylim
+    in
+    if xoff = xlim then
+      for y = yoff to ylim - 1 do A.set chng2 (A.get bi (y)) 1 done
+    else if yoff = ylim then
+      for x = xoff to xlim - 1 do A.set chng1 (A.get ai (x)) 1 done
+    else begin
+      let d = diag_bigarray fd bd sh xvec yvec xoff xlim yoff ylim in
+      let b = A.get bd (sh+d) in
       loop xoff b yoff (b - d);
       loop b xlim (b - d) ylim
     end
@@ -182,12 +308,61 @@ let make_indexer a b = begin
   Array.sub ai 0 k
 end
 
+let bigarray_iteri f ar =
+  let len = A.dim ar in
+
+  for i = 0 to len - 1
+  do f i (A.get ar i) done
+
+let cstruct_iteri f cs =
+  let i = ref 0 in
+  let o = Cstruct.iter (fun _ -> Some 1) (fun _ -> let r = !i, Cstruct.get_uint8 cs !i in incr i; r) cs in
+
+  let rec aux () = match o () with Some (idx, value) -> f idx value; aux () | None -> () in aux ()
+
+let make_indexer_bigarray a b = begin
+  let n = A.dim a in
+  let htb = Hashtbl.create (10 * A.dim b) in
+  bigarray_iteri
+    (fun i e ->
+       try A.set b (i) (Hashtbl.find htb e) with
+         Not_found -> Hashtbl.add htb e e)
+    b;
+  let ai = bigarray_make n 0 in
+  let k =
+    let rec loop i k =
+      if i = n then k
+      else
+        let k =
+          try begin
+            A.set a (i) (Hashtbl.find htb (A.get a (i)));
+            (* line found (since "Not_found" not raised) *)
+            A.set ai (k) i;
+            k + 1
+          end
+          with
+            Not_found -> k
+        in
+        loop (i + 1) k
+    in loop 0 0
+  in
+  A.sub ai 0 k
+end
+
+
 let f a b =
   let ai = make_indexer a b in
   let bi = make_indexer b a in
   let n = Array.length ai in
   let m = Array.length bi in
   diff_loop a ai b bi n m
+
+let f_bigarray a b =
+  let ai = make_indexer_bigarray a b in
+  let bi = make_indexer_bigarray b a in
+  let n = A.dim ai in
+  let m = A.dim bi in
+  diff_loop_bigarray a ai b bi n m
 
 let iter_matches a b func =
   let d1, d2 = f a b in
@@ -204,6 +379,27 @@ let iter_matches a b func =
       end else aux i1 (i2 + 1)
     else
     if not d2.(i2)
+    then aux (i1 + 1) i2
+    else aux (i1 + 1) (i2 + 1)
+  in
+
+  aux 0 0
+
+let iter_matches_bigarray a b func =
+  let d1, d2 = f_bigarray a b in
+
+  let rec aux i1 i2 =
+    if i1 >= A.dim d1 || i2 >= A.dim d2
+    then ()
+    else
+    if A.get d1 (i1) = 0
+    then if A.get d2 (i2) = 0
+      then begin
+        func (i1, i2);
+        aux (i1 + 1) (i2 + 1)
+      end else aux i1 (i2 + 1)
+    else
+    if A.get d2 (i2) = 0
     then aux (i1 + 1) i2
     else aux (i1 + 1) (i2 + 1)
   in
