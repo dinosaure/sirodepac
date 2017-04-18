@@ -547,6 +547,12 @@ let pack ?(chunk_size = 0x800) pack_fmt idx_fmt (entries, rap) =
 let new_idx_filename = "pack.idx"
 let new_pack_filename = "pack.pack"
 
+(* make the lazy IDX getter from the IDX file generated
+   check the IDX implementation (again)
+   check the lazy IDX get the same result than the tree
+   unpack (and check) the PACK file generated
+   and returns ok
+ *)
 let check_generated_idx_file () =
   Format.eprintf "Start to check the generated IDX and PACK file.\n%!";
 
@@ -599,6 +605,10 @@ let () =
      check the non-blocking deserialization of the PACK file.
      pack entries (produce 2 files, [new_idx_filename] and [new_pack_filename]).
      close out channels
+     check the lazy implementation of the IDX file generated.
+     check the non-blocking deserialization of the IDX file generated.
+     check the non-blocking serialization of the IDX file generated.
+     check the non-blocking deserialization of the PACK file generated.
    *)
   match Result.(Idx.Lazy.make ii
                 >>! lazy_index_err
