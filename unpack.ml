@@ -115,7 +115,9 @@ struct
     { i_off          : int
     ; i_pos          : int
     ; i_len          : int
-    ; read           : int
+    ; read           : int (* XXX(dinosaure): consider than it's not possible to have a
+                                              hunk serialized in bigger than [max_int]
+                                              bytes. *)
     ; _length        : int
     ; _reference     : reference
     ; _source_length : int
@@ -157,9 +159,18 @@ struct
       | x :: r -> pp fmt "%a%a" pp_data x sep (); aux r
     in aux lst
 
+  let cstruct_pp fmt cs =
+    Format.fprintf fmt "\"";
+    for i = 0 to Cstruct.len cs - 1
+    do if Cstruct.get_uint8 cs i > 32 && Cstruct.get_uint8 cs i < 127
+      then Format.fprintf fmt "%c" (Cstruct.get_char cs i)
+      else Format.fprintf fmt "."
+    done;
+    Format.fprintf fmt "\""
+
   let pp_obj fmt = function
     | Insert buf ->
-      pp fmt "(Insert %a)" Cstruct.hexdump_pp buf
+      pp fmt "(Insert %a)" cstruct_pp buf
     | Copy (off, len) ->
       pp fmt "(Copy (%d, %d))" off len
 
@@ -171,6 +182,14 @@ struct
   let pp_reference fmt = function
     | Hash hash -> pp fmt "(Reference %s)" hash
     | Offset off -> pp fmt "(Offset %Ld)" off
+
+  let pp_state fmt = function
+    | Header k -> pp fmt "(Header #k)"
+    | List k -> pp fmt "(List #k)"
+    | Is_insert (raw, off, len) -> pp fmt "(Is_insert (#raw, %d, %d))" off len
+    | Is_copy k -> pp fmt "(Is_copy #k)"
+    | End -> pp fmt "End"
+    | Exception exn -> pp fmt "(Exception %a)" pp_error exn
 
   let pp_hunks fmt ({ reference; hunks; length; source_length; target_length; } : hunks) =
     pp fmt "{@[<hov>reference = %a;@ \
@@ -192,10 +211,12 @@ struct
                     reference = %a;@ \
                     source_length = %d;@ \
                     target_length = %d;@ \
-                    hunks = [@[<hov>%a@]]@]}"
+                    hunks = [@[<hov>%a@]];@ \
+                    state = %a;@]}"
       i_off i_pos i_len read _length pp_reference _reference
       _source_length _target_length
       (pp_lst ~sep:(fun fmt () -> pp fmt ";@ ") pp_obj) _hunks
+      pp_state state
 
   let await t     = Wait t
   let error t exn = Error ({ t with state = Exception exn }, exn)
@@ -265,6 +286,7 @@ struct
     @@ fun l0 -> get_byte ((opcode lsr 5) land 1 <> 0)
     @@ fun l1 -> get_byte ((opcode lsr 6) land 1 <> 0)
     @@ fun l2 src t ->
+      (* TODO: may be a bug with little-endian architecture. *)
       let dst = o0 lor (o1 lsl 8) lor (o2 lsl 16) lor (o3 lsl 24) in
       let len =
         let len0 = l0 lor (l1 lsl 8) lor (l2 lsl 16) in
@@ -281,11 +303,13 @@ struct
   and list src t =
     if t.read < t._length
     then KList.get_byte
-           (fun opcode src t ->
+        (fun opcode  src t ->
              if opcode = 0 then error t (Reserved_opcode opcode)
              else match opcode land 0x80 with
-             | 0 -> Cont { t with state = Is_insert (Cstruct.create opcode, 0, opcode) }
-             | _ -> Cont { t with state = Is_copy (copy opcode) })
+               | 0 ->
+                 Cont { t with state = Is_insert (Cstruct.create opcode, 0, opcode) }
+               | _ ->
+                 Cont { t with state = Is_copy (copy opcode) })
            src t
     else ok { t with _hunks = List.rev t._hunks }
 
@@ -345,7 +369,7 @@ struct
   let sp = Format.sprintf
 
   let refill off len t =
-    if t.i_pos = t.i_len 
+    if t.i_pos = t.i_len
     then { t with i_off = off
                 ; i_len = len
                 ; i_pos = 0 }
@@ -680,7 +704,8 @@ struct
       await { t with state = Hunks { offset; length; consumed; crc; z; h; }
                    ; i_pos = t.i_pos + Inflate.used_in z
                    ; read = Int64.add t.read (Int64.of_int (Inflate.used_in z)) }
-    | `Error (z, exn) -> error t (Inflate_error exn)
+    | `Error (z, exn) ->
+      error t (Inflate_error exn)
     | `End z ->
 
       let ret = if Inflate.used_out z <> 0
@@ -702,14 +727,16 @@ struct
                      ; read = Int64.add t.read (Int64.of_int (Inflate.used_in z)) }
        | `Await h ->
          error t (Hunk_input (length, H.read h))
-       | `Error (h, exn) -> error t (Hunk_error exn))
+       | `Error (h, exn) ->
+         error t (Hunk_error exn))
     | `Flush z ->
       match H.eval (match t.o_z with B.Bigstring bs -> Cstruct.of_bigarray bs) (H.refill 0 (Inflate.used_out z) h) with
       | `Await h ->
         Cont { t with state = Hunks { offset; length; consumed; crc
                                     ; z = (Inflate.flush 0 (B.length t.o_z) z)
                                     ; h } }
-      | `Error (h, exn) -> error t (Hunk_error exn)
+      | `Error (h, exn) ->
+        error t (Hunk_error exn)
       | `Ok (h, objs) ->
         Cont { t with state = Hunks { offset; length; consumed; crc
                                     ; z = (Inflate.flush 0 (B.length t.o_z) z)

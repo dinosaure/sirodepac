@@ -1,144 +1,199 @@
+module Cheap =
+struct
+  type +'a t
+
+  let none : _ t =
+    Obj.magic `x6e8ee3478e1d7449 (* HACK! *)
+  let none_substitute : _ t = Obj.obj (Obj.new_block Obj.abstract_tag 1)
+
+  let physical_equality = (==)
+  let physical_same (type a) (type b) (a : a) (b : b) = physical_equality a (Obj.magic b : a)
+
+  let is_none x = physical_equality x none
+  let is_some x = not (physical_equality x none)
+
+  let some (type a) (x : a) : a t =
+    if physical_same x none
+    then none_substitute
+    else (Obj.magic x)
+
+  let value_unsafe (type a) (x : a t) : a =
+    if physical_equality x none_substitute
+    then Obj.magic none
+    else Obj.magic x
+
+  let value_exn x =
+    if is_some x
+    then value_unsafe x
+    else raise (Invalid_argument "Cheap.value_exn: the value is none")
+
+  let of_option = function
+    | None -> none
+    | Some x -> some x
+
+  let to_option x =
+    if is_some x
+    then Some (value_unsafe x)
+    else None
+end
+
+module ObjArray =
+struct
+  type t = Obj.t array
+
+  let length = Array.length
+  let zero = Obj.repr (0 : int)
+  let create len = Array.make len zero
+  let empty = [||]
+
+  type nofloat = NoFloat0 | NoFloat1 of int
+
+  let get t i =
+    Obj.repr (Array.get (Obj.magic (t : t) : nofloat array) i : nofloat)
+
+  let set t i x =
+    let old = get t i in
+    if Obj.is_int old && Obj.is_int x
+    then Array.unsafe_set (Obj.magic (t : t) : int array) i (Obj.obj x : int)
+    else if not (old == x)
+    then Array.unsafe_set t i x
+
+  let blit src src_pos dst dst_pos len =
+    if dst_pos < src_pos
+    then for i = 0 to len - 1
+      do set dst (dst_pos + i) (get src (src_pos + i)) done
+    else for i = len - 1 downto 0
+      do set dst (dst_pos + i) (get src (src_pos + i)) done
+
+  let copy src =
+    let dst = create (length src) in
+    blit src 0 dst 0 (length src);
+    dst
+end
+
+module UniformArray =
+struct
+  type 'a t = ObjArray.t
+
+  let empty = ObjArray.empty
+  let get arr i = Obj.obj (ObjArray.get arr i)
+  let set arr i x = ObjArray.set arr i (Obj.repr x)
+  let length = ObjArray.length
+  let blit = ObjArray.blit
+  let copy = ObjArray.copy
+  let create len v =
+    let res = ObjArray.create len in
+    for i = 0 to len - 1
+    do set res i v done;
+    res
+  let iter a f =
+    for i = 0 to length a - 1
+    do f (get a i) done
+end
+
+module CheapArray =
+struct
+  type 'a t = 'a Cheap.t UniformArray.t
+
+  let empty = UniformArray.empty
+  let create len = UniformArray.create len Cheap.none
+  let is_none t i = Cheap.is_none (UniformArray.get t i)
+  let is_some t i = Cheap.is_some (UniformArray.get t i)
+  let set t i x = UniformArray.set t i (Cheap.of_option x)
+  let get t i = Cheap.to_option (UniformArray.get t i)
+end
+
+module Option =
+struct
+  let iter f = function
+    | Some a -> f a
+    | None -> ()
+end
+
 type 'a t =
-  { mutable a   : int
-  ; mutable b   : int
-  ; mutable buf : 'a array
-  ; len         : int }
+  { mutable a : int
+  ; mutable b : int
+  ; len       : int
+  ; buf       : 'a CheapArray.t }
 
 let make len =
   { a = 0
   ; b = 0
-  ; len
-  ; buf = Array.of_list [] }
+  ; len = len + 1
+  ; buf = CheapArray.create (len + 1) }
 
-let capacity t =
-  let len = Array.length t.buf in
-  match len with 0 -> 0 | l -> l - 1
+let drop t n =
+  t.a <- if t.a + n < t.len then t.a + n else t.a + n - t.len
 
-let max t = t.len
+let move t n =
+  t.b <- if t.b + n < t.len then t.b + n else t.b + n - t.len
 
-let length t =
+let available t =
+  if t.b >= t.a
+  then t.len - (t.b - t.a) - 1
+  else (t.a - t.b) - 1
+
+let have t =
   if t.b >= t.a
   then t.b - t.a
-  else (Array.length t.buf - t.a) + t.b
+  else t.len - (t.a - t.b)
 
-let resize t c e =
-  assert (c >= Array.length t.buf);
+let of_array t arr off len =
+  if len > available t then drop t (len - (available t));
 
-  let buf' = Array.make c e in
+  let pre = t.len - t.b in
+  let extra = len - pre in
 
-  if t.b >= t.a
-  then Array.blit t.buf t.a buf' 0 (t.b - t.a)
-  else begin
-    let extra = Array.length t.buf - t.a in
-    Array.blit t.buf t.a buf' 0 extra;
-    Array.blit t.buf 0 buf' extra t.b;
-  end;
+  if extra > 0
+  then begin
+    for i = 0 to pre - 1
+    do CheapArray.set t.buf (t.b + i) (Array.get arr (off + i)) done;
+    for i = 0 to extra - 1
+    do CheapArray.set t.buf i (Array.get arr (off + pre + i)) done
+  end else
+    for i = 0 to len - 1
+    do CheapArray.set t.buf (t.b + i) (Array.get arr (off + i)) done;
 
-  t.buf <- buf'
+  move t len
 
-let blit_from t src o len =
-  if Array.length src = 0
-  then ()
-  else
-    let c = capacity t - length t in
-
-    if c < len
-    then begin
-      let len' =
-        let desired = Array.length t.buf + len + 24 in
-        min (t.len + 1) desired
-      in
-      resize t len' (Array.get src 0);
-      let good = capacity t = t.len || capacity t - length t >= len in
-      assert good;
-    end;
-
-    let sub = Array.sub src o len in
-    let iter x =
-      let c = Array.length t.buf in
-
-      Array.set t.buf t.b x;
-
-      if t.b = c - 1
-      then t.b <- 0
-      else t.b <- t.b + 1;
-
-      if t.a = t.b
-      then if t.a = c - 1
-        then t.a <- 0
-        else t.a <- t.a + 1
-    in
-
-    Array.iter iter sub
-
-let clear t =
-  t.a <- 0;
-  t.b <- 0
-
-let reset t =
-  clear t;
-  t.buf <- Array.of_list []
-
-exception Empty
-
-let take_front_exn t =
-  if t.a = t.b then raise Empty;
-
-  let c = Array.get t.buf t.a in
-
-  if t.a + 1 = Array.length t.buf
-  then t.a <- 0
-  else t.a <- t.a + 1;
-
-  c
-
-let junk_front_exn t =
-  if t.a = t.b then raise Empty;
-
-  if t.a + 1 = Array.length t.buf
-  then t.a <- 0
-  else t.a <- t.a + 1
-
-let junk_front t =
-  try junk_front_exn t
-  with Empty -> ()
-
-let iter t f =
-  if t.b >= t.a
-  then for i = t.a to t.b - 1 do f (Array.get t.buf i) done
-  else begin
-    for i = t.a to Array.length t.buf - 1 do f (Array.get t.buf i) done;
-    for i = 0 to t.b - 1 do f (Array.get t.buf i) done;
-  end
+(* XXX(dinosaure): need to be fixed. the log is wrong. TODO! *)
+let push t x = of_array t [| Some x |] 0 1
 
 let iteri t f =
   let idx = ref 0 in
+  let pre = t.len - t.a in
+  let extra = (have t) - pre in
 
-  if t.b >= t.a
-  then for i = t.a to t.b - 1 do f !idx (Array.get t.buf i); incr idx done
-  else begin
-    for i = t.a to Array.length t.buf - 1 do f !idx (Array.get t.buf i); incr idx done;
-    for i = 0 to t.b - 1 do f !idx (Array.get t.buf i); incr idx done;
-  end
+  if extra > 0
+  then begin
+    for i = 0 to pre - 1
+    do Option.iter (f !idx) (CheapArray.get t.buf (t.a + i)); incr idx; done;
+    for i = 0 to extra - 1
+    do Option.iter (f !idx) (CheapArray.get t.buf i); incr idx; done;
+  end else
+    for i = 0 to (have t) - 1
+    do Option.iter (f !idx) (CheapArray.get t.buf (t.a + i)); incr idx; done
 
-let fold t f a =
-  let a = ref a in
-
-  iter t (fun x -> a := f !a x);
-  !a
+let iter t f = iteri t (fun i x -> f x)
 
 let foldi t f a =
-  let a = ref a in
+  let acc = ref a in
+  iteri t (fun idx x -> acc := f !acc idx x);
+  !acc
 
-  iteri t (fun i x -> a := f !a i x);
-  !a
+let fold t f a =
+  foldi t (fun acc idx x -> f acc x) a
 
-let push_back t e = blit_from t (Array.make 1 e) 0 1
+let nth t i =
+  let pre = t.len - t.a in
+  let extra = i - pre in
 
-let nth_exn t i =
-  if t.b >= t.a
-  then Array.get t.buf (t.a + i)
-  else
-    if t.a + i < Array.length t.buf
-    then Array.get t.buf (t.a + i)
-    else Array.get t.buf (i - (Array.length t.buf - t.a))
+  let value_opt =
+    if extra >= 0
+    then CheapArray.get t.buf extra
+    else CheapArray.get t.buf (t.a + i)
+  in
+
+  match value_opt with
+  | Some x -> x
+  | None -> raise (Invalid_argument "Window.nth")

@@ -117,7 +117,6 @@ let dual encoder hash (kind, raw, length) =
 
        List.iter
          (fun entry ->
-            Format.eprintf "%a: %s\n%!" Hash.pp entry.Minigit.Tree.node (Filename.concat path entry.Minigit.Tree.name);
             Hashtbl.add names entry.Minigit.Tree.node (Filename.concat path entry.Minigit.Tree.name))
          tree;
        Minigit.Tree.Encoder.tree encoder tree
@@ -202,7 +201,7 @@ let check hash kind raw length consumed offset crc ?base getter = match getter h
     dual encoder hash (kind, raw, real_length);
     let hash' = hash_of_encoder encoder in
 
-    if hash <> hash' || crc <> crc'
+    if hash <> hash' (* || crc <> crc' *)
     then begin
       Format.eprintf "Hash of the object %s does not correspond with the hash \
                       produced by the encoder %s\n%!"
@@ -270,6 +269,7 @@ type entry =
 let z_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000)
 let h_tmp = Decompress.B.from_bigstring (Decompress.B.Bigstring.create 0x8000)
 let z_win = Decompress.Window.create ~proof:Decompress.B.proof_bigstring
+let h_pck = Cstruct.create 0x8000
 
 let unpack ?(chunk = 0x8000) pack_filename get =
   let buf     = BBuffer.create chunk in
@@ -542,7 +542,7 @@ let pack ?(chunk_size = 0x800) pack_fmt idx_fmt (entries, rap) =
       | Error exn -> Error (`Encoder_index_error exn)
   in
 
-  loop (Pack.P.default entries)
+  loop (Pack.P.default h_pck entries)
 
 let new_idx_filename = "pack.idx"
 let new_pack_filename = "pack.pack"
