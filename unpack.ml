@@ -107,16 +107,22 @@ let bin_of_int d =
 (* Implementation of deserialization of a list of hunks (from a PACK file) *)
 module H =
 struct
-  type error = ..
-  type error += Reserved_opcode of int
-  type error += Wrong_insert_hunk of int * int * int
+  type error =
+    | Reserved_opcode of int
+    | Wrong_copy_hunk of int * int * int
+
+  let pp_error fmt = function
+    | Reserved_opcode byte ->
+      Format.fprintf fmt "(Reserved_opcode %02x)" byte
+    | Wrong_copy_hunk (off, len, source) ->
+      Format.fprintf fmt "(Wrong_copy_hunk (off: %d, len: %d, source: %d))" off len source
 
   type t =
     { i_off          : int
     ; i_pos          : int
     ; i_len          : int
     ; read           : int (* XXX(dinosaure): consider than it's not possible to have a
-                                              hunk serialized in bigger than [max_int]
+                                              hunk serialized in bigger than [max_native_int]
                                               bytes. *)
     ; _length        : int
     ; _reference     : reference
@@ -150,73 +156,62 @@ struct
     ; source_length : int
     ; target_length : int }
 
-  let pp = Format.fprintf
-
-  let pp_lst ~sep pp_data fmt lst =
+  let pp_list ~sep pp_data fmt lst =
     let rec aux = function
       | [] -> ()
       | [ x ] -> pp_data fmt x
-      | x :: r -> pp fmt "%a%a" pp_data x sep (); aux r
+      | x :: r -> Format.fprintf fmt "%a%a" pp_data x sep (); aux r
     in aux lst
-
-  let cstruct_pp fmt cs =
-    Format.fprintf fmt "\"";
-    for i = 0 to Cstruct.len cs - 1
-    do if Cstruct.get_uint8 cs i > 32 && Cstruct.get_uint8 cs i < 127
-      then Format.fprintf fmt "%c" (Cstruct.get_char cs i)
-      else Format.fprintf fmt "."
-    done;
-    Format.fprintf fmt "\""
 
   let pp_obj fmt = function
     | Insert buf ->
-      pp fmt "(Insert %a)" cstruct_pp buf
+      Format.fprintf fmt "(Insert %a)" cstruct_pp buf
     | Copy (off, len) ->
-      pp fmt "(Copy (%d, %d))" off len
-
-  let pp_error fmt = function
-    | Reserved_opcode byte -> pp fmt "(Reserved_opcode %02x)" byte
-    | Wrong_insert_hunk (off, len, source) ->
-      pp fmt "(Wrong_insert_hunk (off: %d, len: %d, source: %d))" off len source
+      Format.fprintf fmt "(Copy (%d, %d))" off len
 
   let pp_reference fmt = function
-    | Hash hash -> pp fmt "(Reference %s)" hash
-    | Offset off -> pp fmt "(Offset %Ld)" off
+    | Hash hash -> Format.fprintf fmt "(Reference %s)" hash
+    | Offset off -> Format.fprintf fmt "(Offset %Ld)" off
 
   let pp_state fmt = function
-    | Header k -> pp fmt "(Header #k)"
-    | List k -> pp fmt "(List #k)"
-    | Is_insert (raw, off, len) -> pp fmt "(Is_insert (#raw, %d, %d))" off len
-    | Is_copy k -> pp fmt "(Is_copy #k)"
-    | End -> pp fmt "End"
-    | Exception exn -> pp fmt "(Exception %a)" pp_error exn
+    | Header k ->
+      Format.fprintf fmt "(Header #k)"
+    | List k ->
+      Format.fprintf fmt "(List #k)"
+    | Is_insert (raw, off, len) ->
+      Format.fprintf fmt "(Is_insert (#raw, %d, %d))" off len
+    | Is_copy k ->
+      Format.fprintf fmt "(Is_copy #k)"
+    | End ->
+      Format.fprintf fmt "End"
+    | Exception exn ->
+      Format.fprintf fmt "(Exception @[<hov>%a@])" pp_error exn
 
-  let pp_hunks fmt ({ reference; hunks; length; source_length; target_length; } : hunks) =
-    pp fmt "{@[<hov>reference = %a;@ \
-                    hunks = [@[<hov>%a@]];@ \
-                    length = %d;@ \
-                    source_length = %d;@ \
-                    target_length = %d]}"
-      pp_reference reference
-      (pp_lst ~sep:(fun fmt () -> pp fmt ";@ ") pp_obj) hunks
-      length source_length target_length
+  let pp_hunks fmt hunks =
+    Format.fprintf fmt "{ @[<hov>reference = @[<hov>%a@];@ \
+                                 hunks = [ @[<hov>%a@] ];@ \
+                                 length = %d;@ \
+                                 source_length = %d;@ \
+                                 target_length = %d@] }"
+      pp_reference hunks.reference
+      (pp_list ~sep:(fun fmt () -> Format.fprintf fmt ";@ ") pp_obj) hunks.hunks
+      hunks.length hunks.source_length hunks.target_length
 
-  let pp fmt { i_off; i_pos; i_len; read; _length; _reference;
-               _source_length; _target_length; _hunks; state; } =
-    pp fmt "{@[<hov>i_off = %d;@ \
-                    i_pos = %d;@ \
-                    i_len = %d;@ \
-                    read = %d;@ \
-                    length = %d;@ \
-                    reference = %a;@ \
-                    source_length = %d;@ \
-                    target_length = %d;@ \
-                    hunks = [@[<hov>%a@]];@ \
-                    state = %a;@]}"
-      i_off i_pos i_len read _length pp_reference _reference
-      _source_length _target_length
-      (pp_lst ~sep:(fun fmt () -> pp fmt ";@ ") pp_obj) _hunks
-      pp_state state
+  let pp fmt t =
+    Format.fprintf fmt "{ @[<hov>i_off = %d;@ \
+                                 i_pos = %d;@ \
+                                 i_len = %d;@ \
+                                 read = %d;@ \
+                                 length = %d;@ \
+                                 reference = @[<hov>%a@];@ \
+                                 source_length = %d;@ \
+                                 target_length = %d;@ \
+                                 hunks = [ @[<hov>%a@] ];@ \
+                                 state = @[<hov>%a@];@] }"
+      t.i_off t.i_pos t.i_len t.read
+      t._length pp_reference t._reference t._source_length t._target_length
+      (pp_list ~sep:(fun fmt () -> Format.fprintf fmt ";@ ") pp_obj) t._hunks
+      pp_state t.state
 
   let await t     = Wait t
   let error t exn = Error ({ t with state = Exception exn }, exn)
@@ -296,7 +291,7 @@ struct
       in
 
       if dst + len > t._source_length
-      then error t (Wrong_insert_hunk (dst, len, t._source_length))
+      then error t (Wrong_copy_hunk (dst, len, t._source_length))
       else Cont { t with _hunks = (Copy (dst, len)) :: t._hunks
                        ; state = List list }
 
@@ -366,14 +361,12 @@ struct
     ; _hunks = []
     ; state = Header header }
 
-  let sp = Format.sprintf
-
   let refill off len t =
     if t.i_pos = t.i_len
     then { t with i_off = off
                 ; i_len = len
                 ; i_pos = 0 }
-    else raise (Invalid_argument (sp "H.refill: you lost something"))
+    else raise (Invalid_argument (Format.sprintf "H.refill: you lost something"))
 
   let available_in t = t.i_len
   let used_in t = t.i_pos
@@ -406,26 +399,23 @@ end
 (* Implementatioon of deserialization of a PACK file *)
 module P =
 struct
-  type error = ..
-  type error += Invalid_byte of int
-  type error += Reserved_kind of int
-  type error += Invalid_kind of int
-  type error += Inflate_error of Decompress.Inflate.error
-  type error += Hunk_error of H.error
-  type error += Hunk_input of int * int
-  type error += Invalid_length of int * int
-  type error += Invalid_state
+  type error =
+    | Invalid_byte of int
+    | Reserved_kind of int
+    | Invalid_kind of int
+    | Inflate_error of Decompress.Inflate.error
+    | Hunk_error of H.error
+    | Hunk_input of int * int
+    | Invalid_length of int * int
 
-  let pp = Format.fprintf
   let pp_error fmt = function
-    | Invalid_byte byte              -> pp fmt "(Invalid_byte %02x)" byte
-    | Reserved_kind byte             -> pp fmt "(Reserved_byte %02x)" byte
-    | Invalid_kind byte              -> pp fmt "(Invalid_kind %02x)" byte
-    | Inflate_error err              -> pp fmt "(Inflate_error %a)" Decompress.Inflate.pp_error err
-    | Invalid_length (expected, has) -> pp fmt "(Invalid_length (%d <> %d))" expected has
-    | Hunk_error err                 -> pp fmt "(Hunk_error %a)" H.pp_error err
-    | Hunk_input (expected, has)     -> pp fmt "(Hunk_input (%d <> %d))" expected has
-    | Invalid_state                  -> pp fmt "Invalid_state"
+    | Invalid_byte byte              -> Format.fprintf fmt "(Invalid_byte %02x)" byte
+    | Reserved_kind byte             -> Format.fprintf fmt "(Reserved_byte %02x)" byte
+    | Invalid_kind byte              -> Format.fprintf fmt "(Invalid_kind %02x)" byte
+    | Inflate_error err              -> Format.fprintf fmt "(Inflate_error %a)" Decompress.Inflate.pp_error err
+    | Invalid_length (expected, has) -> Format.fprintf fmt "(Invalid_length (%d <> %d))" expected has
+    | Hunk_error err                 -> Format.fprintf fmt "(Hunk_error %a)" H.pp_error err
+    | Hunk_input (expected, has)     -> Format.fprintf fmt "(Hunk_input (%d <> %d))" expected has
 
   type t =
     { i_off   : int
@@ -433,9 +423,8 @@ struct
     ; i_len   : int
     ; local   : bool
     ; read    : int64
-    ; o_z     : Decompress.B.bs Decompress.B.t
+    ; o_z     : Cstruct.t
     ; o_w     : Decompress.B.bs Decompress.Window.t
-    ; o_h     : Decompress.B.bs Decompress.B.t
     ; version : int32
     ; objects : int32
     ; counter : int32
@@ -483,84 +472,74 @@ struct
     | Hunk of H.hunks
 
   let pp_kind fmt = function
-    | Commit -> pp fmt "Commit"
-    | Tree -> pp fmt "Tree"
-    | Blob -> pp fmt "Blob"
-    | Tag -> pp fmt "Tag"
-    | Hunk hunks -> pp fmt "(Hunks %a)" H.pp_hunks hunks
+    | Commit -> Format.fprintf fmt "Commit"
+    | Tree -> Format.fprintf fmt "Tree"
+    | Blob -> Format.fprintf fmt "Blob"
+    | Tag -> Format.fprintf fmt "Tag"
+    | Hunk hunks -> Format.fprintf fmt "(Hunks @[<hov>%a@])" H.pp_hunks hunks
 
   let pp_state fmt = function
-    | Header _ -> pp fmt "(Header #k)"
-    | Object _ -> pp fmt "(Object #k)"
-    | VariableLength _ -> pp fmt "(VariableLength #k)"
+    | Header k ->
+      Format.fprintf fmt "(Header #k)"
+    | Object k ->
+      Format.fprintf fmt "(Object #k)"
+    | VariableLength k ->
+      Format.fprintf fmt "(VariableLength #k)"
     | Unzip { offset
             ; consumed
             ; length
             ; kind
             ; z } ->
-      pp fmt "{ @[<hov>offset = %Ld;@ \
-                       consumed = %d;@ \
-                       length = %d;@ \
-                       kind = %a;@ \
-                       z = %a;@] }"
-        offset consumed length pp_kind kind Decompress.Inflate.pp z
+      Format.fprintf fmt "(Unzip { @[<hov>offset = %Ld;@ \
+                                          consumed = %d;@ \
+                                          length = %d;@ \
+                                          kind = @[<hov>%a@];@ \
+                                          z = @[<hov>%a@];@] })"
+        offset consumed length pp_kind kind
+        Decompress.Inflate.pp z
     | Hunks { offset
             ; length
             ; consumed
             ; z
             ; h } ->
-      pp fmt "{ @[<hov>offset = %Ld;@ \
-                       consumed = %d;@ \
-                       length = %d;@ \
-                       z = %a;@ \
-                       h = %a;@] }"
-        offset consumed length Decompress.Inflate.pp z H.pp h
+      Format.fprintf fmt "(Hunks { @[<hov>offset = %Ld;@ \
+                                          consumed = %d;@ \
+                                          length = %d;@ \
+                                          z = %a;@ \
+                                          h = @[<hov>%a@];@] })"
+        offset consumed length
+        Decompress.Inflate.pp z H.pp h
     | Next { offset
            ; consumed
            ; length
            ; length' } ->
-      pp fmt "{ @[<hov>offset = %Ld;@ \
-                       consumed = %d;@ \
-                       length = %d;@ \
-                       length' = %d;@] @}"
+      Format.fprintf fmt "(Next { @[<hov>offset = %Ld;@ \
+                                         consumed = %d;@ \
+                                         length = %d;@ \
+                                         length' = %d;@] })"
         offset consumed length length'
-    | Checksum _ -> pp fmt "(Checksum #k)"
-    | End hash -> pp fmt "(End %a)" Hash.pp hash
-    | Exception err -> pp fmt "(Exception %a)" pp_error err
+    | Checksum k ->
+      Format.fprintf fmt "(Checksum #k)"
+    | End hash ->
+      Format.fprintf fmt "(End @[<hov>%a@])" Hash.pp hash
+    | Exception err ->
+      Format.fprintf fmt "(Exception @[<hov>%a@])" pp_error err
 
-  let pp fmt { i_off; i_pos; i_len; o_z; version; objects; counter; state; } =
-    match state with
-    | Unzip { z; _ } ->
-      pp fmt "{ @[<hov>i_off = %d;@ \
-                       i_pos = %d;@ \
-                       i_len = %d;@ \
-                       version = %ld;@ \
-                       objects = %ld;@ \
-                       counter = %ld;@ \
-                       state = %a;@ \
-                       z = %a;@] }"
-        i_off i_pos i_len version objects counter pp_state state Decompress.Inflate.pp z
-    | Hunks { z; h; _ } ->
-      pp fmt "{ @[<hov>i_off = %d;@ \
-                       i_pos = %d;@ \
-                       i_len = %d;@ \
-                       version = %ld;@ \
-                       objects = %ld;@ \
-                       counter = %ld;@ \
-                       state = %a;@ \
-                       z = %a;@ \
-                       h = %a;@] }"
-        i_off i_pos i_len version objects counter pp_state state Decompress.Inflate.pp z H.pp h
-    | _ ->
-      pp fmt "{ @[<hov>i_off = %d;@ \
-                       i_pos = %d;@ \
-                       i_len = %d;@ \
-                       version = %ld;@ \
-                       objects = %ld;@ \
-                       counter = %ld;@ \
-                       state = %a@;] }"
-        i_off i_pos i_len version objects counter pp_state state
+  let pp fmt t =
+    Format.fprintf fmt "{ @[<hov>i_off = %d;@ \
+                                 i_pos = %d;@ \
+                                 i_len = %d;@ \
+                                 version = %ld;@ \
+                                 objects = %ld;@ \
+                                 counter = %ld;@ \
+                                 state = @[<hov>%a@];@] }"
+      t.i_off t.i_pos t.i_len
+      t.version
+      t.objects
+      t.counter
+      pp_state t.state
 
+  (* TODO: need to compute the hash of the input. *)
   let await t      = Wait t
   let flush t      = Flush t
   let error t exn  = Error ({ t with state = Exception exn }, exn)
@@ -696,7 +675,10 @@ struct
   let hunks src t offset length consumed crc z h =
     let open Decompress in
 
-    match Inflate.eval (B.Bigstring (Cstruct.to_bigarray src)) t.o_z z with
+    let dst' = B.from_bigstring (Cstruct.to_bigarray t.o_z) in
+    let src' = B.from_bigstring (Cstruct.to_bigarray src) in
+
+    match Inflate.eval src' dst' z with
     | `Await z ->
       let consumed = consumed + Inflate.used_in z in
       let crc = Crc32.digest ~off:(t.i_off + t.i_pos) ~len:(Inflate.used_in z) crc src in
@@ -709,8 +691,8 @@ struct
     | `End z ->
 
       let ret = if Inflate.used_out z <> 0
-                then H.eval (match t.o_z with B.Bigstring bs -> Cstruct.of_bigarray bs) (H.refill 0 (Inflate.used_out z) h)
-                else H.eval (match t.o_z with B.Bigstring bs -> Cstruct.of_bigarray bs) h
+                then H.eval t.o_z (H.refill 0 (Inflate.used_out z) h)
+                else H.eval t.o_z h
       in
 
       (match ret with
@@ -730,16 +712,16 @@ struct
        | `Error (h, exn) ->
          error t (Hunk_error exn))
     | `Flush z ->
-      match H.eval (match t.o_z with B.Bigstring bs -> Cstruct.of_bigarray bs) (H.refill 0 (Inflate.used_out z) h) with
+      match H.eval t.o_z (H.refill 0 (Inflate.used_out z) h) with
       | `Await h ->
         Cont { t with state = Hunks { offset; length; consumed; crc
-                                    ; z = (Inflate.flush 0 (B.length t.o_z) z)
+                                    ; z = (Inflate.flush 0 (Cstruct.len t.o_z) z)
                                     ; h } }
       | `Error (h, exn) ->
         error t (Hunk_error exn)
       | `Ok (h, objs) ->
         Cont { t with state = Hunks { offset; length; consumed; crc
-                                    ; z = (Inflate.flush 0 (B.length t.o_z) z)
+                                    ; z = (Inflate.flush 0 (Cstruct.len t.o_z) z)
                                     ; h } }
 
   let size_of_variable_length vl =
@@ -767,7 +749,7 @@ struct
                                   ; consumed = size_of_variable_length len
                                   ; crc
                                   ; kind = Commit
-                                  ; z = Inflate.flush 0 (B.length t.o_z)
+                                  ; z = Inflate.flush 0 (Cstruct.len t.o_z)
                                         @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                         @@ Inflate.default (Window.reset t.o_w) } }
     | 0b010 ->
@@ -776,7 +758,7 @@ struct
                                   ; consumed = size_of_variable_length len
                                   ; crc
                                   ; kind     = Tree
-                                  ; z = Inflate.flush 0 (B.length t.o_z)
+                                  ; z = Inflate.flush 0 (Cstruct.len t.o_z)
                                         @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                         @@ Inflate.default (Window.reset t.o_w) } }
     | 0b011 ->
@@ -785,7 +767,7 @@ struct
                                   ; consumed = size_of_variable_length len
                                   ; crc
                                   ; kind     = Blob
-                                  ; z = Inflate.flush 0 (B.length t.o_z)
+                                  ; z = Inflate.flush 0 (Cstruct.len t.o_z)
                                         @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                         @@ Inflate.default (Window.reset t.o_w) } }
     | 0b100 ->
@@ -794,7 +776,7 @@ struct
                                   ; consumed = size_of_variable_length len
                                   ; crc
                                   ; kind     = Tag
-                                  ; z = Inflate.flush 0 (B.length t.o_z)
+                                  ; z = Inflate.flush 0 (Cstruct.len t.o_z)
                                         @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                         @@ Inflate.default (Window.reset t.o_w) } }
     | 0b110 ->
@@ -809,7 +791,7 @@ struct
                                            ; consumed = size_of_variable_length len
                                                         + size_of_offset offset
                                            ; crc
-                                           ; z = Inflate.flush 0 (B.length t.o_z)
+                                           ; z = Inflate.flush 0 (Cstruct.len t.o_z)
                                                  @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                                  @@ Inflate.default (Window.reset t.o_w)
                                            ; h = H.default len (H.Offset offset) } })
@@ -820,15 +802,16 @@ struct
         (fun hash src t ->
           Cont { t with state = Hunks { offset   = off
                                       ; length   = len
-                                      ; consumed = 20 + size_of_variable_length len
+                                      ; consumed = Hash.size + size_of_variable_length len
                                       ; crc
-                                      ; z = Inflate.flush 0 (B.length t.o_z)
+                                      ; z = Inflate.flush 0 (Cstruct.len t.o_z)
                                             @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
                                             @@ Inflate.default (Window.reset t.o_w)
                                       ; h = H.default len (H.Hash hash) } })
         src t
     | _  -> error t (Invalid_kind typ)
 
+  (* TODO: check the hash procuded and the hash noticed. *)
   let checksum src t =
     KChecksum.get_hash
       (fun hash src t -> ok t hash)
@@ -848,7 +831,10 @@ struct
   let unzip src t offset length consumed crc kind z =
     let open Decompress in
 
-    match Inflate.eval (B.Bigstring (Cstruct.to_bigarray src)) t.o_z z with
+    let dst' = B.from_bigstring (Cstruct.to_bigarray t.o_z) in
+    let src' = B.from_bigstring (Cstruct.to_bigarray src) in
+
+    match Inflate.eval src' dst' z with
     | `Await z ->
       let crc = Crc32.digest ~off:(t.i_off + t.i_pos) ~len:(Inflate.used_in z) crc src in
       let consumed = consumed + Inflate.used_in z in
@@ -911,14 +897,13 @@ struct
      @@ version)
     src t
 
-  let default z_tmp z_win h_tmp =
+  let default z_tmp z_win =
     { i_off   = 0
     ; i_pos   = 0
     ; i_len   = 0
     ; local   = false
     ; o_z     = z_tmp
     ; o_w     = z_win
-    ; o_h     = h_tmp
     ; read    = 0L
     ; version = 0l
     ; objects = 0l
@@ -932,21 +917,18 @@ struct
     in
     loop 1 (vl lsr 4) (* avoid type and msb *)
 
-  let from_window window win_offset z_tmp z_win h_tmp =
+  let from_window window win_offset z_tmp z_win =
     { i_off   = 0
     ; i_pos   = 0
     ; i_len   = 0
     ; local   = true
     ; o_z     = z_tmp
     ; o_w     = z_win
-    ; o_h     = h_tmp
     ; read    = Int64.add window.Window.off (Int64.of_int win_offset)
     ; version = 0l
     ; objects = 1l
     ; counter = 1l
     ; state   = Object kind }
-
-  let sp = Format.sprintf
 
   let refill off len t =
     if (t.i_len - t.i_pos) = 0
@@ -973,7 +955,7 @@ struct
          | _ -> { t with i_off = off
                        ; i_len = len
                        ; i_pos = 0 }
-    else raise (Invalid_argument (sp "P.refill: you lost something (pos: %d, len: %d)" t.i_pos t.i_len))
+    else raise (Invalid_argument (Format.sprintf "P.refill: you lost something (pos: %d, len: %d)" t.i_pos t.i_len))
 
   let flush off len t = match t.state with
     | Unzip { offset; length; consumed; crc; kind; z } ->
@@ -987,9 +969,7 @@ struct
 
   let output t = match t.state with
     | Unzip { z; _ } ->
-      (match t.o_z with Decompress.B.Bigstring bs -> Cstruct.of_bigarray bs), Decompress.Inflate.used_out z
-    | Hunks { h; _ } ->
-      (match t.o_h with Decompress.B.Bigstring bs -> Cstruct.of_bigarray bs), 0
+      t.o_z, Decompress.Inflate.used_out z
     | _ -> raise (Invalid_argument "P.output: bad state")
 
   let next_object t = match t.state with
@@ -1007,6 +987,8 @@ struct
     | _ -> raise (Invalid_argument "P.kind: bad state")
 
   let length t = match t.state with
+    | Unzip { length; _ } -> length
+    | Hunks { length; _ } -> length
     | Next { length; _ } -> length
     | _ -> raise (Invalid_argument "P.length: bad state")
 
@@ -1061,11 +1043,11 @@ end
 
 module D (Mapper : MAPPER) =
 struct
-  type error = ..
-  type error += Invalid_hash of string
-  type error += Invalid_offset of int64
-  type error += Invalid_target of (int * int)
-  type error += Unpack_error of P.error
+  type error =
+    | Invalid_hash of string
+    | Invalid_offset of int64
+    | Invalid_target of (int * int)
+    | Unpack_error of P.error
 
   let pp = Format.fprintf
 
@@ -1080,12 +1062,12 @@ struct
     | Unpack_error exn ->
       Format.fprintf fmt "(Unpack_error %a)" P.pp_error exn
 
-  type 'a t =
+  type t =
     { file  : Mapper.fd
     ; max   : int64
     ; win   : Window.t Bucket.t
-    ; idx   : 'a. ('a, [ `SHA1 ]) Hash.t -> (Crc32.t * int64) option
-    ; hash  : ([ `PACK ], [ `SHA1 ]) Hash.t }
+    ; idx   : string -> (Crc32.t * int64) option
+    ; hash  : string }
 
   let is_hunk t = match P.kind t with
     | P.Hunk _ -> true
@@ -1099,14 +1081,11 @@ struct
       ; offset   : Int64.t
       ; length   : int
       ; consumed : int }
-
-    let is_hunk { kind; _ } = match kind with
-      | P.Hunk _ -> true
-      | _ -> false
   end
 
-  let apply hunks base =
-    let raw = Cstruct.create hunks.H.target_length in
+  let apply hunks base raw =
+    if Cstruct.len raw < hunks.H.target_length
+    then raise (Invalid_argument "D.apply");
 
     let target_length = List.fold_left
        (fun acc -> function
@@ -1119,7 +1098,7 @@ struct
 
       if (target_length = hunks.H.target_length)
       then Ok Base.{ kind     = base.kind
-                   ; raw      = raw
+                   ; raw      = Cstruct.sub raw 0 target_length
                    ; offset   = base.offset
                    ; length   = target_length
                    ; consumed = base.consumed }
@@ -1145,7 +1124,10 @@ struct
 
       let () = Bucket.add t.win window in window, relative_offset
 
-  let delta ?(chunk_size = 0x8000) t hunks offset_of_hunks z_tmp z_win h_tmp =
+  let delta ?(chunk = 0x800) t hunks offset_of_hunks z_tmp z_win r_tmp =
+    if Cstruct.len r_tmp < hunks.H.source_length
+    then raise (Invalid_argument (Format.sprintf "D.delta: expect %d and have %d" hunks.H.source_length (Cstruct.len r_tmp)));
+
     let absolute_offset = match hunks.H.reference with
       | H.Offset off ->
         if off < t.max && off >= 0L
@@ -1159,38 +1141,37 @@ struct
     match absolute_offset with
     | Ok absolute_offset ->
       let window, relative_offset = find t absolute_offset in
-      let state    = P.from_window window relative_offset z_tmp z_win h_tmp in
-      let base_raw = Cstruct.create hunks.H.source_length in
+      let state    = P.from_window window relative_offset z_tmp z_win in
 
-      let rec loop window consumed_in_window writted_in_raw git_object state =
+      let rec loop window consumed_in_window writed_in_raw git_object state =
         match P.eval window.Window.raw state with
         | `Await state ->
-          let rest_in_window = min (window.Window.len - consumed_in_window) chunk_size in
+          let rest_in_window = min (window.Window.len - consumed_in_window) chunk in
 
           if rest_in_window > 0
           then
             loop window
-              (consumed_in_window + rest_in_window) writted_in_raw git_object
+              (consumed_in_window + rest_in_window) writed_in_raw git_object
               (P.refill consumed_in_window rest_in_window state)
           else
             let window, relative_offset = find t Int64.(window.Window.off + (of_int consumed_in_window)) in
             (* XXX(dinosaure): we try to find a new window to compute the rest of the current object. *)
             loop window
               relative_offset
-              writted_in_raw
+              writed_in_raw
               git_object
               (P.refill 0 0 state)
         | `Flush state ->
           let o, n = P.output state in
-          Cstruct.blit o 0 base_raw writted_in_raw n;
-          loop window consumed_in_window (writted_in_raw + n) git_object (P.flush 0 n state)
+          Cstruct.blit o 0 r_tmp writed_in_raw n;
+          loop window consumed_in_window (writed_in_raw + n) git_object (P.flush 0 n state)
         | `Object state ->
-          loop window consumed_in_window writted_in_raw
+          loop window consumed_in_window writed_in_raw
             (Some (P.kind state,
-                    P.offset state,
-                    P.length state,
-                    P.consumed state))
-            (P.next_object state) (* XXX *)
+                   P.offset state,
+                   P.length state,
+                   P.consumed state))
+            (P.next_object state)
         | `Error (state, exn) ->
           Error (Unpack_error exn)
         | `End (state, _) ->
@@ -1200,93 +1181,187 @@ struct
           | None -> assert false
           (* XXX: This is not possible, the [`End] state comes only after the
                   [`Object] state and this state changes [kind] to [Some x].
-            *)
+           *)
       in
 
       (match loop window relative_offset 0 None state with
         | Ok (base_kind, base_offset, base_length, base_consumed) ->
           Ok Base.{ kind     = base_kind
-                  ; raw      = base_raw
+                  ; raw      = Cstruct.sub r_tmp 0 base_length
                   ; offset   = base_offset
                   ; length   = base_length
                   ; consumed = base_consumed }
         | Error exn -> Error exn)
     | Error exn -> Error exn
 
-  let make ?(bulk = 10) file (idx : string -> (Crc32.t * int64) option) =
+  let make ?(bucket = 10) file (idx : string -> (Crc32.t * int64) option) =
     { file
     ; max  = Mapper.length file
-    ; win  = Bucket.make bulk
+    ; win  = Bucket.make bucket
     ; idx  = idx
     ; hash = "" (* TODO *) }
 
-  let get ?(chunk_size = 0x800) t hash z_tmp z_win h_tmp =
-    (* XXX(dinosaure): we can avoid the [BBuffer] in this compute but we need to
-                       assert than the bigarray sended by the user has a good
-                       size. The variable-length is the canonic length needed to
-                       store the git object (after application of delta). TODO!
-     *)
-
-    match t.idx hash with
-    | Some (crc, absolute_offset) ->
+  (* XXX(dinosaure): this function returns the max length needed to undelta-ify a PACK object. *)
+  let needed ?(chunk = 0x800) t hash z_tmp z_win =
+    let get absolute_offset =
       let window, relative_offset = find t absolute_offset in
-      let state  = P.from_window window relative_offset z_tmp z_win h_tmp in
-      let buffer = BBuffer.create chunk_size in
+      let state = P.from_window window relative_offset z_tmp z_win in
 
-      let rec loop window consumed_in_window writted_in_raw git_object state =
+      let rec loop window consumed_in_window state =
         match P.eval window.Window.raw state with
         | `Await state ->
-          let rest_in_window = min (window.Window.len - consumed_in_window) chunk_size in
+          let rest_in_window = min (window.Window.len - consumed_in_window) chunk in
 
           if rest_in_window > 0
           then
             loop window
               (consumed_in_window + rest_in_window)
-              writted_in_raw
+              (P.refill consumed_in_window rest_in_window state)
+          else
+            let window, relative_offset = find t Int64.(window.Window.off + (of_int consumed_in_window)) in
+
+            loop window
+              relative_offset
+              (P.refill 0 0 state)
+        | `Flush state ->
+          `Direct (P.length state)
+        | `Object state ->
+          (match P.kind state with
+           | P.Hunk ({ H.reference = H.Offset off; _ } as hunks) ->
+             `IndirectOff (off, P.offset state, max hunks.H.target_length hunks.H.source_length)
+           | P.Hunk ({ H.reference = H.Hash hash; _ } as hunks) ->
+             `IndirectHash (hash, max hunks.H.target_length hunks.H.source_length)
+           | _ -> `Direct (P.length state))
+        | `Error (state, exn) -> `Error (Unpack_error exn)
+        | `End (state, _) -> assert false
+      in
+
+      loop window relative_offset state
+    in
+
+    let rec loop length = function
+      | `IndirectHash (hash, length') ->
+        (match t.idx hash with
+         | Some (_, off) -> loop (max length length') (get off)
+         | None -> Error (Invalid_hash hash))
+      | `IndirectOff (off, off_of_hunks, length') ->
+        (if off < t.max && off >= 0L
+         then loop (max length length') (get (Int64.sub off_of_hunks off))
+         else Error (Invalid_offset off))
+      | `Direct length' -> Ok (max length length')
+      | `Error exn -> Error exn
+    in
+
+    loop 0 (`IndirectHash (hash, 0))
+
+  (* XXX(dinosaure): Need an explanation. This function does not allocate any
+                     [Cstruct.t]. The purpose of this function is to get a git
+                     object from a PACK file (represented by [t]). The user
+                     requests the git object by the [hash].
+
+                     Then, to get the git object, we need 4 buffers.
+                     - One to store the inflated PACK object
+                     - The Window used to inflate the PACK object
+                     - Two buffer to undelta-ified the PACK object
+
+                     We can have 2 two cases in this function:
+                     - We get directly the git object (so, we just need to
+                       inflate the PACK object)
+                     - We get a {!H.hunks} object. In this case, we need to
+                       undelta-ified the object
+
+                     So, we use 2 [Cstruct.t] and swap themselves for each
+                     undelta-ification. Then, we return a {!Base.t} git object
+                     and return the true [Cstruct.t].
+
+                     However, to be clear, this function allocates some buffers
+                     but in same way as [git]. To read a PACK file, we need to
+                     allocate a buffer which contains the data of the PACK file.
+                     It's the purpose of the {!MAPPER} module.
+
+                     So, we [mmap] a part of the PACK file (a part of [1024 *
+                     1024] bytes) which contains the offset of the PACK object
+                     requested - it's a {!Window.t}. Then, we compute the
+                     deserialization of the PACK object (note: sometimes, the
+                     {!Window.t} is not sufficient to deserialize the PACK
+                     object requested, so we allocate a new {!Window.t} which
+                     contains the rest of the PACK object).
+
+                     Finally, we limit the number of {!Window.t} available by 10
+                     (value by default) and limit the allocation. Hopefully, we
+                     amortized the allocation because, for one {!Window.t}, we
+                     can compute some PACK objects.
+   *)
+  let optimized_get ?(chunk = 0x800) t hash (raw0, raw1, length) z_tmp z_win =
+    let get_free_raw = function
+      | true -> raw0
+      | false -> raw1
+    in
+
+    match t.idx hash with
+    | None -> Error (Invalid_hash hash)
+    | Some (crc, absolute_offset) ->
+      let window, relative_offset = find t absolute_offset in
+      let state  = P.from_window window relative_offset z_tmp z_win in
+
+      let rec loop window consumed_in_window writed_in_raw swap git_object state =
+        match P.eval window.Window.raw state with
+        | `Await state ->
+          let rest_in_window = min (window.Window.len - consumed_in_window) chunk in
+
+          if rest_in_window > 0
+          then
+            loop window
+              (consumed_in_window + rest_in_window)
+              writed_in_raw
+              swap
               git_object
               (P.refill consumed_in_window rest_in_window state)
           else
             let window, relative_offset = find t Int64.(window.Window.off + (of_int consumed_in_window)) in
-            (* XXX(dinosaure): we try to find a new window to compute the rest of the current object. *)
+
             loop window
               relative_offset
-              writted_in_raw
+              writed_in_raw
+              swap
               git_object
               (P.refill 0 0 state)
-        | `Flush t ->
-          let o, n = P.output t in
-          let ()   = BBuffer.add o ~len:n buffer in
-          loop window consumed_in_window (writted_in_raw + n) git_object (P.flush 0 n t)
+        | `Flush state ->
+          let o, n = P.output state in
+          Cstruct.blit o 0 (get_free_raw swap) writed_in_raw n;
+          loop window consumed_in_window (writed_in_raw + n) swap git_object (P.flush 0 (Cstruct.len o) state)
         | `Object state ->
           (match P.kind state with
            | P.Hunk hunks ->
              let (rlength, rconsumed, roffset) = P.length state, P.consumed state, P.offset state in
 
-             let rec undelta ?(level = 1) hunks offset =
-               match delta t hunks offset z_tmp z_win h_tmp with
+             let rec undelta ?(level = 1) hunks offset swap =
+               match delta ~chunk t hunks offset z_tmp z_win (get_free_raw swap) with
                | Error exn -> Error exn
                | Ok { Base.kind = P.Hunk hunks; offset; _ } ->
-                 (match undelta ~level:(level + 1) hunks offset with
+                 (match undelta ~level:(level + 1) hunks offset (not swap) with
                   | Ok (base, level) ->
-                    (match apply hunks base with
-                     | Ok base -> Ok (base, level)
+                    (match apply hunks base (get_free_raw swap) with
+                     | Ok base ->
+                       Ok (base, level)
                      | Error exn -> Error exn)
                   | Error exn -> Error exn)
-               | Ok base -> Ok (base, level)
+               | Ok base ->
+                 Ok (base, level)
              in
 
-             (match undelta hunks (P.offset state) with
+             (match undelta hunks (P.offset state) swap with
               | Ok (base, level) ->
-                (match apply hunks base with
+                (match apply hunks base (get_free_raw (not swap)) with
                  | Ok base ->
-                   loop window consumed_in_window writted_in_raw
-                     (Some (base.Base.kind, Some base.Base.raw, roffset, rlength, rconsumed))
+                   loop window consumed_in_window writed_in_raw swap
+                     (Some (base.Base.kind, Cstruct.sub base.Base.raw 0 base.Base.length, roffset, base.Base.length, rconsumed))
                      (P.next_object state)
-                 | Error exn -> Error exn)
+                | Error exn -> Error exn)
               | Error exn -> Error exn)
            | kind ->
-             loop window consumed_in_window writted_in_raw
-               (Some (kind, None, P.offset state, P.length state, P.consumed state))
+             loop window consumed_in_window writed_in_raw (not swap)
+               (Some (kind, (get_free_raw swap), P.offset state, P.length state, P.consumed state))
                (P.next_object state))
         | `Error (state, exn) ->
           Error (Unpack_error exn)
@@ -1296,19 +1371,20 @@ struct
           | None -> assert false
       in
 
-      (match loop window relative_offset 0 None state with
-       | Ok (kind, None, offset, length, consumed) ->
-         Ok Base.{ kind
-                 ; raw = BBuffer.contents buffer
-                 ; offset
-                 ; length
-                 ; consumed }
-       | Ok (kind, Some raw, offset, length, consumed) ->
-         Ok Base.{ kind
-                 ; raw
-                 ; offset
-                 ; length
-                 ; consumed }
-       | Error exn -> Error exn)
-    | None -> Error (Invalid_hash hash)
+      match loop window relative_offset 0 true None state with
+      | Ok (kind, raw, offset, length, consumed) ->
+        Ok Base.{ kind
+                ; raw
+                ; offset
+                ; length
+                ; consumed }
+      | Error exn -> Error exn
+
+  let get ?chunk t hash z_tmp z_win =
+    match needed t hash z_tmp z_win with
+    | Error exn -> Error exn
+    | Ok length ->
+      let tmp = Cstruct.create length, Cstruct.create length, length in
+
+      optimized_get ?chunk t hash tmp z_tmp z_win
 end
