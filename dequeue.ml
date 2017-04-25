@@ -137,7 +137,6 @@ let take_back_node n = match n.cell with
   | Two (x, y) -> n.cell <- One x; y
   | Three (x, y, z) -> n.cell <- Two (x, y); z
 
-
 let take_back d =
   if is_empty d
   then raise Empty

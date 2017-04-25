@@ -19,6 +19,20 @@ let pp_option pp_data fmt = function
   | Some v -> pp_data fmt v
   | None -> Format.pp_print_string fmt "<none>"
 
+module type HASH =
+sig
+  type t
+
+  val length : int
+  val pp : Format.formatter -> t -> unit
+
+  val of_pp_string : string -> t
+  val to_pp_string : t -> string
+
+  val of_string : string -> t
+  val to_string : t -> string
+end
+
 module Int64 =
 struct
   include Int64
@@ -138,11 +152,11 @@ struct
   end
 end
 
-module Commit =
+module Commit (Hash : HASH) =
 struct
   type t =
-    { tree      : ([ `Tree ],   [ `SHA1 ]) Hash.t
-    ; parents   : ([ `Commit ], [ `SHA1 ]) Hash.t list
+    { tree      : Hash.t
+    ; parents   : Hash.t list
     ; author    : User.t
     ; committer : User.t
     ; message   : string  }
@@ -166,9 +180,9 @@ struct
     let open Int64 in
 
     let parents =
-      List.fold_left (fun acc _ -> (string "parent") + 1L + (of_int (Hash.size * 2)) + 1L + acc) 0L t.parents
+      List.fold_left (fun acc _ -> (string "parent") + 1L + (of_int (Hash.length * 2)) + 1L + acc) 0L t.parents
     in
-    (string "tree") + 1L + (of_int (Hash.size * 2)) + 1L
+    (string "tree") + 1L + (of_int (Hash.length * 2)) + 1L
     + parents
     + (string "author") + 1L + (User.raw_length t.author) + 1L
     + (string "committer") + 1L + (User.raw_length t.committer) + 1L
@@ -197,8 +211,8 @@ struct
       >>= fun author    -> binding ~key:"committer" ~value:User.Decoder.user
                            <* commit
       >>= fun committer -> commit
-      *>  return { tree = Hash.from_pp ~sentinel:`Tree tree
-                 ; parents = List.map (Hash.from_pp ~sentinel:`Commit) parents
+      *>  return { tree = Hash.of_pp_string tree
+                 ; parents = List.map Hash.of_pp_string parents
                  ; author
                  ; committer
                  ; message = "" }
@@ -228,7 +242,7 @@ struct
     let sp = ' '
     let lf = '\x0a'
 
-    let parents e x = eval e [ string $ "parent"; char $ sp; !!string ] (Hash.to_pp x)
+    let parents e x = eval e [ string $ "parent"; char $ sp; !!string ] (Hash.to_pp_string x)
 
     let predicate f w e x =
       if f x
@@ -245,7 +259,7 @@ struct
              ; string $ "author"; char $ sp; !!User.Encoder.user; char $ lf
              ; string $ "committer"; char $ sp; !!User.Encoder.user; char $ lf
              ; !!string ]
-        (Hash.to_pp t.tree)
+        (Hash.to_pp_string t.tree)
         (match t.parents with [] -> None | lst -> Some (lst, ()))
         t.author
         t.committer
@@ -253,12 +267,12 @@ struct
   end
 end
 
-module Tree =
+module Tree (Hash : HASH) =
 struct
   type entry =
     { perm : perm
     ; name : string
-    ; node : 'a. ('a, [ `SHA1 ]) Hash.t }
+    ; node : Hash.t }
   and perm =
     [ `Normal | `Everybody | `Exec | `Link | `Dir | `Commit ]
   and t = entry list
@@ -304,7 +318,7 @@ struct
     let open Int64 in
 
     let entry acc x =
-      (string (string_of_perm x.perm)) + 1L + (string x.name) + 1L + (of_int Hash.size) + acc
+      (string (string_of_perm x.perm)) + 1L + (string x.name) + 1L + (of_int Hash.length) + acc
     in
     List.fold_left entry 0L t
 
@@ -356,7 +370,7 @@ struct
       >>= fun hash ->
         return { perm
                ; name
-               ; node = (hash : ([ `Unknow ], [ `SHA1 ]) Hash.t) }
+               ; node = Hash.of_string hash }
       <* commit
 
     let tree = many entry
@@ -391,7 +405,7 @@ struct
                                   in git and if I escape like ocaml-git, the
                                   SHA1 is different.
                 *)
-        t.node
+        (Hash.to_string t.node)
 
     let tree e t =
       (list entry) e t
@@ -416,10 +430,10 @@ struct
   end
 end
 
-module Tag =
+module Tag (Hash : HASH) =
 struct
   type t =
-    { obj     : 'a. ('a, [ `SHA1 ]) Hash.t
+    { obj     : Hash.t
     ; kind    : kind
     ; tag     : string
     ; tagger  : User.t option
@@ -461,7 +475,7 @@ struct
       | Some user -> (string "tagger") + 1L + (User.raw_length user) + 1L
       | None -> 0L
     in
-    (string "object") + 1L + (of_int (Hash.size * 2)) + 1L
+    (string "object") + 1L + (of_int (Hash.length * 2)) + 1L
     + (string "type") + 1L + (string (string_of_kind t.kind)) + 1L
     + (string "tag") + 1L + (string t.tag) + 1L
     + user_length
@@ -488,12 +502,6 @@ struct
       = fun ~key ~value ->
       string key *> sp *> value <* lf
 
-    let sentinel_from_kind = function
-      | Blob   -> `Blob
-      | Commit -> `Commit
-      | Tree   -> `Tree
-      | Tag    -> `Tag
-
     let tag =
       binding ~key:"object" ~value:obj <* commit
       >>= fun obj    -> binding ~key:"type" ~value:kind
@@ -505,7 +513,7 @@ struct
                                  >>= fun user -> return (Some user)))
                         <* commit
       >>= fun tagger -> take 1 *> commit *>
-        return { obj = Hash.from_pp ~sentinel:(sentinel_from_kind kind) obj
+        return { obj = Hash.of_pp_string obj
                ; kind
                ; tag
                ; tagger
@@ -550,7 +558,7 @@ struct
              ; string $ "tag"; char $ sp; !!string; char $ lf
              ; !!(option tagger); char $ lf
              ; !!string ]
-        (Hash.to_pp t.obj)
+        (Hash.to_pp_string t.obj)
         (string_of_kind t.kind)
         t.tag
         t.tagger

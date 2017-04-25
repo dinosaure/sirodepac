@@ -8,20 +8,18 @@ sig
   val pp : Format.formatter -> t -> unit
 end
 
+type 'key hashtbl = (module Hashtbl.S with type key = 'key)
+
 val get_matching_blocks :
+  hashtbl:'b hashtbl ->
   transform:('a -> 'b)
   -> compare:('b -> 'b -> int)
   -> a:'a array
   -> b:'a array
   -> MatchingBlock.t list
 
-val get_matching_blocks_bigarray :
-  compare:(char -> char -> int)
-  -> a:(char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
-  -> b:(char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
-  -> MatchingBlock.t list
-
 val matches :
+  hashtbl:'a hashtbl ->
   compare:('a -> 'a -> int)
   -> 'a array
   -> 'a array
@@ -56,6 +54,7 @@ sig
 end
 
 val get_hunks :
+  hashtbl:'b hashtbl ->
   transform:('a -> 'b)
   -> compare:('b -> 'b -> int)
   -> context:int

@@ -1,4 +1,4 @@
 B _build
 S .
 
-PKG decompress cstruct nocrypto angstrom faraday farfadet
+PKG decompress cstruct nocrypto angstrom faraday farfadet digestif

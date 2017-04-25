@@ -165,7 +165,9 @@ struct
     let findi_from_left piles x =
       let last_pile  = Piles.nth piles 0 `Right in (* first, see if any work. *)
 
-      let dummy_pile = Pile.create { BackPointers.value = (x, 0)
+      let dummy_pile
+        : OrderedSequence.elt BackPointers.t Stack.t
+        = Pile.create { BackPointers.value = (x, 0)
                                    ; tag = None } in
       (* dummy pile used for comparisons. *)
 
@@ -281,64 +283,34 @@ let longest_increasing_subsequence ar =
    loop [] m.(!maxlen)
   end
 
+type 'key hashtbl = (module Hashtbl.S with type key = 'key)
+
 (* patience diff algorithm by Bram Cohen as seen in Bazaar.1.14.1 *)
-let unique_lcs (alpha, alo, ahi) (bravo, blo, bhi) =
-  let unique = Hashtbl.create (min (ahi - alo) (bhi - blo)) in
+let unique_lcs (type elt) ~(hashtbl:elt hashtbl) (alpha, alo, ahi) (bravo, blo, bhi) =
+  let module H = (val hashtbl) in
+  let unique = H.create (min (ahi - alo) (bhi - blo)) in
 
   for i = alo to ahi - 1
   do
     let x = alpha.(i) in
-    try let _ = Hashtbl.find unique x in
-      Hashtbl.replace unique x `Neg
-    with Not_found -> Hashtbl.replace unique x (`UIA i)
+
+    try let _ = H.find unique x in
+      H.replace unique x `Neg
+    with Not_found -> H.replace unique x (`UIA i)
   done;
 
   for i = blo to bhi - 1
   do
     let x = bravo.(i) in
-    try match Hashtbl.find unique x with
+    try match H.find unique x with
       | `Neg -> ()
-      | `UIA i_a -> Hashtbl.replace unique x (`UIAB (i_a, i))
-      | `UIAB (i_a, i_b) -> Hashtbl.replace unique x `Neg
+      | `UIA i_a -> H.replace unique x (`UIAB (i_a, i))
+      | `UIAB (i_a, i_b) -> H.replace unique x `Neg
     with Not_found -> ()
   done;
 
   let diff =
-    let unique = Hashtbl.fold
-        (fun key value acc -> match value with
-           | `UIAB i_a_b -> i_a_b :: acc
-           | `Neg | `UIA _ -> acc)
-        unique []
-    in
-
-    OrderedSequence.create unique
-  in
-
-  Patience.longest_increasing_subsequence diff
-
-let unique_lcs_bigarray (alpha, alo, ahi) (bravo, blo, bhi) =
-  let unique = Hashtbl.create (min (ahi - alo) (bhi - blo)) in
-
-  for i = alo to ahi - 1
-  do
-    let x = A.get alpha (i) in
-    try let _ = Hashtbl.find unique x in
-      Hashtbl.replace unique x `Neg
-    with Not_found -> Hashtbl.replace unique x (`UIA i)
-  done;
-
-  for i = blo to bhi - 1
-  do
-    let x = A.get bravo (i) in
-    try match Hashtbl.find unique x with
-      | `Neg -> ()
-      | `UIA i_a -> Hashtbl.replace unique x (`UIAB (i_a, i))
-      | `UIAB (i_a, i_b) -> Hashtbl.replace unique x `Neg
-    with Not_found -> ()
-  done;
-
-  let diff =
-    let unique = Hashtbl.fold
+    let unique = H.fold
         (fun key value acc -> match value with
            | `UIAB i_a_b -> i_a_b :: acc
            | `Neg | `UIA _ -> acc)
@@ -363,7 +335,7 @@ let unique_lcs_bigarray (alpha, alo, ahi) (bravo, blo, bhi) =
    I couldn't figure out how to do this efficiently in a functionnal way, so
    this is pretty much a straight translation of the original Python code.
 *)
-let matches ~compare alpha bravo =
+let matches (type elt) ~(hashtbl:elt hashtbl) ~compare alpha bravo =
   let matches_ref_length = ref 0 in
   let matches_ref        = ref [] in
 
@@ -380,7 +352,7 @@ let matches ~compare alpha bravo =
       let last_a_pos = ref (alo - 1) in
       let last_b_pos = ref (blo - 1) in
 
-      unique_lcs (alpha, alo, ahi) (bravo, blo, bhi)
+      unique_lcs ~hashtbl (alpha, alo, ahi) (bravo, blo, bhi)
       |> List.iter
         (fun (apos, bpos) ->
            if !last_a_pos + 1 <> apos || !last_b_pos + 1 <> bpos
@@ -428,73 +400,6 @@ let matches ~compare alpha bravo =
     end
   in
   recurse_matches 0 0 (Array.length alpha) (Array.length bravo);
-  List.rev !matches_ref
-
-let matches_bigarray ~compare alpha bravo =
-  let matches_ref_length = ref 0 in
-  let matches_ref        = ref [] in
-
-  let add_match m =
-    incr matches_ref_length;
-    matches_ref := m :: !matches_ref
-  in
-
-  let rec recurse_matches alo blo ahi bhi =
-    let old_left = !matches_ref_length in
-
-    if not (alo >= ahi || blo >= bhi)
-    then begin
-      let last_a_pos = ref (alo - 1) in
-      let last_b_pos = ref (blo - 1) in
-
-      unique_lcs_bigarray (alpha, alo, ahi) (bravo, blo, bhi)
-      |> List.iter
-        (fun (apos, bpos) ->
-           if !last_a_pos + 1 <> apos || !last_b_pos + 1 <> bpos
-           then recurse_matches (!last_a_pos + 1) (!last_b_pos + 1) apos bpos;
-
-           last_a_pos := apos;
-           last_b_pos := bpos;
-           add_match (apos, bpos));
-
-      if !matches_ref_length > old_left
-      then recurse_matches (!last_a_pos + 1) (!last_b_pos + 1) ahi bhi
-      else if (compare (A.get alpha (alo)) (A.get bravo (blo)) = 0)
-      then begin
-        let alo = ref alo in
-        let blo = ref blo in
-
-        while (!alo < ahi && !blo < bhi && (compare (A.get alpha (!alo)) (A.get bravo (!blo)) = 0))
-        do
-          add_match (!alo, !blo);
-          incr alo;
-          incr blo;
-        done;
-
-        recurse_matches !alo !blo ahi bhi
-      end else if (compare (A.get alpha (ahi - 1)) (A.get bravo (bhi - 1)) = 0)
-      then begin
-        let nahi = ref (ahi - 1) in
-        let nbhi = ref (bhi - 1) in
-
-        while (!nahi > alo && !nbhi > blo && compare (A.get alpha (!nahi - 1)) (A.get bravo (!nbhi - 1)) = 0)
-        do
-          decr nahi;
-          decr nbhi;
-        done;
-
-        recurse_matches (!last_a_pos + 1) (!last_b_pos + 1) !nahi !nbhi;
-
-        for i = 0 to (ahi - !nahi - 1)
-        do add_match (!nahi + i, !nbhi + i) done
-      end else
-        PlainDiff.iter_matches_bigarray
-          (A.sub alpha alo (ahi - alo))
-          (A.sub bravo blo (bhi - blo))
-          (fun (i1, i2) -> add_match (alo + i1, blo + i2))
-    end
-  in
-  recurse_matches 0 0 (A.dim alpha) (A.dim bravo);
   List.rev !matches_ref
 
 module MatchingBlock =
@@ -552,24 +457,14 @@ let collapse_sequences matches =
 
   List.rev !collapsed
 
-let get_matching_blocks ~transform ~compare ~a ~b =
+let get_matching_blocks (type elt) ~(hashtbl:elt hashtbl) ~transform ~compare ~a ~b =
   let a = Array.map transform a in
   let b = Array.map transform b in
 
-  let matches = matches ~compare a b |> collapse_sequences in
+  let matches = matches ~hashtbl ~compare a b |> collapse_sequences in
   let last =
     { MatchingBlock.a_start = Array.length a
     ; b_start = Array.length b
-    ; length = 0 }
-  in
-
-  List.append matches [ last ]
-
-let get_matching_blocks_bigarray ~compare ~a ~b =
-  let matches = matches_bigarray ~compare a b |> collapse_sequences in
-  let last =
-    { MatchingBlock.a_start = A.dim a
-    ; b_start = A.dim b
     ; length = 0 }
   in
 
@@ -656,7 +551,7 @@ struct
       (pp_list (Range.pp ~sep:(fun fmt -> Format.fprintf fmt "@\n") pp_data)) hunk.ranges
 end
 
-let get_range_rev ~transform ~compare ~a ~b =
+let get_range_rev (type elt) ~(hashtbl:elt hashtbl) ~transform ~compare ~a ~b =
   let rec aux matching_blocks i j l =
     match matching_blocks with
     | x :: r ->
@@ -706,7 +601,7 @@ let get_range_rev ~transform ~compare ~a ~b =
     | [] -> List.rev l
   in
 
-  let matching_blocks = get_matching_blocks ~transform ~compare ~a ~b in
+  let matching_blocks = get_matching_blocks ~hashtbl ~transform ~compare ~a ~b in
   aux matching_blocks 0 0 []
 
 let all_same hunks =
@@ -716,8 +611,8 @@ let all_same hunks =
     | [] -> false
     | _ -> true
 
-let get_hunks ~transform ~compare ~context ~a ~b =
-  let ranges = get_range_rev ~transform ~compare ~a ~b in
+let get_hunks (type elt) ~(hashtbl:elt hashtbl) ~transform ~compare ~context ~a ~b =
+  let ranges = get_range_rev ~hashtbl ~transform ~compare ~a ~b in
 
   if context < 0
   then

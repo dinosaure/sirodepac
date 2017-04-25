@@ -1,5 +1,14 @@
 (** Unpack a PACK file. *)
 
+module type HASH =
+sig
+  type t
+
+  val pp : Format.formatter -> t -> unit
+  val length : int
+  val of_string : string -> t
+end
+
 (** Decoder of a Hunk object.
 
     Limitation: the Hunk object must be lower than [max_native_int]. The decoder
@@ -14,8 +23,10 @@
     TODO: we can optimize the decoder and avoid the allocaton of the [Insert]
     hunk. I can explain that only in my mind.
   *)
-module H :
+module type HunkDecoder =
 sig
+  module Hash : HASH
+
   (** Errors of the decoder. *)
   type error =
     | Reserved_opcode of int
@@ -41,7 +52,7 @@ sig
     }
   and reference =
     | Offset of int64 (** Absolute offset of the base object. *)
-    | Hash of string (** Hash of the base object. *)
+    | Hash of Hash.t (** Hash of the base object. *)
   and hunk =
     | Insert of Cstruct.t
       (** When we apply the base object, we need to write the [Cstruct.t] raw. *)
@@ -141,8 +152,11 @@ end
     TODO: because the {! Hunk.t} decoder can be optimized to not allocate any
     [Cstruct.t], this decoder need to follow this optimization.
   *)
-module P :
+module type PACKDecoder =
 sig
+  module Hash        : HASH
+  module HunkDecoder : HunkDecoder
+
   type error =
     | Invalid_byte of int
       (** Appears when the header of the PACK file is wrong. *)
@@ -354,7 +368,7 @@ end
     understrand what is going on, you can read the code (some comments is
     available inside).
   *)
-module D (Mapper: MAPPER) :
+module Decoder :
 sig
   type error =
     | Invalid_hash of string
@@ -363,7 +377,7 @@ sig
       (** Appears when the given offset is not available inside the PACK file. *)
     | Invalid_target of (int * int)
       (** Appears when the result of the application of a {H.hunks} returns a bad raw. *)
-    | Unpack_error of P.error
+    | Unpack_error of PACKDecoder.error
       (** Appears when we have an {!P.error}. *)
 
   val pp_error : Format.formatter -> error -> unit

@@ -1,5 +1,3 @@
-module BBuffer = Unpack.BBuffer
-
 let pp_list ?(sep = (fun fmt () -> ()) )pp_data fmt lst =
   let rec aux = function
     | [] -> ()
@@ -7,7 +5,7 @@ let pp_list ?(sep = (fun fmt () -> ()) )pp_data fmt lst =
     | x :: r -> Format.fprintf fmt "%a%a" pp_data x sep (); aux r
   in aux lst
 
-let cstruct_pp fmt cs =
+let pp_cstruct fmt cs =
   Format.fprintf fmt "\"";
   for i = 0 to Cstruct.len cs - 1
   do if Cstruct.get_uint8 cs i > 32 && Cstruct.get_uint8 cs i < 127
@@ -16,6 +14,43 @@ let cstruct_pp fmt cs =
   done;
   Format.fprintf fmt "\""
 
+let pp_array pp_data fmt arr =
+  Format.fprintf fmt "[| @[<hov>%a@] |]"
+    (pp_list ~sep:(fun fmt () -> Format.fprintf fmt ";@ ") pp_data) (Array.to_list arr)
+
+module CstructKey : Hashtbl.HashedType with type t = Cstruct.t =
+struct
+  type t = Cstruct.t
+
+  let hash x =
+    Hashtbl.hash (Cstruct.to_string x)
+
+  let equal a b =
+    Cstruct.compare a b = 0
+end
+
+module CstructHashtbl = Hashtbl.Make(CstructKey)
+
+module type HASH =
+sig
+  type t = Rakia.Bi.t
+  type ctx
+  type buffer = Cstruct.buffer
+
+  val length : int
+  val pp : Format.formatter -> t -> unit
+
+  val init : unit -> ctx
+  val feed : ctx -> buffer -> unit
+  val get : ctx -> t
+
+  val of_pp_string : string -> t
+  val to_pp_string : t -> string
+
+  val of_string : string -> t
+  val to_string : t -> string
+end
+
 module Hunk =
 struct
   type t =
@@ -23,7 +58,7 @@ struct
     | Copy of int * int
 
   let pp fmt = function
-    | Insert cs -> Format.fprintf fmt "(Insert [%a])" cstruct_pp cs
+    | Insert cs -> Format.fprintf fmt "(Insert [%a])" pp_cstruct cs
     | Copy (off, len) -> Format.fprintf fmt "(Copy (%d, %d))" off len
 
   let count_copy =
@@ -41,8 +76,13 @@ struct
     in
 
     if Cstruct.compare res result <> 0
-    then Format.eprintf "production is wrong: @[<hov>%a@]\n%!"
-        (pp_list ~sep:(fun fmt () -> Format.fprintf fmt ";@ ") pp) hunks;
+    then
+      begin
+        Format.eprintf "production is wrong: @[<hov>%a@]\n%!"
+          (pp_list ~sep:(fun fmt () -> Format.fprintf fmt ";@ ") pp) hunks;
+        Format.eprintf "expect:\n%a\n%!" pp_cstruct result;
+        Format.eprintf "have:\n%a\n%!" pp_cstruct res;
+      end;
 
     assert (w = len);
     assert (Cstruct.compare res result = 0)
@@ -53,7 +93,6 @@ struct
     @@ List.map snd
     @@ Array.to_list a
 
-  (* XXX(dinosaure): need to be optimized (TODO). *)
   let split_to_127 acc cs =
     let rec aux acc current cs =
       if Cstruct.len (Array.get cs current) > 0x7F
@@ -80,6 +119,7 @@ struct
 
   let of_patience_diff hunk =
     List.fold_left (fun (off, acc) -> function
+        (* TODO:i use the [acc] of [split_to_127]. *)
         | Pdiff.Range.New a ->
           let lst = List.map (fun x -> Insert x) (split_to_127 [] a) in
           (off, lst @ acc)
@@ -137,11 +177,16 @@ struct
     | Tag -> Format.fprintf fmt "Tag"
 end
 
-module Entry =
+module Entry (Hash : HASH) =
 struct
+  module Commit = Minigit.Commit(Hash)
+  module Tree   = Minigit.Tree(Hash)
+  module Tag    = Minigit.Tag(Hash)
+  module Blob   = Minigit.Blob
+
   type t =
     { hash_name   : int
-    ; hash_object : string
+    ; hash_object : Hash.t
     ; name        : string option
     ; kind        : Kind.t
     ; length      : int64 }
@@ -176,10 +221,10 @@ struct
     !res
 
   type kind =
-    | Commit of Minigit.Commit.t
-    | Tree   of Minigit.Tree.t
-    | Tag    of Minigit.Tag.t
-    | Blob   of Minigit.Blob.t
+    | Commit of Commit.t
+    | Tree   of Tree.t
+    | Tag    of Tag.t
+    | Blob   of Blob.t
 
   let name entry = entry.name
 
@@ -192,33 +237,43 @@ struct
       ; hash_object
       ; name
       ; kind = Kind.Tag
-      ; length = Minigit.Tag.raw_length tag }
+      ; length = Tag.raw_length tag }
     | Commit commit ->
       { hash_name
       ; hash_object
       ; name
       ; kind = Kind.Commit
-      ; length = Minigit.Commit.raw_length commit }
+      ; length = Commit.raw_length commit }
     | Tree tree ->
       { hash_name
       ; hash_object
       ; name
       ; kind = Kind.Tree
-      ; length = Minigit.Tree.raw_length tree }
+      ; length = Tree.raw_length tree }
     | Blob blob ->
       { hash_name
       ; hash_object
       ; name
       ; kind = Kind.Blob
-      ; length = Minigit.Blob.raw_length blob }
+      ; length = Blob.raw_length blob }
 
-  let compare = Compare.lexicographic
-    [ (fun a b -> Compare.int (Kind.to_int a.kind) (Kind.to_int b.kind))
-    ; (fun a b -> Compare.int a.hash_name b.hash_name)
-    ; (fun a b -> Compare.int64 a.length b.length) ]
+  let compare a b =
+    if Kind.to_int a.kind > Kind.to_int b.kind
+    then (-1)
+    else if Kind.to_int a.kind < Kind.to_int b.kind
+    then 1
+    else if a.hash_name > b.hash_name
+    then (-1)
+    else if a.hash_name < b.hash_name
+    then 1
+    else if a.length > b.length
+    then (-1)
+    else if a.length < b.length
+    then 1
+    else Pervasives.compare a b
     (* XXX(dinosaure): git compare the preferred base and the memory address of
                        the object to take the newest. obviously, it's not possible
-                       to do this in OCaml.
+                       to do this in OCaml. Instead, we use [Pervasives.compare].
      *)
 
   let from_commit hash commit =
@@ -233,8 +288,6 @@ struct
   let from_blob hash ?path:name blob =
     make hash ?name (Blob blob)
 end
-
-let sp = Format.sprintf
 
 module Int32 =
 struct
@@ -255,7 +308,7 @@ struct
   let ( << ) = Int64.shift_left (* >> (tuareg) *)
 end
 
-module H =
+module MakeHunkEncoder (Hash : HASH) =
 struct
   type error = ..
 
@@ -274,7 +327,7 @@ struct
     ; state         : state }
   and reference =
     | Offset of int64
-    | Hash of string
+    | Hash of Hash.t
   and k = Cstruct.t -> t -> res
   and state =
     | Header of k
@@ -437,7 +490,12 @@ struct
       | Hunk.Insert raw ->
         assert (Cstruct.len raw > 0);
 
-        let byte = Cstruct.len raw land 0x7F in (* TODO: be sure the length of the raw is lower than 0x7F. *)
+        let byte = Cstruct.len raw land 0x7F in
+          (* TODO: be sure the length of the raw is lower than 0x7F.
+
+             XXX(dinosaure): this is the case because we called
+                             [of_patience_diff] (which calls [split_to_127]).
+           *)
 
         KHunk.put_byte byte (insert idx raw) dst t
       | Hunk.Copy (off, len) ->
@@ -518,8 +576,12 @@ struct
   let used_out t = t.o_pos
 end
 
-module P =
+module MakePACKEncoder (Hash : HASH) =
 struct
+  module Entry = Entry(Hash)
+  module Radix = Radix.Make(Rakia.Bi)
+  module H = MakeHunkEncoder(Hash)
+
   type error = ..
   type error += Deflate_error of Decompress.Deflate.error
   type error += Hunk_error of H.error
@@ -549,7 +611,7 @@ struct
     ; objects : Entry.t array
     ; hash    : Hash.ctx
     ; h_tmp   : Cstruct.t
-    ; buffer  : BBuffer.t
+    ; buffer  : BBuffer.t (* TODO: replace by a [Cstruct.t]. *)
     ; window  : base Window.t (* offset, entry, raw *)
     ; state   : state }
   and k = Cstruct.t -> t -> res
@@ -638,10 +700,11 @@ struct
       pp_state state
 
   let await t = Wait t
+
   let flush dst t =
-    let () = Hash.feed t.hash (Cstruct.to_string (Cstruct.sub dst t.o_off t.o_pos)) in
-                              (* XXX(dinosaure): use [cstruct] instead [string] (avoid allocation). TODO! *)
+    Hash.feed t.hash (Cstruct.to_bigarray (Cstruct.sub dst t.o_off t.o_pos));
     Flush t
+
   let error t exn = Error ({ t with state = Exception exn }, exn)
   let ok    t = Ok ({ t with state = End })
 
@@ -687,13 +750,35 @@ struct
                      ; write = Int64.add t.write 1L }
       end else flush dst { t with state = WriteHeader (put_byte byte k) }
 
-    let rec length n crc k dst t =
-      let byte = Int64.(to_int (n && 0x7FL)) in
-      let rest = Int64.(n >> 7) in
+    let tmp_header = Bytes.create 10
 
-      if rest <> 0L
-      then put_byte (byte lor 0x80) (length rest (Crc32.digestc crc (byte lor 0x80)) k) dst t
-      else put_byte byte (k (Crc32.digestc crc byte)) dst t
+    let header kind len crc k dst t =
+      let byt = ref ((kind lsl 4) lor Int64.(to_int (len && 15L))) in
+      let len = ref Int64.(len >> 4) in
+      let pos = ref 0 in
+
+      while !len <> 0L
+      do
+        Bytes.set tmp_header !pos (Char.unsafe_chr (!byt lor 0x80));
+        byt := Int64.(to_int (!len && 0x7FL));
+        len := Int64.(!len >> 7);
+        pos := !pos + 1;
+      done;
+
+      Bytes.set tmp_header !pos (Char.unsafe_chr !byt);
+      pos := !pos + 1;
+
+      let rec loop idx crc dst t =
+        if idx < !pos
+        then
+          let byte = Char.code (Bytes.get tmp_header idx) in
+          let crc = Crc32.digestc crc byte in
+
+          put_byte byte (loop (idx + 1) crc) dst t
+        else k crc dst t
+      in
+
+      loop 0 crc dst t
 
     (* XXX(dinosaure): NOT THREAD SAFE! The [10] limitation is come from [git]. *)
 
@@ -719,7 +804,7 @@ struct
           let byte = Char.code (Bytes.get tmp_offset idx) in
           let crc = Crc32.digestc crc byte in
 
-          put_byte (Char.code @@ Bytes.get tmp_offset idx) (loop (idx + 1) crc) dst t
+          put_byte byte (loop (idx + 1) crc) dst t
       in
 
       loop !pos crc dst t
@@ -733,14 +818,14 @@ struct
         Cstruct.set_uint8 dst (t.o_off + t.o_pos) byte;
         k dst { t with o_pos = t.o_pos + 1
                      ; write = Int64.add t.write 1L }
-      end else flush dst { t with state = Hash (put_byte byte k) }
+      end else Flush { t with state = Hash (put_byte byte k) }
 
     let put_hash hash k dst t =
-      if t.o_len - t.o_pos >= Hash.size
+      if t.o_len - t.o_pos >= Hash.length
       then begin
-        Cstruct.blit_from_string hash 0 dst (t.o_off + t.o_pos) Hash.size;
-        k dst { t with o_pos = t.o_pos + Hash.size
-                     ; write = Int64.add t.write (Int64.of_int Hash.size) }
+        Cstruct.blit hash 0 dst (t.o_off + t.o_pos) Hash.length;
+        k dst { t with o_pos = t.o_pos + Hash.length
+                     ; write = Int64.add t.write (Int64.of_int Hash.length) }
       end else
         let rec loop rest dst t =
           if rest = 0
@@ -751,18 +836,23 @@ struct
             if n = 0
             then Flush { t with state = Hash (loop rest) }
             else begin
-              Cstruct.blit_from_string hash (Hash.size - rest) dst (t.o_off + t.o_pos) n;
+              Cstruct.blit hash (Hash.length - rest) dst (t.o_off + t.o_pos) n;
               Flush { t with state = Hash (loop (rest - n))
                            ; o_pos = t.o_pos + n
                            ; write = Int64.add t.write (Int64.of_int n) }
             end
         in
 
-        loop Hash.size dst t
+        loop Hash.length dst t
   end
 
   let hash dst t =
-    KHash.put_hash (Hash.get t.hash) (fun _ -> ok) dst t
+    Hash.feed t.hash (Cstruct.to_bigarray (Cstruct.sub dst t.o_off t.o_pos));
+    let hash = Hash.get t.hash in
+
+    Format.eprintf "Hash result: %a\n%!" Hash.pp hash;
+
+    KHash.put_hash (Cstruct.of_bigarray hash) (fun _ -> ok) dst t
 
   let pp_list ?(sep = (fun fmt () -> ())) pp_data fmt lst =
     let rec aux = function
@@ -784,14 +874,14 @@ struct
 
   (* XXX(dinosaure): I'm not sure about this function. If we have a bug in the
                      serialization, may be is there. TODO! *)
-  let split_at_newline cs =
+  let split_by chr cs =
     let lst = ref [] in
     let last = ref 0 in
     let i = ref 0 in
 
     while !i < Cstruct.len cs
     do
-      if Cstruct.get_char cs !i = '\n'
+      if Cstruct.get_char cs !i = chr
       then begin
         lst := Cstruct.sub cs !last ((!i + 1) - !last) :: !lst;
 
@@ -824,84 +914,33 @@ struct
         H.flush 0 (Cstruct.len t.h_tmp)
         @@ H.default (H.Offset offset) source_length target_length hunk in
 
-      let length = H.length h in
-
-      let byte = 0b110 lsl 4 in
-      let byte = byte lor (length land 0x0F) in
-
-      let byte, continue =
-        if length lsr 4 <> 0
-        then byte lor 0x80, true
-        else byte, false
-      in
-
-      let crc = Crc32.digestc Crc32.default byte in
-
       Hunk.produce source.raw target.raw hunk;
 
       let open Decompress in
 
-      if continue
-      then (KWriteHeader.put_byte byte
-            @@ KWriteHeader.length (Int64.of_int (length lsr 4)) crc
-            @@ fun crc -> KWriteHeader.offset offset crc
-            @@ fun crc dst t ->
-               let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos)
-                 @@ Deflate.default ~proof:B.proof_bigstring 4 in
+      (KWriteHeader.header 0b110 (Int64.of_int (H.length h)) Crc32.default
+       @@ fun crc -> KWriteHeader.offset offset crc
+       @@ fun crc dst t ->
+          let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos)
+            @@ Deflate.default ~proof:B.proof_bigstring 4 in
 
-               Cont { t with state = WriteHunk { current = target
-                                               ; crc
-                                               ; h
-                                               ; z } })
-          dst t
-      else (KWriteHeader.put_byte byte
-            @@ KWriteHeader.offset offset crc
-            @@ fun crc dst t ->
-             let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos)
-               @@ Deflate.default ~proof:B.proof_bigstring 4 in
+          Cont { t with state = WriteHunk { current = target
+                                          ; crc
+                                          ; h
+                                          ; z } })
+      dst t
 
-             Cont { t with state = WriteHunk { current = target
-                                             ; crc
-                                             ; h
-                                             ; z } })
-          dst t
-
-    | KHash (hash, hunk) -> Cont t
+    | KHash (hash, hunk) -> Cont t (* TODO! *)
     | KRaw current ->
       let open Decompress in
 
-      let length = current.entry.Entry.length in
+      (KWriteHeader.header (Kind.to_bin current.entry.Entry.kind) current.entry.Entry.length Crc32.default
+       @@ fun crc dst t ->
+          let z = Decompress.Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos)
+            @@ Decompress.Deflate.default ~proof:Decompress.B.proof_bigstring 4 in
 
-      (* XXX(dinosaure): need to be clear, the variable length integer tells us
-                         the expected size of the object AFTER the object is
-                         inflated. *)
-
-      let byte = ((Kind.to_bin current.entry.Entry.kind) lsl 4) in (* kind *)
-      let byte = byte lor Int64.(to_int (length && 0x0FL)) in (* part of the size *)
-
-      let byte, continue =
-        if Int64.(length >> 4) <> 0L
-        then byte lor 0x80, true
-        else byte, false
-      in
-
-      let crc = Crc32.digestc Crc32.default byte in
-
-      if continue
-      then (KWriteHeader.put_byte byte
-            @@ KWriteHeader.length Int64.(length >> 4) crc
-            @@ fun crc dst t ->
-               let z = Decompress.Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos)
-                 @@ Decompress.Deflate.default ~proof:Decompress.B.proof_bigstring 4 in
-
-               Cont { t with state = WriteZip { current; crc; last = false; z; } })
-          dst t
-      else KWriteHeader.put_byte byte
-          (fun dst t ->
-             let z = Decompress.Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos)
-               @@ Decompress.Deflate.default ~proof:Decompress.B.proof_bigstring 4 in
-
-             Cont { t with state = WriteZip { current; crc; last = false; z; } }) dst t
+          Cont { t with state = WriteZip { current; crc; last = false; z; } })
+        dst t
 
   let write_zip dst t current crc last z =
     let open Decompress in
@@ -1029,10 +1068,11 @@ struct
          if current.entry.Entry.kind = base.entry.Entry.kind
             && current.entry.Entry.name = base.entry.Entry.name
          then begin
-           let raw' = split_at_newline current.raw in
-           let base_raw' = split_at_newline base.raw in
+           let raw' = split_by (if current.entry.Entry.kind = Kind.Tree then '\000' else '\n') current.raw in
+           let base_raw' = split_by (if current.entry.Entry.kind = Kind.Tree then '\000' else '\n') base.raw in
            let diff =
              Pdiff.get_hunks
+               ~hashtbl:(module CstructHashtbl)
                ~transform:identity
                ~compare:Cstruct.compare
                ~context:(-1)
@@ -1076,7 +1116,7 @@ struct
       Cont { t with state = WriteHeader (write_header (KRaw current)) }
 
   let number dst t =
-    (* XXX(dinosaure): problem in 32-bits architecture. *)
+    (* XXX(dinosaure): problem in 32-bits architecture. TODO! *)
     KHeader.put_u32 (Int32.of_int (Array.length t.objects))
       (fun dst t -> Cont { t with state = Object (offset_entry 0) })
       dst t
@@ -1136,7 +1176,7 @@ struct
         { t with o_off = offset
                ; o_len = len
                ; o_pos = 0 }
-    else raise (Invalid_argument (sp "P.flush: you lost something (pos: %d, len: %d)" t.o_pos t.o_len))
+    else raise (Invalid_argument (Format.sprintf "P.flush: you lost something (pos: %d, len: %d)" t.o_pos t.o_len))
 
   let used_out t = t.o_pos
 
