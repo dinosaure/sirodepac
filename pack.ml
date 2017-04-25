@@ -30,6 +30,7 @@ struct
 end
 
 module CstructHashtbl = Hashtbl.Make(CstructKey)
+module CharHashtbl = Hashtbl.Make(struct type t = char let hash x = Char.code x let equal = Char.equal end)
 
 module type HASH =
 sig
@@ -93,35 +94,78 @@ struct
     @@ List.map snd
     @@ Array.to_list a
 
-  let split_to_127 acc cs =
-    let rec aux acc current cs =
-      if Cstruct.len (Array.get cs current) > 0x7F
-      then
-        let one = Cstruct.sub (Array.get cs current) 0 0x7F in
+  let cstruct_aggregate_to_127 arr =
+    let len = Array.length arr in
 
-        Array.set cs current (Cstruct.sub (Array.get cs current) 0x7F (Cstruct.len (Array.get cs current) - 0x7F));
-
-        aux (one :: acc) current cs
-      (* terminate the recursion or continue with the rest. *)
-      else if Cstruct.len (Array.get cs current) > 0
+    let rec aux acc idx =
+      if Cstruct.len (Array.get arr idx) > 0x7F
       then
-        if current = Array.length cs - 1
-        then (Array.get cs current :: acc)
-        else aux (Array.get cs current :: acc) (current + 1) cs
+        let one = Cstruct.sub (Array.get arr idx) 0 0x7F in
+
+        Array.set arr idx (Cstruct.sub (Array.get arr idx) 0x7F (Cstruct.len (Array.get arr idx) - 0x7F));
+
+        aux (one :: acc) idx
+      else if Cstruct.len (Array.get arr idx) > 0
+      then
+        if idx = len - 1
+        then (Array.get arr idx :: acc)
+        else aux (Array.get arr idx :: acc) (idx + 1)
       else
-        (if current = Array.length cs - 1
-         then acc
-         else aux acc (current + 1) cs)
+        begin
+          if idx = len - 1
+          then acc
+          else aux acc (idx + 1)
+        end
     in
-    if Array.length cs = 0
-    then acc
-    else aux acc 0 cs
 
-  let of_patience_diff hunk =
+    if len = 0
+    then []
+    else aux [] 0
+
+  let char_aggregate_to_127 arr =
+    let len = Array.length arr in
+
+    let rec aux ?current acc idx =
+      if idx = len
+      then match current with
+        | Some (raw, len) -> Cstruct.sub raw 0 len :: acc
+        | None -> acc
+      else match current with
+        | Some (raw, pos) ->
+          let n = min (0x7F - pos) (idx - len) in
+
+          for i = 0 to n - 1
+          do Cstruct.set_char raw (pos + i) (Array.get arr (idx + i)) done;
+
+          let current, acc =
+            if pos + n = 0x7F
+            then None, raw :: acc
+            else Some (raw, pos + n), acc
+          in
+
+          aux ?current acc (idx + n)
+        | None ->
+          let n = min (len - idx) 0x7F in
+          let raw = Cstruct.create 0x7F in
+
+          for i = 0 to n - 1
+          do Cstruct.set_char raw i (Array.get arr (idx + i)) done;
+
+          let current, acc =
+            if n = 0x7F
+            then None, raw :: acc
+            else Some (raw, n), acc
+          in
+
+          aux ?current acc (idx + n)
+    in
+
+    aux [] 0
+
+  let of_cstruct_patience_diff hunk =
     List.fold_left (fun (off, acc) -> function
-        (* TODO:i use the [acc] of [split_to_127]. *)
         | Pdiff.Range.New a ->
-          let lst = List.map (fun x -> Insert x) (split_to_127 [] a) in
+          let lst = List.map (fun x -> Insert x) (cstruct_aggregate_to_127 a) in
           (off, lst @ acc)
         | Pdiff.Range.Same a ->
           let len = count a in
@@ -129,10 +173,30 @@ struct
           (off + len, res :: acc )
         | Pdiff.Range.Replace (o, n) ->
           let add = List.fold_left (+) 0 (List.map Cstruct.len (Array.to_list o)) in
-          let res = List.map (fun x -> Insert x) (split_to_127 [] n) in
+          let res = List.map (fun x -> Insert x) (cstruct_aggregate_to_127 n) in
           (off + add, res @ acc)
         | Pdiff.Range.Old o ->
           let len = List.fold_left (+) 0 (List.map Cstruct.len (Array.to_list o)) in
+          (off + len, acc))
+      (0, [])
+      hunk.Pdiff.Hunk.ranges
+    |> fun (off, lst) -> List.rev lst
+
+  let of_char_patience_diff hunk =
+    List.fold_left (fun (off, acc) -> function
+        | Pdiff.Range.New a ->
+          let lst = List.map (fun x -> Insert x) (char_aggregate_to_127 a) in
+          (off, lst @ acc)
+        | Pdiff.Range.Same a ->
+          let len = Array.length a in
+          let res = Copy (off, len) in
+          (off + len, res :: acc )
+        | Pdiff.Range.Replace (o, n) ->
+          let add = Array.length o in
+          let res = List.map (fun x -> Insert x) (char_aggregate_to_127 n) in
+          (off + add, res @ acc)
+        | Pdiff.Range.Old o ->
+          let len = Array.length o in
           (off + len, acc))
       (0, [])
       hunk.Pdiff.Hunk.ranges
@@ -611,7 +675,6 @@ struct
     ; objects : Entry.t array
     ; hash    : Hash.ctx
     ; h_tmp   : Cstruct.t
-    ; buffer  : BBuffer.t (* TODO: replace by a [Cstruct.t]. *)
     ; window  : base Window.t (* offset, entry, raw *)
     ; state   : state }
   and k = Cstruct.t -> t -> res
@@ -620,10 +683,8 @@ struct
     | Object of k
     | Raw    of { idx : int
                 ; off : int64 }
-    | Buffer of { idx : int
-                ; raw : Cstruct.t
-                ; off : int64 }
     | Finish of { idx : int
+                ; raw : Cstruct.t
                 ; off : int64 }
     | WriteHeader of k
     | WriteZip of { current : base
@@ -657,11 +718,6 @@ struct
     | Raw { idx; off; } ->
       pp fmt "(Raw { @[<hov>idx = %d;@ \
                             off = %Ld;@] })"
-        idx off
-    | Buffer { idx; off; raw; } ->
-      pp fmt "(Buffer { @[<hov>idx = %d;@ \
-                               raw = #raw;@ \
-                               off = %Ld;@] })"
         idx off
     | Finish { idx; off; } ->
       pp fmt "(Finish { @[<hov>idx = %d;@ \
@@ -922,7 +978,7 @@ struct
        @@ fun crc -> KWriteHeader.offset offset crc
        @@ fun crc dst t ->
           let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos)
-            @@ Deflate.default ~proof:B.proof_bigstring 4 in
+            @@ Deflate.default ~proof:B.proof_bigstring 9 in
 
           Cont { t with state = WriteHunk { current = target
                                           ; crc
@@ -937,7 +993,7 @@ struct
       (KWriteHeader.header (Kind.to_bin current.entry.Entry.kind) current.entry.Entry.length Crc32.default
        @@ fun crc dst t ->
           let z = Decompress.Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos)
-            @@ Decompress.Deflate.default ~proof:Decompress.B.proof_bigstring 4 in
+            @@ Decompress.Deflate.default ~proof:Decompress.B.proof_bigstring 9 in
 
           Cont { t with state = WriteZip { current; crc; last = false; z; } })
         dst t
@@ -1046,6 +1102,48 @@ struct
     Cont { t with state = Object (offset_entry (obj.idx + 1))
                 ; radix = Radix.bind t.radix (Array.get t.objects obj.idx).Entry.hash_object (crc, obj.offset) }
 
+  let character_split = function
+    | Kind.Tree -> '\000'
+    | Kind.Commit -> '\x20'
+    | Kind.Blob -> '\x0a'
+    | Kind.Tag -> '\x20'
+
+  module ArrayOfCstruct : Pdiff.A with type t = Cstruct.t array and type elt = Cstruct.t =
+  struct
+    type t = Cstruct.t array
+    type elt = Cstruct.t
+
+    include Array
+
+    let sentinel = Pdiff.Array
+    let empty = [||]
+    external to_array : t -> elt array = "%identity"
+  end
+
+  module BigarrayOfChar : Pdiff.A with type t = (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
+                                   and type elt = char =
+  struct
+    type t = (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
+    type elt = char
+
+    let sub = Bigarray.Array1.sub
+    let length = Bigarray.Array1.dim
+    let empty = Bigarray.Array1.create Bigarray.char Bigarray.c_layout 0
+    let get = Bigarray.Array1.get
+
+    let to_array a =
+      let len = length a in
+      let res = Array.make len '\000' in
+      for i = 0 to len - 1
+      do Array.set res i (get a i) done;
+
+      res
+
+    let to_list a = Array.to_list (to_array a)
+
+    let sentinel = Pdiff.Bigarray
+  end
+
   let delta current t =
     (* XXX(dinosaure): we choose one which has the most [Hunk.Copy]. *)
 
@@ -1068,19 +1166,19 @@ struct
          if current.entry.Entry.kind = base.entry.Entry.kind
             && current.entry.Entry.name = base.entry.Entry.name
          then begin
-           let raw' = split_by (if current.entry.Entry.kind = Kind.Tree then '\000' else '\n') current.raw in
-           let base_raw' = split_by (if current.entry.Entry.kind = Kind.Tree then '\000' else '\n') base.raw in
-           let diff =
+           let hunk =
+             let current_raw' = split_by '\n' current.raw in
+             let base_raw'    = split_by '\n' base.raw in
+
              Pdiff.get_hunks
+               ~array:(module ArrayOfCstruct)
                ~hashtbl:(module CstructHashtbl)
-               ~transform:identity
                ~compare:Cstruct.compare
                ~context:(-1)
-               ~a:base_raw' ~b:raw'
+               ~a:base_raw' ~b:current_raw'
+             |> List.hd
+             |> Hunk.of_cstruct_patience_diff
            in
-
-           let diff = List.hd diff in (* XXX(dinosaure): the context is -1, so we have only one hunk. *)
-           let hunk = Hunk.of_patience_diff diff in
 
            Format.eprintf "%a diff %a: %d %% (%d / %d)\n%!"
              Hash.pp current.entry.Entry.hash_object
@@ -1094,16 +1192,11 @@ struct
          end else best)
       None
 
-  let finish_entry dst t idx offset =
-    let raw = BBuffer.contents t.buffer in
-    let raw = Cstruct.of_string (Cstruct.copy raw 0 (Cstruct.len raw)) in
-
+  let finish_entry dst t idx raw offset =
     let current = { idx
                   ; offset
                   ; entry = Array.get t.objects idx
                   ; raw } in
-
-    BBuffer.clear t.buffer;
 
     match delta current t with
     | Some (idx, hunk) ->
@@ -1137,26 +1230,8 @@ struct
 
     match t.state with
     | Raw { idx; off; } ->
-      { t with state = Buffer { idx; raw; off; } }
+      { t with state = Finish { idx; raw; off; } }
     | _ -> raise (Invalid_argument "P.raw: bad state")
-
-  let current_raw t = match t.state with
-    | Buffer { raw; _ } -> raw
-    | _ -> raise (Invalid_argument "P.current_raw: bad state")
-
-  let finish_raw t = match t.state with
-    | Buffer { idx; raw; off; } ->
-      { t with state = Finish { idx; off; } }
-    | _ -> raise (Invalid_argument "P.finish_raw: bad state")
-
-  let refill offset len ?raw t = match t.state, raw with
-    | Buffer { idx; raw; off; }, Some new_raw ->
-      BBuffer.add new_raw ~off:offset ~len t.buffer;
-      { t with state = Buffer { idx; raw = new_raw; off; } }
-    | Buffer { idx; raw; off; }, None ->
-      BBuffer.add raw ~off:offset ~len t.buffer;
-      { t with state = Buffer { idx; raw; off; } }
-    | _ -> raise (Invalid_argument "P.refill: bad state")
 
   let flush offset len t =
     if (t.o_len - t.o_pos) = 0
@@ -1182,11 +1257,9 @@ struct
 
   let expect t = match t.state with
     | Raw { idx; off; } ->
-      (try
-         let hash = (Array.get t.objects idx).Entry.hash_object in
-         Some hash
+      (try (Array.get t.objects idx).Entry.hash_object
        with exn -> raise (Invalid_argument "P.expect: invalid index"))
-    | _ -> None
+    | _ -> raise (Invalid_argument "P.expect: bad state")
 
   let entry t = match t.state with
     | Raw { idx; off; } ->
@@ -1203,8 +1276,7 @@ struct
       | Header k -> k dst t
       | Object k -> k dst t
       | Raw { idx; off; } -> await t
-      | Buffer { idx; raw; off; } -> await t
-      | Finish { idx; off; } -> finish_entry dst t idx off
+      | Finish { idx; raw; off; } -> finish_entry dst t idx raw off
       | WriteHeader k -> k dst t
       | WriteZip { current; crc; last; z; } -> write_zip dst t current crc last z
       | WriteHunk { current; crc; h; z; } -> write_hunk dst t current crc h z
@@ -1231,7 +1303,6 @@ struct
     ; o_len = 0
     ; write = 0L
     ; radix = Radix.empty
-    ; buffer = BBuffer.create 0x800
     ; h_tmp
     ; window = Window.make chunk
     ; objects
