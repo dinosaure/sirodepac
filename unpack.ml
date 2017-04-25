@@ -704,15 +704,15 @@ struct
           let crc = Crc32.digestc crc byte in
           offset msb (Int64.of_int (byte land 0x7F)) crc
             (fun offset crc src t ->
-              Cont { t with state = Hunks { offset   = off
-                                          ; length   = len
-                                          ; consumed = size_of_variable_length len
+               Cont { t with state = Hunks { offset   = off
+                                           ; length   = len
+                                           ; consumed = size_of_variable_length len
                                                         + size_of_offset offset
-                                          ; crc
-                                          ; z = Inflate.flush 0 (Cstruct.len t.o_z)
-                                                @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                                @@ Inflate.default (Window.reset t.o_w)
-                                          ; h = H.default len (H.Offset offset) } })
+                                           ; crc
+                                           ; z = Inflate.flush 0 (Cstruct.len t.o_z)
+                                               @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
+                                               @@ Inflate.default (Window.reset t.o_w)
+                                           ; h = H.default len (H.Offset offset) } })
             src t)
         src t
     | 0b111 ->
@@ -878,11 +878,11 @@ struct
   let flush off len t = match t.state with
     | Unzip { offset; length; consumed; crc; kind; z } ->
       { t with state = Unzip { offset
-                            ; length
-                            ; consumed
-                            ; crc
-                            ; kind
-                            ; z = Decompress.Inflate.flush off len z } }
+                             ; length
+                             ; consumed
+                             ; crc
+                             ; kind
+                             ; z = Decompress.Inflate.flush off len z } }
     | _ -> raise (Invalid_argument "P.flush: bad state")
 
   let output t = match t.state with
@@ -994,25 +994,89 @@ struct
     ; idx   : Hash.t -> (Crc32.t * int64) option
     ; hash  : Hash.t }
 
+  type kind = [ `Commit | `Blob | `Tree | `Tag ]
+
+  let pp_kind fmt = function
+    | `Commit -> Format.fprintf fmt "Commit"
+    | `Blob -> Format.fprintf fmt "Blob"
+    | `Tree -> Format.fprintf fmt "Tree"
+    | `Tag -> Format.fprintf fmt "Tag"
+
+  let to_kind = function
+    | P.Commit -> `Commit
+    | P.Blob -> `Blob
+    | P.Tree -> `Tree
+    | P.Tag -> `Tag
+    | _ -> assert false
+
   module Base =
   struct
-    type t =
-      { kind     : P.kind
-      ; raw      : Cstruct.t
-      ; offset   : int64
-      ; length   : int
-      ; consumed : int }
+    type from =
+      | Hunk of { length   : int
+                ; consumed : int
+                ; offset   : int64
+                ; crc      : Crc32.t
+                ; base     : from }
+      | Direct of { consumed : int
+                  ; offset   : int64
+                  ; crc      : Crc32.t }
 
-    let pp fmt base =
+    and t =
+      { kind     : kind
+      ; raw      : Cstruct.t
+      ; length   : int64
+      ; from     : from }
+
+    let rec pp_from fmt = function
+      | Hunk { length; consumed; offset; crc; base; } ->
+        Format.fprintf fmt "(Hunk { @[<hov>length = %d;@ \
+                                           consumed = %d;@ \
+                                           offset = %Lx;@ \
+                                           crc = @[<hov>%a@];@ \
+                                           base = @[<hov>%a@];@] })"
+          length consumed offset Crc32.pp crc pp_from base
+      | Direct { consumed; offset; crc; } ->
+        Format.fprintf fmt "(Direct { @[<hov>consumed = %d;@ \
+                                             offset = %Lx;@ \
+                                             crc = @[<hov>%a@];@] })"
+          consumed offset Crc32.pp crc
+
+    let pp fmt t =
       Format.fprintf fmt "{ @[<hov>kind = @[<hov>%a@];@ \
                                    raw = #raw;@ \
-                                   offset = %Lx;@ \
-                                   length = %d;@ \
-                                   consumed = %d;@] }"
-        P.pp_kind base.kind base.offset base.length base.consumed
+                                   length = %Ld;@ \
+                                   from = @[<hov>%a@];@] }"
+        pp_kind t.kind t.length pp_from t.from
+
+    let first_crc t =
+      match t.from with
+      | Direct { crc; _ } -> crc
+      | Hunk { crc; _ } -> crc
+
+    let first_offset t =
+      match t.from with
+      | Direct { offset; _ } -> offset
+      | Hunk { offset; _ } -> offset
+
+    let deep_crc t =
+      let rec aux  = function
+        | Direct { crc; _ } -> crc
+        | Hunk { base; _ } -> aux base
+      in
+      aux t.from
   end
 
-  let apply hunks base raw =
+  type partial =
+    { _length : int
+    ; _consumed : int
+    ; _offset : int64
+    ; _crc : Crc32.t }
+
+  type pack_object =
+    | Hunks  of partial * H.hunks
+    | Object of kind * partial * Cstruct.t
+
+  let apply partial_hunks hunks base raw =
     if Cstruct.len raw < hunks.H.target_length
     then raise (Invalid_argument "D.apply");
 
@@ -1026,11 +1090,14 @@ struct
       in
 
       if (target_length = hunks.H.target_length)
-      then Ok Base.{ kind     = base.kind
+      then Ok Base.{ kind     = base.Base.kind
                    ; raw      = Cstruct.sub raw 0 target_length
-                   ; offset   = base.offset
-                   ; length   = target_length
-                   ; consumed = base.consumed }
+                   ; length   = Int64.of_int hunks.H.target_length
+                   ; from     = Hunk { length   = partial_hunks._length
+                                     ; consumed = partial_hunks._consumed
+                                     ; offset   = partial_hunks._offset
+                                     ; crc      = partial_hunks._crc
+                                     ; base     = base.from } }
       else Error (Invalid_target (target_length, hunks.H.target_length))
 
   let map_window t offset_requested =
@@ -1053,14 +1120,14 @@ struct
 
       let () = Bucket.add t.win window in window, relative_offset
 
-  let delta ?(chunk = 0x800) t hunks offset_of_hunks z_tmp z_win r_tmp =
-    if Cstruct.len r_tmp < hunks.H.source_length
-    then raise (Invalid_argument (Format.sprintf "D.delta: expect %d and have %d" hunks.H.source_length (Cstruct.len r_tmp)));
+  let get_pack_object ?(chunk = 0x800) t reference source_length source_offset z_tmp z_win r_tmp =
+    if Cstruct.len r_tmp < source_length
+    then raise (Invalid_argument (Format.sprintf "D.delta: expect %d and have %d" source_length (Cstruct.len r_tmp)));
 
-    let absolute_offset = match hunks.H.reference with
+    let absolute_offset = match reference with
       | H.Offset off ->
         if off < t.max && off >= 0L
-        then Ok (Int64.sub offset_of_hunks off)
+        then Ok (Int64.sub source_offset off)
         else Error (Invalid_offset off)
       | H.Hash hash -> match t.idx hash with
         | Some (crc, off) -> Ok off
@@ -1097,16 +1164,17 @@ struct
         | `Object state ->
           loop window consumed_in_window writed_in_raw
             (Some (P.kind state,
-                   P.offset state,
-                   P.length state,
-                   P.consumed state))
+                   { _length = P.length state
+                   ; _consumed = P.consumed state
+                   ; _offset = P.offset state
+                   ; _crc = P.crc state }))
             (P.next_object state)
         | `Error (state, exn) ->
           Error (Unpack_error exn)
         | `End (state, _) ->
           match git_object with
-          | Some (kind, offset, length, consumed) ->
-            Ok (kind, offset, length, consumed)
+          | Some (kind, partial) ->
+            Ok (kind, partial)
           | None -> assert false
           (* XXX: This is not possible, the [`End] state comes only after the
                   [`Object] state and this state changes [kind] to [Some x].
@@ -1114,13 +1182,11 @@ struct
       in
 
       (match loop window relative_offset 0 None state with
-        | Ok (base_kind, base_offset, base_length, base_consumed) ->
-          Ok Base.{ kind     = base_kind
-                  ; raw      = Cstruct.sub r_tmp 0 base_length
-                  ; offset   = base_offset
-                  ; length   = base_length
-                  ; consumed = base_consumed }
-        | Error exn -> Error exn)
+       | Ok (P.Hunk hunks, partial) ->
+         Ok (Hunks (partial, hunks))
+       | Ok (kind, partial) ->
+         Ok (Object (to_kind kind, partial, Cstruct.sub r_tmp 0 partial._length))
+       | Error exn -> Error exn)
     | Error exn -> Error exn
 
   let make ?(bucket = 10) file (idx : Hash.t -> (Crc32.t * int64) option) =
@@ -1262,53 +1328,60 @@ struct
           loop window consumed_in_window (writed_in_raw + n) swap git_object (P.flush 0 (Cstruct.len o) state)
         | `Object state ->
           (match P.kind state with
-          | P.Hunk hunks ->
-            let (rlength, rconsumed, roffset) = P.length state, P.consumed state, P.offset state in
+           | P.Hunk hunks ->
+             let partial_hunks =
+               { _length   = P.length state
+               ; _consumed = P.consumed state
+               ; _offset   = P.offset state
+               ; _crc      = P.crc state }
+             in
 
-            let rec undelta ?(level = 1) hunks offset swap =
-              match delta ~chunk t hunks offset z_tmp z_win (get_free_raw swap) with
-              | Error exn -> Error exn
-              | Ok { Base.kind = P.Hunk hunks; offset; _ } ->
-                (match undelta ~level:(level + 1) hunks offset (not swap) with
-                  | Ok (base, level) ->
-                    (match apply hunks base (get_free_raw swap) with
-                    | Ok base ->
-                      Ok (base, level)
-                    | Error exn -> Error exn)
+             let rec undelta partial hunks swap =
+               match get_pack_object ~chunk t hunks.H.reference hunks.H.source_length partial._offset z_tmp z_win (get_free_raw swap) with
+               | Error exn -> Error exn
+               | Ok (Hunks (partial_hunks, hunks)) ->
+                 (match undelta partial_hunks hunks (not swap) with
+                  | Ok base ->
+                    apply partial_hunks hunks base (get_free_raw swap)
                   | Error exn -> Error exn)
-              | Ok base ->
-                Ok (base, level)
-            in
+               | Ok (Object (kind, partial, raw)) ->
+                 Ok Base.{ kind
+                         ; raw
+                         ; length = Int64.of_int partial._length
+                         ; from   = Direct { consumed = partial._consumed
+                                           ; offset   = partial._offset
+                                           ; crc      = partial._crc } }
+             in
 
-            (match undelta hunks (P.offset state) swap with
-              | Ok (base, level) ->
-                (match apply hunks base (get_free_raw (not swap)) with
-                | Ok base ->
-                  loop window consumed_in_window writed_in_raw swap
-                    (Some (base.Base.kind, Cstruct.sub base.Base.raw 0 base.Base.length, roffset, base.Base.length, rconsumed))
-                    (P.next_object state)
-                | Error exn -> Error exn)
+             (match undelta partial_hunks hunks swap with
+              | Ok base ->
+                (match apply partial_hunks hunks base (get_free_raw (not swap)) with
+                 | Ok obj ->
+                   loop window consumed_in_window writed_in_raw swap (Some obj) (P.next_object state)
+                 | Error exn -> Error exn)
               | Error exn -> Error exn)
-          | kind ->
-            loop window consumed_in_window writed_in_raw (not swap)
-              (Some (kind, (get_free_raw swap), P.offset state, P.length state, P.consumed state))
-              (P.next_object state))
+           | kind ->
+             let obj =
+               Base.{ kind   = to_kind kind
+                    ; raw    = Cstruct.sub (get_free_raw swap) 0 (P.length state)
+                    ; length = Int64.of_int (P.length state)
+                    ; from   = Direct { consumed = P.consumed state
+                                      ; offset   = P.offset state
+                                      ; crc      = P.crc state } }
+             in
+
+             loop window consumed_in_window writed_in_raw (not swap)
+               (Some obj)
+               (P.next_object state))
         | `Error (state, exn) ->
           Error (Unpack_error exn)
         | `End (t, _) -> match git_object with
-          | Some (kind, raw_opt, offset, length, consumed) ->
-            Ok (kind, raw_opt, offset, length, consumed)
+          | Some obj ->
+            Ok obj
           | None -> assert false
       in
 
-      match loop window relative_offset 0 true None state with
-      | Ok (kind, raw, offset, length, consumed) ->
-        Ok Base.{ kind
-                ; raw = Cstruct.sub raw 0 length
-                ; offset
-                ; length
-                ; consumed }
-      | Error exn -> Error exn
+      loop window relative_offset 0 true None state
 
   let get' ?chunk t hash z_tmp z_win (raw0, raw1) =
     match needed t hash z_tmp z_win with
