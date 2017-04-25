@@ -10,19 +10,41 @@ end
 
 type 'key hashtbl = (module Hashtbl.S with type key = 'key)
 
+type _ s =
+  | Bigarray : ('elt, _, Bigarray.c_layout) Bigarray.Array1.t s
+  | Array    : 'elt array s
+
+module type A =
+sig
+  type t
+  type elt
+
+  val length : t -> int
+  val get    : t -> int -> elt
+  val sub    : t -> int -> int -> t
+  val empty  : t
+  val to_array : t -> elt array
+  val to_list  : t -> elt list
+
+  val sentinel : t s
+end
+
+type ('elt, 'arr) scalar = (module A with type t = 'arr and type elt = 'elt)
+
 val get_matching_blocks :
-  hashtbl:'b hashtbl ->
-  transform:('a -> 'b)
-  -> compare:('b -> 'b -> int)
-  -> a:'a array
-  -> b:'a array
+  array:('elt, 'arr) scalar
+  -> hashtbl:'elt hashtbl
+  -> compare:('elt -> 'elt -> int)
+  -> a:'arr
+  -> b:'arr
   -> MatchingBlock.t list
 
 val matches :
-  hashtbl:'a hashtbl ->
-  compare:('a -> 'a -> int)
-  -> 'a array
-  -> 'a array
+  array:('elt, 'arr) scalar
+  -> hashtbl:'elt hashtbl
+  -> compare:('elt -> 'elt -> int)
+  -> 'arr
+  -> 'arr
   -> (int * int) list
 
 module Range :
@@ -54,13 +76,13 @@ sig
 end
 
 val get_hunks :
-  hashtbl:'b hashtbl ->
-  transform:('a -> 'b)
-  -> compare:('b -> 'b -> int)
+  array:('elt, 'arr) scalar
+  -> hashtbl:'elt hashtbl
+  -> compare:('elt -> 'elt -> int)
   -> context:int
-  -> a:'a array
-  -> b:'a array
-  -> 'a Hunk.t list
+  -> a:'arr
+  -> b:'arr
+  -> 'elt Hunk.t list
 
 val all_same : 'a Hunk.t list -> bool
 val unified  : 'a Hunk.t list -> 'a Hunk.t list

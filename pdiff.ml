@@ -285,14 +285,38 @@ let longest_increasing_subsequence ar =
 
 type 'key hashtbl = (module Hashtbl.S with type key = 'key)
 
+type _ s =
+  | Bigarray : ('elt, _, Bigarray.c_layout) Bigarray.Array1.t s
+  | Array    : 'elt array s
+
+module type A =
+sig
+  type t
+  type elt
+
+  val length : t -> int
+  val get    : t -> int -> elt
+  val sub    : t -> int -> int -> t
+  val empty  : t
+  val to_array : t -> elt array
+  val to_list  : t -> elt list
+
+  val sentinel : t s
+end
+
+type ('elt, 'arr) scalar = (module A with type t = 'arr and type elt = 'elt)
+
 (* patience diff algorithm by Bram Cohen as seen in Bazaar.1.14.1 *)
-let unique_lcs (type elt) ~(hashtbl:elt hashtbl) (alpha, alo, ahi) (bravo, blo, bhi) =
+let unique_lcs
+  : type elt arr. array:(elt, arr) scalar -> hashtbl:elt hashtbl -> (arr * int * int) -> (arr * int * int) -> OrderedSequence.elt list
+  = fun ~array ~hashtbl (alpha, alo, ahi) (bravo, blo, bhi) ->
   let module H = (val hashtbl) in
+  let module A = (val array) in
   let unique = H.create (min (ahi - alo) (bhi - blo)) in
 
   for i = alo to ahi - 1
   do
-    let x = alpha.(i) in
+    let x = A.get alpha i in
 
     try let _ = H.find unique x in
       H.replace unique x `Neg
@@ -301,7 +325,7 @@ let unique_lcs (type elt) ~(hashtbl:elt hashtbl) (alpha, alo, ahi) (bravo, blo, 
 
   for i = blo to bhi - 1
   do
-    let x = bravo.(i) in
+    let x = A.get bravo i in
     try match H.find unique x with
       | `Neg -> ()
       | `UIA i_a -> H.replace unique x (`UIAB (i_a, i))
@@ -335,7 +359,9 @@ let unique_lcs (type elt) ~(hashtbl:elt hashtbl) (alpha, alo, ahi) (bravo, blo, 
    I couldn't figure out how to do this efficiently in a functionnal way, so
    this is pretty much a straight translation of the original Python code.
 *)
-let matches (type elt) ~(hashtbl:elt hashtbl) ~compare alpha bravo =
+let matches
+  : type elt arr. array:(elt, arr) scalar -> hashtbl:elt hashtbl -> compare:(elt -> elt -> int) -> arr -> arr -> (int * int) list
+  = fun ~array ~hashtbl ~compare alpha bravo ->
   let matches_ref_length = ref 0 in
   let matches_ref        = ref [] in
 
@@ -343,6 +369,8 @@ let matches (type elt) ~(hashtbl:elt hashtbl) ~compare alpha bravo =
     incr matches_ref_length;
     matches_ref := m :: !matches_ref
   in
+
+  let module A = (val array) in
 
   let rec recurse_matches alo blo ahi bhi =
     let old_left = !matches_ref_length in
@@ -352,7 +380,7 @@ let matches (type elt) ~(hashtbl:elt hashtbl) ~compare alpha bravo =
       let last_a_pos = ref (alo - 1) in
       let last_b_pos = ref (blo - 1) in
 
-      unique_lcs ~hashtbl (alpha, alo, ahi) (bravo, blo, bhi)
+      unique_lcs ~array ~hashtbl (alpha, alo, ahi) (bravo, blo, bhi)
       |> List.iter
         (fun (apos, bpos) ->
            if !last_a_pos + 1 <> apos || !last_b_pos + 1 <> bpos
@@ -364,12 +392,12 @@ let matches (type elt) ~(hashtbl:elt hashtbl) ~compare alpha bravo =
 
       if !matches_ref_length > old_left
       then recurse_matches (!last_a_pos + 1) (!last_b_pos + 1) ahi bhi
-      else if (compare alpha.(alo) bravo.(blo) = 0)
+      else if (compare (A.get alpha alo) (A.get bravo blo) = 0)
       then begin
         let alo = ref alo in
         let blo = ref blo in
 
-        while (!alo < ahi && !blo < bhi && (compare alpha.(!alo) bravo.(!blo) = 0))
+        while (!alo < ahi && !blo < bhi && (compare (A.get alpha !alo) (A.get bravo !blo) = 0))
         do
           add_match (!alo, !blo);
           incr alo;
@@ -377,12 +405,12 @@ let matches (type elt) ~(hashtbl:elt hashtbl) ~compare alpha bravo =
         done;
 
         recurse_matches !alo !blo ahi bhi
-      end else if (compare alpha.(ahi - 1) bravo.(bhi - 1) = 0)
+      end else if (compare (A.get alpha (ahi - 1)) (A.get bravo (bhi - 1)) = 0)
       then begin
         let nahi = ref (ahi - 1) in
         let nbhi = ref (bhi - 1) in
 
-        while (!nahi > alo && !nbhi > blo && compare alpha.(!nahi - 1) bravo.(!nbhi - 1) = 0)
+        while (!nahi > alo && !nbhi > blo && compare (A.get alpha (!nahi - 1)) (A.get bravo (!nbhi - 1)) = 0)
         do
           decr nahi;
           decr nbhi;
@@ -392,14 +420,21 @@ let matches (type elt) ~(hashtbl:elt hashtbl) ~compare alpha bravo =
 
         for i = 0 to (ahi - !nahi - 1)
         do add_match (!nahi + i, !nbhi + i) done
-      end else
-        PlainDiff.iter_matches
-          (Array.sub alpha alo (ahi - alo))
-          (Array.sub bravo blo (bhi - blo))
-          (fun (i1, i2) -> add_match (alo + i1, blo + i2))
+      end else match A.sentinel with
+        | Array ->
+          PlainDiff.iter_matches
+            (A.sub alpha alo (ahi - alo))
+            (A.sub bravo blo (bhi - blo))
+            (fun (i1, i2) -> add_match (alo + i1, blo + i2))
+        | Bigarray ->
+          PlainDiff.iter_matches_bigarray
+            (A.sub alpha alo (ahi - alo))
+            (A.sub bravo blo (bhi - blo))
+            (fun (i1, i2) -> add_match (alo + i1, blo + i2))
+      (* XXX(dinosaure): this hack ... *)
     end
   in
-  recurse_matches 0 0 (Array.length alpha) (Array.length bravo);
+  recurse_matches 0 0 (A.length alpha) (A.length bravo);
   List.rev !matches_ref
 
 module MatchingBlock =
@@ -457,14 +492,18 @@ let collapse_sequences matches =
 
   List.rev !collapsed
 
-let get_matching_blocks (type elt) ~(hashtbl:elt hashtbl) ~transform ~compare ~a ~b =
-  let a = Array.map transform a in
-  let b = Array.map transform b in
+let get_matching_blocks
+  : type elt arr. array:(elt, arr) scalar ->
+                  hashtbl:elt hashtbl ->
+                  compare:(elt -> elt -> int) ->
+                  a:arr -> b:arr -> MatchingBlock.t list
+  = fun ~array ~hashtbl ~compare ~a ~b ->
+  let module A = (val array) in
 
-  let matches = matches ~hashtbl ~compare a b |> collapse_sequences in
+  let matches = matches ~array ~hashtbl ~compare a b |> collapse_sequences in
   let last =
-    { MatchingBlock.a_start = Array.length a
-    ; b_start = Array.length b
+    { MatchingBlock.a_start = A.length a
+    ; b_start = A.length b
     ; length = 0 }
   in
 
@@ -551,7 +590,17 @@ struct
       (pp_list (Range.pp ~sep:(fun fmt -> Format.fprintf fmt "@\n") pp_data)) hunk.ranges
 end
 
-let get_range_rev (type elt) ~(hashtbl:elt hashtbl) ~transform ~compare ~a ~b =
+let get_range_rev
+  : type elt arr. array:(elt, arr) scalar -> hashtbl:elt hashtbl -> compare:(elt -> elt -> int) -> a:arr -> b:arr -> elt Range.t list
+  = fun ~array ~hashtbl ~compare ~a ~b ->
+  let module A = (val array) in
+
+  let ( <|> ) ar (i, j) =
+    if j <= i
+    then A.empty
+    else A.sub ar i (j - i)
+  in
+
   let rec aux matching_blocks i j l =
     match matching_blocks with
     | x :: r ->
@@ -569,15 +618,15 @@ let get_range_rev (type elt) ~(hashtbl:elt hashtbl) ~transform ~compare ~a ~b =
           then
             let a_range = a <|> (i, a_index) in
             let b_range = b <|> (j, b_index) in
-            Some (Range.Replace (a_range, b_range))
+            Some (Range.Replace (A.to_array a_range, A.to_array b_range))
           else if i < a_index
           then
             let a_range = a <|> (i, a_index) in
-            Some (Range.Old a_range)
+            Some (Range.Old (A.to_array a_range))
           else if j < b_index
           then
             let b_range = b <|> (j, b_index) in
-            Some (Range.New b_range)
+            Some (Range.New (A.to_array b_range))
           else None
         in
 
@@ -592,7 +641,7 @@ let get_range_rev (type elt) ~(hashtbl:elt hashtbl) ~transform ~compare ~a ~b =
             let b_range = b <|> (b_index, b_stop) in
             let range   = Array.map2
                 (fun x y -> (x, y))
-                a_range b_range
+                (A.to_array a_range) (A.to_array b_range)
             in
             Range.Same range :: l
         in
@@ -601,7 +650,7 @@ let get_range_rev (type elt) ~(hashtbl:elt hashtbl) ~transform ~compare ~a ~b =
     | [] -> List.rev l
   in
 
-  let matching_blocks = get_matching_blocks ~hashtbl ~transform ~compare ~a ~b in
+  let matching_blocks = get_matching_blocks ~array ~hashtbl ~compare ~a ~b in
   aux matching_blocks 0 0 []
 
 let all_same hunks =
@@ -611,12 +660,15 @@ let all_same hunks =
     | [] -> false
     | _ -> true
 
-let get_hunks (type elt) ~(hashtbl:elt hashtbl) ~transform ~compare ~context ~a ~b =
-  let ranges = get_range_rev ~hashtbl ~transform ~compare ~a ~b in
+let get_hunks
+  : type elt arr. array:(elt, arr) scalar -> hashtbl:elt hashtbl -> compare:(elt -> elt -> int) -> context:int -> a:arr -> b:arr -> elt Hunk.t list
+  = fun ~array ~hashtbl ~compare ~context ~a ~b ->
+  let module A = (val array) in
+  let ranges = get_range_rev ~array ~hashtbl ~compare ~a ~b in
 
   if context < 0
   then
-    let singleton = Hunk.make 0 (Array.length a) 0 (Array.length b) (List.rev ranges)
+    let singleton = Hunk.make 0 (A.length a) 0 (A.length b) (List.rev ranges)
     in [ singleton ]
   else
     let rec aux rest ranges alo ahi blo bhi acc = match rest with
