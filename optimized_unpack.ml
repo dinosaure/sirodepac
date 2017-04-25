@@ -78,6 +78,21 @@ struct
         aux (j + 1) (j + 2)
       end
     in aux 0 1; tmp
+
+  exception Break
+
+  let equal a b =
+    let open Bigarray.Array1 in
+
+    if dim a <> dim b
+    then false
+    else
+      try
+        for i = 0 to dim a - 1
+        do if get a i <> get b i then raise Break done;
+
+        true
+      with Break -> false
 end
 
 module Mapper : Unpack.MAPPER with type fd = Unix.file_descr =
@@ -149,19 +164,18 @@ let save_names_of_tree hash raw =
 let base_to_entry hash base =
   let open Decoder.Base in
   match base.kind with
-  | PACKDecoder.Commit ->
+  | `Commit ->
     PACKEncoder.Entry.from_commit hash
     @@ Result.unsafe_ok (Commit.Decoder.to_result base.raw)
-  | PACKDecoder.Tree ->
+  | `Tree ->
     PACKEncoder.Entry.from_tree hash ?path:(try Some (Hashtbl.find p_nam hash) with Not_found -> None)
     @@ Result.unsafe_ok (Tree.Decoder.to_result base.raw)
-  | PACKDecoder.Tag ->
+  | `Tag ->
     PACKEncoder.Entry.from_tag hash
     @@ Result.unsafe_ok (Tag.Decoder.to_result base.raw)
-  | PACKDecoder.Blob ->
+  | `Blob ->
     PACKEncoder.Entry.from_blob hash  ?path:(try Some (Hashtbl.find p_nam hash) with Not_found -> None)
     @@ Result.unsafe_ok (Blob.Decoder.to_result base.raw)
-  | PACKDecoder.Hunk _ -> assert false
 
 let pp_option pp_data fmt = function
   | Some x -> pp_data fmt x
@@ -173,18 +187,13 @@ let make_pack pack_fmt idx_fmt pack entries =
   let rec loop_pack ?(raw = false) t =
     match PACKEncoder.eval o_tmp t with
     | `Await t ->
-      (match PACKEncoder.expect t with
-       | Some hash ->
-         let base  = Result.unsafe_ok (Decoder.get pack hash z_tmp z_win) in
-         let entry = PACKEncoder.entry t in
+      let hash = PACKEncoder.expect t in
+      let base  = Result.unsafe_ok (Decoder.get pack hash z_tmp z_win) in
+      let entry = PACKEncoder.entry t in
 
-         Format.eprintf "Pack the git object (name = %a): %a\n%!" (pp_option Format.pp_print_string) (PACKEncoder.Entry.name entry) SHA1.pp hash;
+      Format.eprintf "Pack the git object (name = %a): %a\n%!" (pp_option Format.pp_print_string) (PACKEncoder.Entry.name entry) SHA1.pp hash;
 
-         loop_pack (PACKEncoder.raw base.Decoder.Base.raw t)
-       | None ->
-         if raw
-         then loop_pack (PACKEncoder.finish_raw t)
-         else loop_pack ~raw:true (PACKEncoder.refill 0 (Cstruct.len (PACKEncoder.current_raw t)) t))
+      loop_pack (PACKEncoder.raw base.Decoder.Base.raw t)
     | `Flush t ->
       let n = PACKEncoder.used_out t in
       Format.fprintf pack_fmt "%s%!" (Cstruct.to_string (Cstruct.sub o_tmp 0 n));
@@ -236,6 +245,19 @@ let bigarray_compare a b =
       true
     with Break -> false
 
+let hash_of_git_object base =
+  let typename = match base.Decoder.Base.kind with
+    | `Commit -> "commit"
+    | `Tree -> "tree"
+    | `Blob -> "blob"
+    | `Tag -> "tag"
+  in
+
+  let hdr = Format.sprintf "%s %Ld\000" typename base.Decoder.Base.length in
+
+  SHA1.digestv [ (Cstruct.to_bigarray (Cstruct.of_string hdr))
+               ; (Cstruct.to_bigarray base.Decoder.Base.raw) ]
+
 let () =
   let (tree_idx, hash_idx) = idx_from_filename Sys.argv.(2) in
   let pack = Decoder.make (Unix.openfile Sys.argv.(1) [ Unix.O_RDONLY ] 0o644) (fun hash -> Radix.lookup tree_idx hash) in
@@ -249,16 +271,26 @@ let () =
       assert false) 0 tree_idx
   in
 
+  Format.printf "Max length: %d\n%!" max_length;
+
   let raw0, raw1 = Cstruct.create max_length, Cstruct.create max_length in
 
   let each_git_object (hash, (crc, offset)) acc =
     Format.printf "Save %a git object.\n%!" SHA1.pp hash;
 
     match Decoder.get' pack hash z_tmp z_win (raw0, raw1) with
-    | Ok ({ Decoder.Base.kind = PACKDecoder.Tree; _ } as base) ->
+    | Ok ({ Decoder.Base.kind = `Tree; _ } as base) ->
       save_names_of_tree hash base.Decoder.Base.raw;
+      Format.printf "Hash correct: %b\n%!"
+        (SHA1.equal hash (hash_of_git_object base));
+      Format.printf "CRC-32 correct: %b\n%!"
+        (Int32.equal (Crc32.to_int32 crc) (Crc32.to_int32 (Decoder.Base.first_crc base)));
       base_to_entry hash base :: acc
     | Ok base ->
+      Format.printf "Hash correct: %b\n%!"
+        (SHA1.equal hash (hash_of_git_object base));
+      Format.printf "CRC-32 correct: %b\n%!"
+        (Int32.equal (Crc32.to_int32 crc) (Crc32.to_int32 (Decoder.Base.first_crc base)));
       base_to_entry hash base :: acc
     | Error exn ->
       (Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
@@ -288,12 +320,20 @@ let () =
       assert false) 0 tree_idx
   in
 
+  Format.printf "Max length: %d\n%!" max_length;
+
   let raw0, raw1 = Cstruct.create max_length, Cstruct.create max_length in
 
   let each_git_object (hash, (crc, offset)) =
     match Decoder.get' pack hash z_tmp z_win (raw0, raw1) with
     | Ok base ->
-      Format.printf "Get the git object: %a\n%!" SHA1.pp hash
+      Format.printf "Get the git object (offset: %Lx): %a\n%!" (Decoder.Base.first_offset base) SHA1.pp hash;
+      Format.printf "Hash correct: %b\n%!"
+        (SHA1.equal hash (hash_of_git_object base));
+      Format.printf "CRC-32 correct: %b\n%!"
+        (Int32.equal (Crc32.to_int32 crc) (Crc32.to_int32 (Decoder.Base.first_crc base)));
+      if not (Int32.equal (Crc32.to_int32 crc) (Crc32.to_int32 (Decoder.Base.first_crc base)))
+      then Format.eprintf "ERROR CRC-32 FOR PACK OBJECT AT %Lx\n%!" (Decoder.Base.first_offset base);
     | Error exn ->
       Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
       assert false
