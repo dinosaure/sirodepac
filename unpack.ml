@@ -9,6 +9,15 @@ let bin_of_int d =
   in
   String.concat "" (aux [] d)
 
+let pp_cstruct fmt cs =
+  Format.fprintf fmt "\"";
+  for i = 0 to Cstruct.len cs - 1
+  do if Cstruct.get_uint8 cs i > 32 && Cstruct.get_uint8 cs i < 127
+    then Format.fprintf fmt "%c" (Cstruct.get_char cs i)
+    else Format.fprintf fmt "."
+  done;
+  Format.fprintf fmt "\""
+
 module Window =
 struct
   type t =
@@ -92,7 +101,7 @@ struct
 
   let pp_obj fmt = function
     | Insert buf ->
-      Format.fprintf fmt "(Insert %a)" Cstruct.hexdump_pp buf
+      Format.fprintf fmt "(Insert %a)" pp_cstruct buf
     | Copy (off, len) ->
       Format.fprintf fmt "(Copy (%d, %d))" off len
 
@@ -1016,6 +1025,7 @@ struct
                 ; consumed : int
                 ; offset   : int64
                 ; crc      : Crc32.t
+                ; hunks    : H.hunks
                 ; base     : from }
       | Direct of { consumed : int
                   ; offset   : int64
@@ -1028,13 +1038,14 @@ struct
       ; from     : from }
 
     let rec pp_from fmt = function
-      | Hunk { length; consumed; offset; crc; base; } ->
+      | Hunk { length; consumed; offset; crc; hunks; base; } ->
         Format.fprintf fmt "(Hunk { @[<hov>length = %d;@ \
                                            consumed = %d;@ \
                                            offset = %Lx;@ \
                                            crc = @[<hov>%a@];@ \
+                                           hunks = @[<hov>%a@];@ \
                                            base = @[<hov>%a@];@] })"
-          length consumed offset Crc32.pp crc pp_from base
+          length consumed offset Crc32.pp crc H.pp_hunks hunks pp_from base
       | Direct { consumed; offset; crc; } ->
         Format.fprintf fmt "(Direct { @[<hov>consumed = %d;@ \
                                              offset = %Lx;@ \
@@ -1097,6 +1108,7 @@ struct
                                      ; consumed = partial_hunks._consumed
                                      ; offset   = partial_hunks._offset
                                      ; crc      = partial_hunks._crc
+                                     ; hunks
                                      ; base     = base.from } }
       else Error (Invalid_target (target_length, hunks.H.target_length))
 
