@@ -672,7 +672,7 @@ struct
       o_off o_pos o_len write Hash.pp pack pp_state state
 
   let flush dst t =
-    let () = Hash.feed t.hash (Cstruct.to_bigarray (Cstruct.sub dst t.o_off t.o_pos)) in
+    Hash.feed t.hash (Cstruct.to_bigarray (Cstruct.sub dst t.o_off t.o_pos));
     Flush t
 
   module Int32 =
@@ -892,7 +892,7 @@ struct
     let put_hash ?(digest = true) hash k dst t =
       if t.o_len - t.o_pos >= Hash.length
       then begin
-        Cstruct.blit_from_string hash 0 dst (t.o_off + t.o_pos) Hash.length;
+        Cstruct.blit hash 0 dst (t.o_off + t.o_pos) Hash.length;
         k dst { t with o_pos = t.o_pos + Hash.length
                      ; write = t.write + Hash.length }
       end else
@@ -900,14 +900,14 @@ struct
           if rest = 0
           then k dst t
           else
-            let n = min Hash.length (t.o_len - t.o_pos) in
+            let n = min rest (t.o_len - t.o_pos) in
 
             if n = 0
             then let t = { t with state = Hash (loop rest) } in
                  if digest then flush dst t else Flush t
             else begin
-              Cstruct.blit_from_string hash (Hash.length - rest) dst (t.o_off + t.o_pos) n;
-              let t = { t with state = Hash (loop rest)
+              Cstruct.blit hash (Hash.length - rest) dst (t.o_off + t.o_pos) n;
+              let t = { t with state = Hash (loop (rest - n))
                              ; o_pos = t.o_pos + n
                              ; write = t.write + n }
               in
@@ -924,11 +924,12 @@ struct
     Int64.(integer >> 31) <> 0L
 
   let hash dst t =
-    (KHash.put_hash (Hash.to_string t.pack)
+    (KHash.put_hash (Cstruct.of_bigarray t.pack)
      @@ fun dst t ->
      Hash.feed t.hash (Cstruct.to_bigarray (Cstruct.sub dst t.o_off t.o_pos));
      let hash = Hash.get t.hash in
-     KHash.put_hash ~digest:false (Hash.to_string hash) (fun _ t -> ok t) dst t)
+
+     KHash.put_hash ~digest:false (Cstruct.of_bigarray hash) (fun _ t -> ok t) dst t)
     dst t
 
   let rec boffsets idx dst t =
