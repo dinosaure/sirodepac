@@ -323,17 +323,17 @@ struct
 
   let compare a b =
     if Kind.to_int a.kind > Kind.to_int b.kind
-    then (-1)
+    then (1)
     else if Kind.to_int a.kind < Kind.to_int b.kind
-    then 1
+    then (-1)
     else if a.hash_name > b.hash_name
-    then (-1)
+    then (1)
     else if a.hash_name < b.hash_name
-    then 1
-    else if a.length > b.length
     then (-1)
+    else if a.length > b.length
+    then (1)
     else if a.length < b.length
-    then 1
+    then (-1)
     else Pervasives.compare a b
     (* XXX(dinosaure): git compare the preferred base and the memory address of
                        the object to take the newest. obviously, it's not possible
@@ -697,14 +697,14 @@ struct
                    ; z : (Decompress.B.bs, Decompress.B.bs) Decompress.Deflate.t }
     | Save   of { current : base; crc : Crc32.t; }
     | Hash   of k
-    | End
+    | End    of Hash.t
     | Exception of error
   and res =
     | Wait of t
     | Flush of t
     | Error of t * error
     | Cont of t
-    | Ok of t
+    | Ok of t * Hash.t
   and kind =
     | KOffset of base * base * Hunk.t list
     | KHash of string * Hunk.t list
@@ -740,7 +740,7 @@ struct
                              crc = %a;@] })"
         pp_base current Crc32.pp crc
     | Hash _ -> pp fmt "(Hash #k)"
-    | End -> pp fmt "End"
+    | End hash -> pp fmt "(End %a)" Hash.pp hash
     | Exception exn -> pp fmt "(Exception %a)" pp_error exn
 
   let pp fmt { o_off; o_pos; o_len; write; radix; objects; state; } =
@@ -762,7 +762,7 @@ struct
     Flush t
 
   let error t exn = Error ({ t with state = Exception exn }, exn)
-  let ok    t = Ok ({ t with state = End })
+  let ok t hash   = Ok ({ t with state = End hash }, hash)
 
   module KHeader =
   struct
@@ -906,9 +906,7 @@ struct
     Hash.feed t.hash (Cstruct.to_bigarray (Cstruct.sub dst t.o_off t.o_pos));
     let hash = Hash.get t.hash in
 
-    Format.eprintf "Hash result: %a\n%!" Hash.pp hash;
-
-    KHash.put_hash (Cstruct.of_bigarray hash) (fun _ -> ok) dst t
+    KHash.put_hash (Cstruct.of_bigarray hash) (fun dst t -> ok t hash) dst t
 
   let pp_list ?(sep = (fun fmt () -> ())) pp_data fmt lst =
     let rec aux = function
@@ -1167,17 +1165,17 @@ struct
             && current.entry.Entry.name = base.entry.Entry.name
          then begin
            let hunk =
-             let current_raw' = split_by '\n' current.raw in
-             let base_raw'    = split_by '\n' base.raw in
+               let current_raw' = split_by '\n' current.raw in
+               let base_raw'    = split_by '\n' base.raw in
 
-             Pdiff.get_hunks
-               ~array:(module ArrayOfCstruct)
-               ~hashtbl:(module CstructHashtbl)
-               ~compare:Cstruct.compare
-               ~context:(-1)
-               ~a:base_raw' ~b:current_raw'
-             |> List.hd
-             |> Hunk.of_cstruct_patience_diff
+               Pdiff.get_hunks
+                 ~array:(module ArrayOfCstruct)
+                 ~hashtbl:(module CstructHashtbl)
+                 ~compare:Cstruct.compare
+                 ~context:(-1)
+                 ~a:base_raw' ~b:current_raw'
+               |> List.hd
+               |> Hunk.of_cstruct_patience_diff
            in
 
            Format.eprintf "%a diff %a: %d %% (%d / %d)\n%!"
@@ -1269,8 +1267,6 @@ struct
 
   let idx t = t.radix
 
-  let hash t = Hash.get t.hash
-
   let eval dst t =
     let eval0 t = match t.state with
       | Header k -> k dst t
@@ -1283,7 +1279,7 @@ struct
       | Save { current; crc; } -> save_entry dst t current crc
       | Exception exn -> error t exn
       | Hash k -> k dst t
-      | End -> Ok t
+      | End hash -> Ok (t, hash)
     in
 
     let rec loop t =
@@ -1291,7 +1287,7 @@ struct
       | Cont t -> loop t
       | Wait t -> `Await t
       | Flush t -> `Flush t
-      | Ok t -> `End t
+      | Ok (t, hash) -> `End (t, hash)
       | Error (t, exn) -> `Error (t, exn)
     in
 
