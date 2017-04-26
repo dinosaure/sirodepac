@@ -201,11 +201,11 @@ let make_pack pack_fmt idx_fmt pack entries =
     | `Error (t, exn) ->
       Format.eprintf "PACK encoder: %a\n%!" PACKEncoder.pp_error exn;
       assert false
-    | `End t ->
+    | `End (t, hash) ->
       if PACKEncoder.used_out t <> 0
       then Format.fprintf pack_fmt "%s%!" (Cstruct.to_string (Cstruct.sub o_tmp 0 (PACKEncoder.used_out t)));
 
-      PACKEncoder.idx t, PACKEncoder.hash t
+      PACKEncoder.idx t, hash
   in
 
   let rec loop_idx t =
@@ -225,6 +225,9 @@ let make_pack pack_fmt idx_fmt pack entries =
   in
 
   let tree_idx, hash_pack = loop_pack (PACKEncoder.default h_tmp entries) in
+
+  Format.printf "Hash produced: %a\n%!" SHA1.pp hash_pack;
+
   loop_idx (IDXEncoder.default (Radix.to_sequence tree_idx) hash_pack)
 
 let idx_filename  = "pack.idx"
@@ -281,16 +284,8 @@ let () =
     match Decoder.get' pack hash z_tmp z_win (raw0, raw1) with
     | Ok ({ Decoder.Base.kind = `Tree; _ } as base) ->
       save_names_of_tree hash base.Decoder.Base.raw;
-      Format.printf "Hash correct: %b\n%!"
-        (SHA1.equal hash (hash_of_git_object base));
-      Format.printf "CRC-32 correct: %b\n%!"
-        (Int32.equal (Crc32.to_int32 crc) (Crc32.to_int32 (Decoder.Base.first_crc base)));
       base_to_entry hash base :: acc
     | Ok base ->
-      Format.printf "Hash correct: %b\n%!"
-        (SHA1.equal hash (hash_of_git_object base));
-      Format.printf "CRC-32 correct: %b\n%!"
-        (Int32.equal (Crc32.to_int32 crc) (Crc32.to_int32 (Decoder.Base.first_crc base)));
       base_to_entry hash base :: acc
     | Error exn ->
       (Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
@@ -327,13 +322,7 @@ let () =
   let each_git_object (hash, (crc, offset)) =
     match Decoder.get' pack hash z_tmp z_win (raw0, raw1) with
     | Ok base ->
-      Format.printf "Get the git object (offset: %Lx): %a\n%!" (Decoder.Base.first_offset base) SHA1.pp hash;
-      Format.printf "Hash correct: %b\n%!"
-        (SHA1.equal hash (hash_of_git_object base));
-      Format.printf "CRC-32 correct: %b\n%!"
-        (Int32.equal (Crc32.to_int32 crc) (Crc32.to_int32 (Decoder.Base.first_crc base)));
-      if not (Int32.equal (Crc32.to_int32 crc) (Crc32.to_int32 (Decoder.Base.first_crc base)))
-      then Format.eprintf "ERROR CRC-32 FOR PACK OBJECT AT %Lx\n%!" (Decoder.Base.first_offset base);
+      Format.printf "Get the git object: %a\n%!" SHA1.pp hash;
     | Error exn ->
       Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
       assert false
