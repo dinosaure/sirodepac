@@ -16,3 +16,25 @@ let clear t =
 
 let create len = UniformArray.create len CheapOption.none
 let blit src src_pos dst dst_pos len = UniformArray.blit src src_pos dst dst_pos len
+
+let pp pp_data fmt arr =
+  let len = length arr in
+
+  let pp_data fmt = function
+    | Some x -> pp_data fmt x
+    | None -> Format.fprintf fmt "<none>"
+  in
+
+  let rec aux fmt idx =
+    if idx = len
+    then ()
+    else if idx = len - 1
+    then pp_data fmt (get arr idx)
+    else begin
+      Format.fprintf fmt "%05d: %a;@\n" idx pp_data (get arr idx);
+      aux fmt (idx + 1)
+    end
+  in
+
+  Format.fprintf fmt "[| @[<hov>%a@] |]" aux 0
+

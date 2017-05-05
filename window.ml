@@ -10,6 +10,7 @@ type 'a t =
   ; mutable b : int
   ; len       : int
   ; buf       : 'a CheapArray.t }
+  (* XXX(dinosaure): replace to 'a option array? TODO! *)
 
 let make len =
   { a = 0
@@ -77,18 +78,3 @@ let foldi t f a =
 
 let fold t f a =
   foldi t (fun acc idx x -> f acc x) a
-
-(* XXX(dinosaure): I'm not sure about this function. *)
-let nth t i =
-  let pre = t.len - t.a in
-  let extra = i - pre in
-
-  let value_opt =
-    if extra >= 0
-    then CheapArray.get t.buf extra
-    else CheapArray.get t.buf (t.a + i)
-  in
-
-  match value_opt with
-  | Some x -> x
-  | None -> raise (Invalid_argument "Window.nth")

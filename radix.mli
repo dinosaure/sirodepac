@@ -15,6 +15,7 @@ sig
   val is_empty    : 'a t -> bool
   val bind        : 'a t -> Key.t -> 'a -> 'a t
   val lookup      : 'a t -> Key.t -> 'a option
+  val exists      : 'a t -> Key.t -> bool
   val fold        : (Key.t * 'a -> 'b -> 'b) -> 'b -> 'a t -> 'b
   val iter        : (Key.t * 'a -> unit) -> 'a t -> unit
   val to_sequence : 'a t -> (Key.t * 'a) sequence

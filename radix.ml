@@ -176,6 +176,11 @@ struct
       let keylen = Key.length key in
       lookup key 0 keylen tree
 
+  let exists tree key =
+    match lookup tree key with
+    | None -> false
+    | Some _ -> true
+
   let rec fold f acc tree = match tree with
     | L (k, v) -> f (k, v) acc
     | T (m, k, v) ->

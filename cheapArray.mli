@@ -12,3 +12,4 @@ val set_some : 'a t -> int -> 'a -> unit
 val set_none : 'a t -> int -> unit
 val clear : 'a t -> unit
 val blit : 'a t -> int -> 'a t -> int -> int -> unit
+val pp : (Format.formatter -> 'a -> unit) -> Format.formatter -> 'a t -> unit

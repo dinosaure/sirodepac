@@ -20,8 +20,6 @@ let pp_array pp_data fmt arr =
   Format.fprintf fmt "[| @[<hov>%a@] |]"
     (pp_list ~sep:(fun fmt () -> Format.fprintf fmt ";@ ") pp_data) (Array.to_list arr)
 
-open Patience_diff_lib
-
 let () =
   if Array.length Sys.argv = 3
   then
@@ -49,4 +47,4 @@ let () =
       hunks;
 
     ()
-else Format.eprintf "%s filename filename\n%!" Sys.argv.(0)
+  else Format.eprintf "%s filename filename\n%!" Sys.argv.(0)

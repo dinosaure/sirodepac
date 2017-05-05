@@ -22,32 +22,3 @@ let pp fmt x =
   Format.fprintf fmt "%08lx" (to_int32 x)
 
 let default = of_int32 0l
-
-(*
-
-let cstruct_map filename =
-  let i = Unix.openfile filename [ Unix.O_RDONLY ] 0o644 in
-  let m = Bigarray.Array1.map_file i Bigarray.Char Bigarray.c_layout false (-1) in
-  Cstruct.of_bigarray m
-
-let () =
-  let filename = Sys.argv.(1) in
-  let chunk = 32 in
-
-  let map = cstruct_map filename in
-
-  let rec loop off rest crc =
-    let n = min chunk rest in
-
-    if n = 0
-    then Format.printf "%a\n%!" pp crc
-    else loop (off + n) (rest - n) (digest crc ~off ~len:n map)
-  in
-
-  let crc = digest default ~off:0 ~len:2 map in
-
-  Format.printf "start with: %a\n%!" pp crc;
-
-  loop 2 (Cstruct.len map - 2) crc;
-
-*)
