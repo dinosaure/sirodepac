@@ -74,6 +74,8 @@ struct
       end
     in aux 0 1; tmp
 
+  let hash = Hashtbl.hash
+
   exception Break
 
   let equal a b =

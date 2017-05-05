@@ -11,6 +11,9 @@ sig
   val feed : ctx -> buffer -> unit
   val get : ctx -> t
   val init : unit -> ctx
+  val compare : t -> t -> int
+  val hash : t -> int
+  val equal : t -> t -> bool
 end
 
 module Lazy (Hash : HASH) =
@@ -26,6 +29,8 @@ struct
     | Invalid_version version -> pp fmt "(Invalid_version %ld)" version
     | Invalid_index -> pp fmt "Invalid_index"
 
+  module Cache = Lru.M.Make(Hash)(struct type t = Crc32.t * int64 let weight _ = 1 end)
+
   type t =
     { map           : Cstruct.t
     ; fanout_offset : int
@@ -33,7 +38,7 @@ struct
     ; crcs_offset   : int
     ; values_offset : int
     ; v64_offset    : int option
-    ; cache         : (Crc32.t * Int64.t) LRU.t }
+    ; cache         : Cache.t }
 
   let has map off len =
     if (off < 0 || len < 0 || off + len > Cstruct.len map)
@@ -83,13 +88,13 @@ struct
          ; crcs_offset
          ; values_offset
          ; v64_offset = None
-         ; cache = LRU.make 1024 }
+         ; cache = Cache.create ~random:true 1024 }
 
   exception Break
 
   let compare buf off hash =
     try for i = 0 to 19
-        do if Cstruct.get_char buf (off + i) <> String.get hash i
+        do if Cstruct.get_char buf (off + i) <> Cstruct.get_char hash i
            then raise Break
         done; true
     with Break -> false
@@ -100,7 +105,7 @@ struct
   let lt buf off hash =
     try for i = 0 to 19
         do let a = Cstruct.get_uint8 buf (off + i) in
-           let b = Char.code @@ String.get hash i in
+           let b = Cstruct.get_uint8 hash i in
 
            if a > b
            then raise ReturnT
@@ -146,7 +151,7 @@ struct
                      integer is safe.
    *)
   let fanout_idx t hash =
-    match Char.code @@ String.get hash 0 with
+    match Cstruct.get_uint8 hash 0 with
     | 0 ->
       let n = Cstruct.BE.get_uint32 t.map t.fanout_offset in
       Ok (binary_search (Cstruct.sub t.map t.hashes_offset (Int32.to_int n * 20)) hash)
@@ -167,16 +172,16 @@ struct
     Cstruct.sub t.map (t.hashes_offset + off) 20
 
   let find t hash =
-    match LRU.find t.cache hash with
+    match Cache.find hash t.cache with
     | Some (crc, offset) -> Some (crc, offset)
     | None ->
-      match fanout_idx t hash with
+      match fanout_idx t (Cstruct.of_bigarray hash) with
       | Ok idx ->
         let crc = Cstruct.BE.get_uint32 t.map (t.crcs_offset + (idx * 4)) in
         let off = Int64.of_int32 @@ Cstruct.BE.get_uint32 t.map (t.values_offset + (idx * 4)) in
         (* XXX(dinosaure): need to check if it's a big offset or not. TODO! *)
 
-        LRU.add t.cache hash (Crc32.of_int32 crc, off);
+        Cache.add hash (Crc32.of_int32 crc, off) t.cache;
 
         Some (Crc32.of_int32 crc,  off)
       | Error _ -> None
