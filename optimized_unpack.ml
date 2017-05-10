@@ -236,7 +236,7 @@ let cstruct_map filename =
 
 let idx_from_filename filename =
   let map = cstruct_map filename in
-  let len = 0x800 in
+  let len = 0x8000 in
 
   let rec loop tree off t =
     match IDXDecoder.eval map t with
@@ -256,9 +256,9 @@ let idx_from_filename filename =
   loop Radix.empty 0 (IDXDecoder.make ())
 
 (* global tempory buffer *)
-let z_tmp = Cstruct.create 0x800
-let o_tmp = Cstruct.create 0x800
-let h_tmp = Cstruct.create 0x800
+let z_tmp = Cstruct.create 0x8000
+let o_tmp = Cstruct.create 0x8000
+let h_tmp = Cstruct.create 0x8000
 let z_win = Decompress.Window.create ~proof:Decompress.B.proof_bigstring
 let p_nam = Hashtbl.create 100
 
