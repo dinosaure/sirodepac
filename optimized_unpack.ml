@@ -333,6 +333,7 @@ let () =
       if SHA1.neq (hash_of_object base) hash
       then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object base) SHA1.pp hash;
 
+      Format.eprintf "unpack object: %a\n%!" SHA1.pp hash;
       save_names_of_tree hash base.Decoder.Object.raw;
       Cache.add hash (`Tree, cstruct_copy base.Decoder.Object.raw) lru_cache;
       object_to_entry hash base :: acc
@@ -340,6 +341,7 @@ let () =
       if SHA1.neq (hash_of_object base) hash
       then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object base) SHA1.pp hash;
 
+      Format.eprintf "unpack object: %a\n%!" SHA1.pp hash;
       Cache.add hash (base.Decoder.Object.kind, cstruct_copy base.Decoder.Object.raw) lru_cache;
       object_to_entry hash base :: acc
     | Error exn ->
@@ -412,8 +414,8 @@ let () =
         if SHA1.neq (hash_of_object new_base) hash
         then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object new_base) SHA1.pp hash;
 
+        Format.eprintf "unpack object: %a\n%!" SHA1.pp hash;
         Cache.add hash (new_base.Decoder.Object.kind, cstruct_copy new_base.Decoder.Object.raw) lru_cache;
-        Format.eprintf "Get the git object: %a\n%!" SHA1.pp hash;
       | Error exn, _ | _, Error exn ->
         Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
         assert false
