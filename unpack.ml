@@ -1243,7 +1243,7 @@ struct
     ; hash = (Hash.of_string (String.make Hash.length '\000')) (* TODO *) }
 
   (* XXX(dinosaure): this function returns the max length needed to undelta-ify a PACK object. *)
-  let needed ?(chunk = 0x800) t hash z_tmp z_win =
+  let needed ?(chunk = 0x8000) t hash z_tmp z_win =
     let get absolute_offset =
       let window, relative_offset = find t absolute_offset in
       let state = P.from_window window relative_offset z_tmp z_win in

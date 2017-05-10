@@ -326,6 +326,7 @@ let () =
   let max_length = IDXLazy.fold old_idx (fun hash _ acc -> match Decoder.needed old_pack hash z_tmp z_win with
       | Ok length ->
         Format.eprintf "get length for %a: %d\n%!" SHA1.pp hash (max length acc);
+        Gc.compact ();
         max length acc
       | Error exn ->
         Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
