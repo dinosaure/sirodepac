@@ -273,7 +273,7 @@ struct
 
   let rec offsets idx boffs max src t =
     if Int32.compare idx max >= 0
-    then (if boffs > 0 then boffsets (Array.make boffs 0L) 0 boffs src t else hash src t)
+    then (if boffs > 0 then begin Format.eprintf "Has a bigoffset: %d\n%!" boffs; boffsets (Array.make boffs 0L) 0 boffs src t end else hash src t)
     else KOffsets.get_u32_and_msb
            (fun (offset, msb) src t ->
              Queue.add (offset, msb) t.offsets;
