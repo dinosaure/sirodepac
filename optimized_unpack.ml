@@ -295,7 +295,7 @@ let pp_list ?(sep = (fun fmt () -> ()) )pp_data fmt lst =
     | x :: r -> Format.fprintf fmt "%a%a" pp_data x sep (); aux r
   in aux lst
 
-module Cache = Lru.M.Make(SHA1)(struct type t = Decoder.kind * Cstruct.t let weight (_, x) = Cstruct.len x end)
+module Cache = Lru.M.Make(SHA1)(struct type t = Decoder.kind * Cstruct.t let weight (_, x) = 1 + 3 + Cstruct.len x + 1  end)
 module Rev = Map.Make(Int64)
 
 let cstruct_copy x =
@@ -308,7 +308,7 @@ let () =
   let (old_tree_idx, _) = idx_from_filename Sys.argv.(2) in
 
   let rev_index = Radix.fold (fun (k, (_, off)) acc -> Rev.add off k acc) Rev.empty old_tree_idx in
-  let lru_cache = Cache.create 0x8000 in
+  let lru_cache = Cache.create (0x8000 * 10)  in
   let old_pack = Decoder.make (Unix.openfile Sys.argv.(1) [ Unix.O_RDONLY ] 0o644)
       (fun hash -> Cache.find hash lru_cache)
       (fun hash -> Radix.lookup old_tree_idx hash)
@@ -358,14 +358,14 @@ let () =
       entries
   in
 
-  match Delta.deltas entries
+  match Delta.deltas ~memory:true entries
       (fun hash -> match Decoder.get old_pack hash z_tmp z_win with
          | Ok base -> Some base.Decoder.Object.raw
          | Error exn ->
            Format.eprintf "Silent error with %a: %a\n%!" SHA1.pp hash Decoder.pp_error exn;
            None)
       (fun hash -> false) (* we tag all object to [false]. *)
-      10 50 with
+      (max_length * 10) 50 with
   | Ok entries ->
     Format.eprintf "Start to write the new PACK file.\n%!";
 
@@ -374,7 +374,7 @@ let () =
     let pack_fmt = Format.formatter_of_out_channel pack_out in
     let idx_fmt  = Format.formatter_of_out_channel idx_out in
 
-    let access hash = match Decoder.get old_pack hash z_tmp z_win with
+    let access hash = match Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
       | Ok base -> Some base.Decoder.Object.raw
       | Error exn ->
         Format.eprintf "Silent error with %a: %a\n%!" SHA1.pp hash Decoder.pp_error exn;

@@ -70,6 +70,8 @@ struct
     Format.fprintf fmt "{ @[<hov>offset = %d;@ \
                                  hash = %x;@] }"
       entry.offset entry.hash
+
+  let memory_size _ = 2
 end
 
 module Index =
@@ -78,6 +80,9 @@ struct
     { hash : Entry.t list array
     ; mask : int
     ; buff : Cstruct.t }
+
+  let memory_size { hash; mask; buff; } =
+    3 + (Cstruct.len buff + 1) + 1 + (Array.fold_left (fun acc x -> List.length x * 4 + 1 + acc) 1 hash)
 
   let pp fmt index =
     let pp_lst fmt lst =

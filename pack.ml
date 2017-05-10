@@ -588,6 +588,8 @@ end
 
 module MakeDelta (Hash : HASH) =
 struct
+  module Entry  = Entry(Hash)
+
   type t =
     { mutable delta : delta }
   and delta =
@@ -596,12 +598,22 @@ struct
            ; depth      : int
            ; hunks      : Rabin.e list
            ; src        : t
-           ; src_length : int64 (* XXX(dinosaure): this is then length of the inflated raw of [src]. *)
+           ; src_length : int64 (* XXX(dinosaure): this is the length of the inflated raw of [src]. *)
            ; src_hash   : Hash.t }
     (* XXX(dinosaure): I try to use GADT (peano number) and ... I really crazy. *)
 
-  module Entry  = Entry(Hash)
-  module Window = Lru.F.Make(Entry)(struct type nonrec t = t * Cstruct.t * Rabin.Index.t let weight _ = 1 end)
+  module MV =
+  struct
+    type nonrec t = t * Cstruct.t * Rabin.Index.t
+
+    let weight (_, raw, rabin) =
+      1 + Cstruct.len raw + 1 + (Rabin.Index.memory_size rabin)
+  end
+
+  module AV = struct type nonrec t = t * Cstruct.t * Rabin.Index.t let weight _ = 1 end
+
+  module type WINDOW = Lru.F.S with type k = Entry.t and type v = t * Cstruct.t * Rabin.Index.t
+  type window = (module WINDOW)
 
   let rec pp_delta fmt = function
     | Z -> Format.fprintf fmt "Τ"
@@ -648,7 +660,9 @@ struct
 
   let only_insert = List.for_all (function Rabin.I _ -> true | Rabin.C _ -> false)
 
-  let delta trg_entry trg_raw trg window max =
+  let delta
+    : type window. window -> (module WINDOW with type t = window) -> int -> Entry.t -> Cstruct.t -> t -> (Entry.t * Rabin.e list * int) option
+    = fun window window_pack max trg_entry trg_raw trg ->
     let limit src = match trg.delta with
       | S { length; src; _ } ->
         length * (max - (depth src)) / (max - (depth trg + 1))
@@ -688,6 +702,8 @@ struct
 
         choose best (Some (src_entry, hunks, length))
     in
+
+    let module Window = (val window_pack) in
 
     if not trg_entry.Entry.preferred
        && (depth trg) < max
@@ -739,7 +755,10 @@ struct
 
   exception Uncaught_hash of Hash.t
 
-  let deltas entries get tag window max =
+  module MemoryCache = Lru.F.Make(Entry)(MV)
+  module AbstractCache = Lru.F.Make(Entry)(AV)
+
+  let deltas ?(memory = false) entries get tag window max =
     let to_delta e = match e.Entry.delta, e.Entry.preferred with
       | Entry.None, false -> e.Entry.length >= 50L
       | _ -> false
@@ -756,6 +775,15 @@ struct
     in
 
     try
+      let window_pack =
+        if memory
+        then (module MemoryCache : WINDOW)
+        else (module AbstractCache : WINDOW)
+      in
+
+      let module Window = (val window_pack) in
+      let window_pack = (module Window : WINDOW with type t = Window.t) in
+
       let window = Window.empty window in
       let normal = Hashtbl.create (List.length tries) in
 
@@ -811,7 +839,7 @@ struct
             let rabin  = Rabin.Index.make ~copy:false raw in (* we keep [rabin] with [raw] in the [window]. *)
             let window = Window.add entry (base, raw, rabin) window in
 
-            match delta entry raw base window max with
+            match delta window window_pack max entry raw base with
             | None -> window, (entry, base) :: acc
             | Some (src_entry, hunks, length) ->
               match Window.find ~promote:true src_entry window with
@@ -851,13 +879,15 @@ sig
   val eval     : Cstruct.t -> Cstruct.t -> t -> [ `Flush of t | `Await of t | `Error of (t * error) | `End of t ]
 end
 
-module MakePACKEncoder (Hash : HASH) (Deflate : Z) =
+module MakePACKEncoder (Hash : HASH) (_ : Z) =
 struct
   module Entry = Entry(Hash)
   module Delta = MakeDelta(Hash)
   module Radix = Radix.Make(Rakia.Bi)
   module Write = Set.Make(Hash)
   module HunkEncoder = MakeHunkEncoder(Hash)
+
+  module Deflate = Decompress.Deflate
 
   type error = ..
   type error += Deflate_error of Deflate.error
@@ -895,15 +925,15 @@ struct
                 ; r   : (Entry.t * Delta.t) list
                 ; crc : Crc32.t
                 ; off : int64
-                ; l   : bool
-                ; z   : Deflate.t }
+                ; ui  : int
+                ; z   : (Decompress.B.bs, Decompress.B.bs) Deflate.t }
     | WriteH of { x   : Entry.t * Delta.t * Cstruct.t
                 ; r   : (Entry.t * Delta.t) list
                 ; crc : Crc32.t
                 ; off : int64
-                ; p   : int option
+                ; ui  : int
                 ; h   : HunkEncoder.t
-                ; z   : Deflate.t }
+                ; z   : (Decompress.B.bs, Decompress.B.bs) Deflate.t }
     | Save   of { x   : Entry.t
                 ; r   : (Entry.t * Delta.t) list
                 ; crc : Crc32.t
@@ -922,51 +952,6 @@ struct
     | KindRaw
 
   let pp = Format.fprintf
-
-  (*
-  letx pp_state fmt = function
-    | Header _ -> pp fmt "(Header #k)"
-    | Object _ -> pp fmt "(Object #k)"
-    | Raw { idx; off; } ->
-      pp fmt "(Raw { @[<hov>idx = %d;@ \
-                            off = %Ld;@] })"
-        idx off
-    | Finish { idx; off; } ->
-      pp fmt "(Finish { @[<hov>idx = %d;@ \
-                               off = %Ld;@] })"
-        idx off
-    | WriteHeader kind -> pp fmt "(WriteHeader #k)"
-    | WriteZip { current; crc; last; _ } ->
-      pp fmt "(WriteZip { @[<hov>current = @[<hov>%a@];@ \
-                                 last = %b;@ \
-                                 z = #deflate;@] })"
-        pp_base current last
-    | WriteHunk { current; crc; h; _ } ->
-      pp fmt "(WriteHunk { @[<hov>current = @[<hov>%a@];@ \
-                                  crc = %a;@ \
-                                  h = %a;@ \
-                                  z = #deflate;@] })"
-        pp_base current Crc32.pp crc H.pp h
-    | Save { current; crc; } ->
-      pp fmt "(Save { @[<hov>current = %a;@ \
-                             crc = %a;@] })"
-        pp_base current Crc32.pp crc
-    | Hash _ -> pp fmt "(Hash #k)"
-    | End hash -> pp fmt "(End %a)" Hash.pp hash
-    | Exception exn -> pp fmt "(Exception %a)" pp_error exn
-
-  let pp fmt { o_off; o_pos; o_len; write; radix; objects; state; } =
-    pp fmt "{ @[<hov>o_off = %d;@ \
-                     o_pos = %d;@ \
-                     o_len = %d;@ \
-                     write = %Ld;@ \
-                     radix = #tree;@ \
-                     objects = #list;@ \
-                     state = @[<hov>%a@];@] }"
-      o_off o_pos o_len
-      write
-      pp_state state
-  *)
 
   let flush dst t =
     Hash.feed t.hash (Cstruct.to_bigarray (Cstruct.sub dst t.o_off t.o_pos));
@@ -1157,14 +1142,14 @@ struct
 
       (KWriteK.header (Kind.to_bin entry.Entry.kind) entry.Entry.length Crc32.default
        @@ fun crc dst t ->
-       let z = Deflate.default 4 in
+       let z = Deflate.default ~proof:Decompress.B.proof_bigstring 4 in
        let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos) z in
 
        Cont { t with state = WriteZ { x = (entry, entry_raw)
                                     ; r = rest
                                     ; crc
                                     ; off = abs_off
-                                    ; l = false
+                                    ; ui = 0
                                     ; z } })
       dst t
 
@@ -1183,14 +1168,14 @@ struct
       (KWriteK.header 0b111 (Int64.of_int length) Crc32.default
        @@ fun crc -> KWriteK.hash (Cstruct.of_bigarray src_hash) crc
        @@ fun crc dst t ->
-       let z = Deflate.default 4 in
+       let z = Deflate.default ~proof:Decompress.B.proof_bigstring 4 in
        let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos) z in
 
        Cont { t with state = WriteH { x = (entry, entry_delta, entry_raw)
                                     ; r = rest
                                     ; crc
                                     ; off = abs_off
-                                    ; p = None
+                                    ; ui = 0
                                     ; h
                                     ; z } })
         dst t
@@ -1204,6 +1189,9 @@ struct
          let abs_off    = t.write in
          let rel_off    = Int64.sub abs_off src_off in
 
+         Format.eprintf "%a: Offset from %Ld:%Ld (source length: %Ld, target length: %d)\n%!"
+           Hash.pp entry.Entry.hash_object rel_off abs_off src_length trg_length;
+
          let h =
            HunkEncoder.flush 0 (Cstruct.len t.h_tmp)
            @@ HunkEncoder.default (HunkEncoder.Offset rel_off) (Int64.to_int src_length) trg_length hunks
@@ -1212,14 +1200,14 @@ struct
          (KWriteK.header 0b110 (Int64.of_int length) Crc32.default
           @@ fun crc -> KWriteK.offset rel_off crc
           @@ fun crc dst t ->
-          let z = Deflate.default 4 in
+          let z = Deflate.default ~proof:Decompress.B.proof_bigstring 4 in
           let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos) z in
 
           Cont { t with state = WriteH { x = (entry, entry_delta, entry_raw)
                                        ; r = rest
                                        ; crc
                                        ; off = abs_off
-                                       ; p = None
+                                       ; ui = 0
                                        ; h
                                        ; z } })
            dst t
@@ -1233,16 +1221,24 @@ struct
                      state to an error.
    *)
 
-  let writez dst t ((entry, entry_raw) as x) r crc off last z =
-    let rec loop last z = match Deflate.eval entry_raw dst z with
+  let writez dst t ((entry, entry_raw) as x) r crc off used_in z =
+    let src' = Decompress.B.from_bigstring (Cstruct.to_bigarray entry_raw) in
+    let dst' = Decompress.B.from_bigstring (Cstruct.to_bigarray dst) in
+
+    (* assert than [entry_raw] is physically the same and immutable at each call of [writez].
+       that means the deflate state compute all the time the same [src'] buffer.
+       so, [used_in] is equivalent semantically for each call.
+     *)
+
+    let rec loop used_in z = match Deflate.eval src' dst' z with
       | `Await z ->
-        if last
-        then loop true (Deflate.finish z)
-        else loop true (Deflate.no_flush 0 (Cstruct.len entry_raw) z)
+        if used_in = Cstruct.len entry_raw
+        then loop used_in (Deflate.finish z)
+        else loop (Deflate.used_in z) (Deflate.no_flush (Deflate.used_in z) (Cstruct.len entry_raw - Deflate.used_in z) z)
       | `Flush z ->
         let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
 
-        flush dst { t with state = WriteZ { x; r; crc; off; l = last; z; }
+        flush dst { t with state = WriteZ { x; r; crc; off; ui = (Deflate.used_in z); z; }
                          ; o_pos = t.o_pos + (Deflate.used_out z)
                          ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
       | `End z ->
@@ -1254,71 +1250,51 @@ struct
       | `Error (z, exn) -> error t (Deflate_error exn)
     in
 
-    loop last z
+    loop used_in z
 
-  (* XXX(dinosaure): oh god this code. This is a code and it's constraint by an
-                     __unspecified__ semantic of [Deflate]. In the hood, we use
-                     [Decompress] or [Zlib] but these libraries are little
-                     different. In fact, [Zlib] completes the input __and__ the
-                     output at any time and [Decompress] waits all input to
-                     start to write something. Another point is, [Decompress]
-                     consumes all of the input and [Zlib] can be stop one time.
+  let writeh dst t ((entry, entry_delta, entry_raw) as x) r crc off used_in h z =
+    let src' = Decompress.B.from_bigstring (Cstruct.to_bigarray t.h_tmp) in
+    let dst' = Decompress.B.from_bigstring (Cstruct.to_bigarray dst) in
 
-                     These behaviours should be not impact the code but some
-                     errors can happen if you use some functions with some
-                     specific arguments. For example, in the [`Flush] branch of
-                     [Deflate], with [Decompress], you can't use
-                     [Deflate.no_flush]. Otherwise, with [Zlib], you can't send
-                     an empty buffer ...
-
-                     For all of these details this function __does__ not fail
-                     ... yet! So take care if you want to change something.
-   *)
-  let writeh dst t ((entry, entry_delta, entry_raw) as x) r crc off p h z =
-    match Deflate.eval t.h_tmp dst z with
+    match Deflate.eval src' dst' z with
     | `Await z ->
       (match HunkEncoder.eval t.h_tmp h with
        | `Flush h ->
-         let p, h, z = match p, Deflate.used_in z with
-          | Some p, n ->
-            if n < p
-            then Some (p - n), HunkEncoder.consume n h, Deflate.no_flush n (p - n) z
-            else None, HunkEncoder.flush 0 (Cstruct.len t.h_tmp) h, Deflate.no_flush 0 0 z
-          | None, 0 ->
-            Some (HunkEncoder.used_out h), h, Deflate.no_flush 0 (HunkEncoder.used_out h) z
-          | None, n -> assert false
+         let used_in' = used_in + Deflate.used_in z in
+           (* ce qu'a consommé [zlib] ou [decompress] entre [used_in] et [HunkEncoder.used_out h]:
+              - dans le cas de [decompress], [used_in] retournera toujours le nombre de bytes qu'à écrit [HunkEncoder]
+              - dans le cas de [zlib], [used_in] peut retourner un nombre inférieur à ce qu'à donné [HunkDecoder]
+
+              tant que [used_in] ne sera pas équivalent à [HunkEncoder.used_out], [t.h_tmp] est considéré comme physiquement le même et immutable.
+           *)
+
+         let z, h, ui =
+           if used_in' = HunkEncoder.used_out h
+           then Deflate.no_flush 0 0 z, HunkEncoder.flush 0 (Cstruct.len t.h_tmp) h, 0
+           else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
          in
 
-         Cont { t with state = WriteH { x; r; crc; off; p; h; z; } }
+         (* on assure que, dans ce contexte, [HunkEncoder.used_out] est constant.
+            en effet, tant qu'on aura pas tout consommé, [h] reste exactement le même.
+          *)
+
+         Cont { t with state = WriteH { x; r; crc; off; ui; h; z; } }
        | `End h ->
-         let p, h, z = match p, Deflate.used_in z with
-          | Some p, n ->
-            if n < p
-            then Some (p - n), HunkEncoder.consume n h, Deflate.no_flush n (p - n) z
-            else None, HunkEncoder.flush 0 (Cstruct.len t.h_tmp) h,
-                 (if HunkEncoder.used_out h = 0 then Deflate.finish z else Deflate.no_flush 0 0 z)
-          | None, 0 ->
-            (if HunkEncoder.used_out h = 0 then None else Some (HunkEncoder.used_out h)),
-            h, (if HunkEncoder.used_out h = 0 then Deflate.finish z else Deflate.no_flush 0 (HunkEncoder.used_out h) z)
-          | None, n -> assert false
+         let used_in' = used_in + Deflate.used_in z in
+
+         let z, h, ui =
+           if used_in' = HunkEncoder.used_out h
+           then Deflate.finish z, h, used_in'
+           else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
          in
 
-         Cont { t with state = WriteH { x; r; crc; off; p; h; z; } }
+         Cont { t with state = WriteH { x; r; crc; off; ui; h; z; } }
        | `Error (h, exn) -> error t (Hunk_error exn))
     | `Flush z ->
       let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
+      let used_in' = used_in + Deflate.used_in z in
 
-      let p, h, z = match p, Deflate.used_in z with
-        | Some p, n ->
-          if n < p
-          then Some (p - n), HunkEncoder.consume n h, Deflate.no_flush n (p - n) z
-          else None, HunkEncoder.flush 0 0 h, z
-        | None, 0 ->
-          (if HunkEncoder.used_out h = 0 then None else Some (HunkEncoder.used_out h)), h, z
-        | None, n -> assert false
-      in
-
-      flush dst { t with state = WriteH { x; r; crc; off; p; h; z; }
+      flush dst { t with state = WriteH { x; r; crc; off; ui = used_in'; h; z; }
                        ; o_pos = t.o_pos + (Deflate.used_out z)
                        ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
     | `End z ->
@@ -1372,8 +1348,8 @@ struct
       | Header k -> k dst t
       | Object k -> k dst t
       | WriteK k -> k dst t
-      | WriteZ { x; r; crc; off; l; z; } -> writez dst t x r crc off l z
-      | WriteH { x; r; crc; off; p; h; z; } -> writeh dst t x r crc off p h z
+      | WriteZ { x; r; crc; off; ui; z; } -> writez dst t x r crc off ui z
+      | WriteH { x; r; crc; off; ui; h; z; } -> writeh dst t x r crc off ui h z
       | Save { x; r; crc; off; } -> save dst t x r crc off
       | Exception exn -> error t exn
       | Hash k -> k dst t
@@ -1394,16 +1370,16 @@ struct
     if (t.o_len - t.o_pos) = 0
     then
       match t.state with
-      | WriteZ { x; r; crc; off; l; z; } ->
+      | WriteZ { x; r; crc; off; ui; z; } ->
         { t with o_off = offset
                ; o_len = len
                ; o_pos = 0
-               ; state = WriteZ { x; r; crc; off; l; z = Deflate.flush offset len z } }
-      | WriteH { x; r; crc; off; p; h; z; } ->
+               ; state = WriteZ { x; r; crc; off; ui; z = Deflate.flush offset len z } }
+      | WriteH { x; r; crc; off; ui; h; z; } ->
         { t with o_off = offset
                ; o_len = len
                ; o_pos = 0
-               ; state = WriteH { x; r; crc; off; p; h; z = Deflate.flush offset len z } }
+               ; state = WriteH { x; r; crc; off; ui; h; z = Deflate.flush offset len z } }
       | _ ->
         { t with o_off = offset
                ; o_len = len
