@@ -14,6 +14,12 @@ sig
   val equal   : t -> t -> bool
 end
 
+module Option =
+struct
+  let bind f = function Some x -> Some (f x) | None -> None
+  let value ~default = function Some x -> x | None -> default
+end
+
 module Decoder (Hash : HASH) =
 struct
   type error =
@@ -50,7 +56,7 @@ struct
     | Crcs      of k
     | Offsets   of k
     | Hash      of k
-    | Ret       of Hash.t * Hash.t
+    | Ret       of int64 array option * Hash.t * Hash.t
     | End       of Hash.t
     | Exception of error
   and res =
@@ -67,7 +73,9 @@ struct
     | Crcs _                    -> pp fmt "(Crcs #k)"
     | Offsets _                 -> pp fmt "(Offsets #k)"
     | Hash _                    -> pp fmt "(Hash #k)"
-    | Ret (hash_idx, hash_pack) -> pp fmt "(Ret (idx:%a, pack:%a))" Hash.pp hash_idx Hash.pp hash_pack
+    | Ret (boffs, hash_idx, hash_pack) -> pp fmt "(Ret (big offsets:%d, idx:%a, pack:%a))"
+                                            (Option.value ~default:0 (Option.bind Array.length boffs))
+                                            Hash.pp hash_idx Hash.pp hash_pack
     | End hash_pack             -> pp fmt "(End %a)" Hash.pp hash_pack
     | Exception exn             -> pp fmt "(Exception %a)" pp_error exn
 
@@ -234,16 +242,16 @@ struct
       loop 0 src t
   end
 
-  let rest ~boffsets (hash_idx, hash_pack) src t =
+  let rest ?boffsets (hash_idx, hash_pack) src t =
     match Queue.pop t.hashes, Queue.pop t.crcs, Queue.pop t.offsets with
-    | hash, crc, (offset, true) -> Result ({ t with state = Ret (hash_idx, hash_pack) }, (hash, crc, Int64.of_int32 offset))
+    | hash, crc, (offset, true) -> Result ({ t with state = Ret (boffsets, hash_idx, hash_pack) }, (hash, crc, Int64.of_int32 offset))
     | exception Queue.Empty -> ok t hash_pack
     | hash, crc, (offset, false) -> match boffsets with
       | None -> error t (Expected_bigoffset_table)
       | Some arr ->
         let idx = Int32.to_int (Int32.logand offset 0x7FFFFFFFl) in
         if idx >= 0 && idx < Array.length arr
-        then Result ({ t with state = Ret (hash_idx, hash_pack) }, (hash, crc, Array.get arr idx))
+        then Result ({ t with state = Ret (boffsets, hash_idx, hash_pack) }, (hash, crc, Array.get arr idx))
         else error t (Invalid_index_of_bigoffset idx)
 
   let rec hash ?boffsets src t =
@@ -259,7 +267,7 @@ struct
 
      if hash_idx <> produce
      then error t (Invalid_hash (Hash.get t.hash, hash_idx))
-     else rest ~boffsets (hash_idx, hash_pack) src t)
+     else rest ?boffsets (hash_idx, hash_pack) src t)
     src t
 
   let rec boffsets arr idx max src t =
@@ -273,7 +281,7 @@ struct
 
   let rec offsets idx boffs max src t =
     if Int32.compare idx max >= 0
-    then (if boffs > 0 then begin Format.eprintf "Has a bigoffset: %d\n%!" boffs; boffsets (Array.make boffs 0L) 0 boffs src t end else hash src t)
+    then (if boffs > 0 then boffsets (Array.make boffs 0L) 0 boffs src t else hash src t)
     else KOffsets.get_u32_and_msb
            (fun (offset, msb) src t ->
              Queue.add (offset, msb) t.offsets;
@@ -353,7 +361,7 @@ struct
       | Hashes k -> k src t
       | Crcs k -> k src t
       | Offsets k -> k src t
-      | Ret (hash_idx, hash_pack) -> rest (hash_idx, hash_pack) src t
+      | Ret (boffsets, hash_idx, hash_pack) -> rest ~boffsets (hash_idx, hash_pack) src t
       | Hash k -> k src t
       | End hash -> ok t hash
       | Exception exn -> error t exn
