@@ -1140,6 +1140,8 @@ struct
     | KindRaw, { Delta.delta = Delta.Z } ->
       let abs_off = t.write in
 
+      Format.eprintf "%a: Raw\n%!" Hash.pp entry.Entry.hash_object;
+
       (KWriteK.header (Kind.to_bin entry.Entry.kind) entry.Entry.length Crc32.default
        @@ fun crc dst t ->
        let z = Deflate.default ~proof:Decompress.B.proof_bigstring 4 in
@@ -1159,6 +1161,9 @@ struct
       let abs_off    = t.write in
 
       (* XXX(dinosaure): we can obtain the source hash by [entry.delta]. TODO! *)
+
+      Format.eprintf "%a: Hash from %a (source length: %Ld, target length: %d)\n%!"
+        Hash.pp entry.Entry.hash_object Hash.pp src_hash src_length trg_length;
 
       let h =
         HunkEncoder.flush 0 (Cstruct.len t.h_tmp)
