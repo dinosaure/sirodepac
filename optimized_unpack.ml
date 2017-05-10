@@ -208,7 +208,7 @@ let save_names_of_tree hash raw =
     List.iter (fun entry -> Hashtbl.add p_nam entry.Tree.node (Filename.concat path entry.Tree.name)) tree
   | Error exn -> Format.eprintf "Invalid Tree: %s\n%!" exn; assert false
 
-let object_to_entry hash base revidx =
+let object_to_entry hash base =
   let open Decoder.Object in
 
   match base.kind with
@@ -271,7 +271,7 @@ let make_pack pack_fmt idx_fmt pack access entries =
 let idx_filename  = "pack.idx"
 let pack_filename = "pack.pack"
 
-let hash_of_git_object base =
+let hash_of_object base =
   let typename = match base.Decoder.Object.kind with
     | `Commit -> "commit"
     | `Tree -> "tree"
@@ -284,8 +284,6 @@ let hash_of_git_object base =
   SHA1.digestv [ (Cstruct.to_bigarray (Cstruct.of_string hdr))
                ; (Cstruct.to_bigarray base.Decoder.Object.raw) ]
 
-module Map = Map.Make(Int64)
-
 let pp_pair pp_one pp_two fmt (a, b) =
   Format.fprintf fmt "@[<hov>(@[<hov>%a@],@ @[<hov>%a@])@]"
     pp_one a pp_two b
@@ -297,10 +295,24 @@ let pp_list ?(sep = (fun fmt () -> ()) )pp_data fmt lst =
     | x :: r -> Format.fprintf fmt "%a%a" pp_data x sep (); aux r
   in aux lst
 
+module Cache = Lru.M.Make(SHA1)(struct type t = Decoder.kind * Cstruct.t let weight (_, x) = Cstruct.len x end)
+module Rev = Map.Make(Int64)
+
+let cstruct_copy x =
+  let l = Cstruct.len x in
+  let r = Cstruct.create l in
+  Cstruct.blit x 0 r 0 l;
+  r
+
 let () =
   let (old_tree_idx, _) = idx_from_filename Sys.argv.(2) in
+
+  let rev_index = Radix.fold (fun (k, (_, off)) acc -> Rev.add off k acc) Rev.empty old_tree_idx in
+  let lru_cache = Cache.create 0x8000 in
   let old_pack = Decoder.make (Unix.openfile Sys.argv.(1) [ Unix.O_RDONLY ] 0o644)
+      (fun hash -> Cache.find hash lru_cachet)
       (fun hash -> Radix.lookup old_tree_idx hash)
+      (fun off  -> try Some (Rev.find off rev_index) with Not_found -> None)
       (fun hash -> None)
   in
 
@@ -311,16 +323,25 @@ let () =
       assert false) 0 old_tree_idx
   in
 
+  Format.printf "Max length calculated: %d\n%!" max_length;
+
   let old_raw0, old_raw1 = Cstruct.create max_length, Cstruct.create max_length in
-  let revidx = Radix.fold (fun (hash, (_, offset)) acc -> Map.add offset hash acc) Map.empty old_tree_idx in
 
   let each_git_object (hash, (crc, offset)) acc =
     match Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
     | Ok ({ Decoder.Object.kind = `Tree; _ } as base) ->
+      if SHA1.neq (hash_of_object base) hash
+      then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object base) SHA1.pp hash;
+
       save_names_of_tree hash base.Decoder.Object.raw;
-      object_to_entry hash base (fun offset -> try Some (Map.find offset revidx) with Not_found -> None) :: acc
+      Cache.add hash (`Tree, cstruct_copy base.Decoder.Object.raw) lru_cache;
+      object_to_entry hash base :: acc
     | Ok base ->
-      object_to_entry hash base (fun offset -> try Some (Map.find offset revidx) with Not_found -> None) :: acc
+      if SHA1.neq (hash_of_object base) hash
+      then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object base) SHA1.pp hash;
+
+      Cache.add hash (base.Decoder.Object.kind, cstruct_copy base.Decoder.Object.raw) lru_cache;
+      object_to_entry hash base :: acc
     | Error exn ->
       (Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
        assert false)
@@ -363,7 +384,15 @@ let () =
     close_out idx_out;
 
     let (new_tree_idx, _) = idx_from_filename idx_filename in
-    let new_pack = Decoder.make (Unix.openfile pack_filename [ Unix.O_RDONLY ] 0o644) (fun hash -> Radix.lookup new_tree_idx hash) (fun hash -> None) in
+
+    let rev_index = Radix.fold (fun (k, (_, off)) acc -> Rev.add off k acc) Rev.empty new_tree_idx in
+
+    let new_pack = Decoder.make (Unix.openfile pack_filename [ Unix.O_RDONLY ] 0o644)
+        (fun hash -> Cache.find hash lru_cache)
+        (fun hash -> Radix.lookup new_tree_idx hash)
+        (fun off  -> try Some (Rev.find off rev_index) with Not_found -> None)
+        (fun hash -> None)
+    in
 
     let max_length = Radix.fold (fun (hash, _) acc -> match Decoder.needed new_pack hash z_tmp z_win with
       | Ok length -> max length acc
@@ -372,12 +401,18 @@ let () =
         assert false) 0 new_tree_idx
     in
 
+    Format.printf "Max length calculated: %d\n%!" max_length;
+
     let new_raw0, new_raw1 = Cstruct.create max_length, Cstruct.create max_length in
 
     let each_git_object (hash, (crc, offset)) =
       match Decoder.get' new_pack hash z_tmp z_win (new_raw0, new_raw1),
             Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
       | Ok new_base, Ok old_base ->
+        if SHA1.neq (hash_of_object new_base) hash
+        then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object new_base) SHA1.pp hash;
+
+        Cache.add hash (new_base.Decoder.Object.kind, cstruct_copy new_base.Decoder.Object.raw) lru_cache;
         Format.eprintf "Get the git object: %a\n%!" SHA1.pp hash;
       | Error exn, _ | _, Error exn ->
         Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
