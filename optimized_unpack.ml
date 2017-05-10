@@ -229,19 +229,23 @@ let pp_option pp_data fmt = function
   | Some x -> pp_data fmt x
   | None -> Format.fprintf fmt "<none>"
 
-let make_pack pack_fmt idx_fmt pack access entries =
+external write : Unix.file_descr -> Cstruct.buffer -> int -> int -> int =
+  "bigstring_write" [@@noalloc]
+
+let make_pack pack_out idx_out pack access entries =
   let rec loop_pack ?(raw = false) t =
     match PACKEncoder.eval o_tmp t with
     | `Flush t ->
       let n = PACKEncoder.used_out t in
-      Format.fprintf pack_fmt "%s%!" (Cstruct.to_string (Cstruct.sub o_tmp 0 n));
+
+      ignore @@ write pack_out (Cstruct.to_bigarray o_tmp) 0 n;
       loop_pack (PACKEncoder.flush 0 (Cstruct.len o_tmp) t)
     | `Error (t, exn) ->
       Format.eprintf "PACK encoder: %a\n%!" PACKEncoder.pp_error exn;
       assert false
     | `End (t, hash) ->
       if PACKEncoder.used_out t <> 0
-      then Format.fprintf pack_fmt "%s%!" (Cstruct.to_string (Cstruct.sub o_tmp 0 (PACKEncoder.used_out t)));
+      then ignore @@ write pack_out (Cstruct.to_bigarray o_tmp) 0 (PACKEncoder.used_out t);
 
       PACKEncoder.idx t, hash
   in
@@ -250,11 +254,11 @@ let make_pack pack_fmt idx_fmt pack access entries =
     match IDXEncoder.eval o_tmp t with
     | `Flush t ->
       let n = IDXEncoder.used_out t in
-      Format.fprintf idx_fmt "%s%!" (Cstruct.to_string (Cstruct.sub o_tmp 0 n));
+      ignore @@ write idx_out (Cstruct.to_bigarray o_tmp) 0 n;
       loop_idx (IDXEncoder.flush 0 (Cstruct.len o_tmp) t)
     | `End t ->
       if IDXEncoder.used_out t <> 0
-      then Format.fprintf idx_fmt "%s%!" (Cstruct.to_string (Cstruct.sub o_tmp 0 (IDXEncoder.used_out t)));
+      then ignore @@ write idx_out (Cstruct.to_bigarray o_tmp) 0 (IDXEncoder.used_out t);
 
       ()
     | `Error (t, exn) ->
@@ -369,10 +373,8 @@ let () =
   | Ok entries ->
     Format.eprintf "Start to write the new PACK file.\n%!";
 
-    let pack_out = open_out pack_filename in
-    let idx_out  = open_out idx_filename in
-    let pack_fmt = Format.formatter_of_out_channel pack_out in
-    let idx_fmt  = Format.formatter_of_out_channel idx_out in
+    let pack_out = Unix.openfile pack_filename [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o644 in
+    let idx_out  = Unix.openfile idx_filename [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o644 in
 
     let access hash = match Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
       | Ok base -> Some base.Decoder.Object.raw
@@ -381,9 +383,9 @@ let () =
         None
     in
 
-    make_pack pack_fmt idx_fmt old_pack access entries;
-    close_out pack_out;
-    close_out idx_out;
+    make_pack pack_out idx_out old_pack access entries;
+    Unix.close pack_out;
+    Unix.close idx_out;
 
     let (new_tree_idx, _) = idx_from_filename idx_filename in
 
