@@ -26,8 +26,8 @@ sig
   val length : int
   val pp : Format.formatter -> t -> unit
 
-  val of_pp_string : string -> t
-  val to_pp_string : t -> string
+  val of_hex_string : string -> t
+  val to_hex_string : t -> string
 
   val of_string : string -> t
   val to_string : t -> string
@@ -211,8 +211,8 @@ struct
       >>= fun author    -> binding ~key:"committer" ~value:User.Decoder.user
                            <* commit
       >>= fun committer -> commit
-      *>  return { tree = Hash.of_pp_string tree
-                 ; parents = List.map Hash.of_pp_string parents
+      *>  return { tree = Hash.of_hex_string tree
+                 ; parents = List.map Hash.of_hex_string parents
                  ; author
                  ; committer
                  ; message = "" }
@@ -242,7 +242,7 @@ struct
     let sp = ' '
     let lf = '\x0a'
 
-    let parents e x = eval e [ string $ "parent"; char $ sp; !!string ] (Hash.to_pp_string x)
+    let parents e x = eval e [ string $ "parent"; char $ sp; !!string ] (Hash.to_hex_string x)
 
     let predicate f w e x =
       if f x
@@ -259,7 +259,7 @@ struct
              ; string $ "author"; char $ sp; !!User.Encoder.user; char $ lf
              ; string $ "committer"; char $ sp; !!User.Encoder.user; char $ lf
              ; !!string ]
-        (Hash.to_pp_string t.tree)
+        (Hash.to_hex_string t.tree)
         (match t.parents with [] -> None | lst -> Some (lst, ()))
         t.author
         t.committer
@@ -513,7 +513,7 @@ struct
                                  >>= fun user -> return (Some user)))
                         <* commit
       >>= fun tagger -> take 1 *> commit *>
-        return { obj = Hash.of_pp_string obj
+        return { obj = Hash.of_hex_string obj
                ; kind
                ; tag
                ; tagger
@@ -558,7 +558,7 @@ struct
              ; string $ "tag"; char $ sp; !!string; char $ lf
              ; !!(option tagger); char $ lf
              ; !!string ]
-        (Hash.to_pp_string t.obj)
+        (Hash.to_hex_string t.obj)
         (string_of_kind t.kind)
         t.tag
         t.tagger

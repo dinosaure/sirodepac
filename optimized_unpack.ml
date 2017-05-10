@@ -23,75 +23,14 @@ struct
   let to_cstruct x = Cstruct.of_bigarray x
   let of_cstruct x = (Cstruct.to_bigarray x :> t)
 
-  let of_string s =
-    let cs = Cstruct.create length in
+  let of_string x = of_cstruct @@ Cstruct.of_string x
+  let to_string x = Cstruct.to_string @@ to_cstruct x
 
-    for i = 0 to length - 1
-    do Cstruct.set_uint8 cs i (Char.code (String.get s i)) done;
+  let of_hex_string x = of_hex (Cstruct.to_bigarray (Cstruct.of_string x))
+  let to_hex_string x = Cstruct.to_string (Cstruct.of_bigarray (to_hex x))
 
-    (Cstruct.to_bigarray cs :> t)
-
-  let to_string x =
-    Cstruct.to_string (to_cstruct x)
-
-  let pp fmt hash =
-    let cs = Cstruct.of_bigarray hash in
-
-    for i = 0 to length - 1
-    do Format.fprintf fmt "%02x" (Cstruct.get_uint8 cs i) done
-
-  let to_pp_string hash =
-    let buf = Buffer.create (length * 2) in
-    let fmt = Format.formatter_of_buffer buf in
-
-    Format.fprintf fmt "%a%!" pp hash;
-
-    Buffer.contents buf
-
-  let to_char x y =
-    let code c = match c with
-      | '0'..'9' -> Char.code c - 48 (* Char.code '0' *)
-      | 'A'..'F' -> Char.code c - 55 (* Char.code 'A' + 10 *)
-      | 'a'..'f' -> Char.code c - 87 (* Char.code 'a' + 10 *)
-      | _ ->
-        raise (Invalid_argument (Format.sprintf "Hash.to_char: %d is an invalid char" (Char.code c)))
-    in
-    Char.chr (code x lsl 4 + code y)
-
-  let of_pp_string hash =
-    let tmp = Rakia.Bi.create 20 in
-    let buf = if String.length hash mod 2 = 1
-              then hash ^ "0" else hash
-    in
-
-    let rec aux i j =
-      if i >= 40 then ()
-      else if j >= 40
-      then raise (Invalid_argument "Hash.from_pp")
-      else begin
-        Rakia.Bi.set tmp (i / 2) (to_char buf.[i] buf.[j]);
-        aux (j + 1) (j + 2)
-      end
-    in aux 0 1; tmp
-
-  let hash = Hashtbl.hash
-
-  exception Break
-
-  let equal a b =
-    let open Bigarray.Array1 in
-
-    if dim a <> dim b
-    then false
-    else
-      try
-        for i = 0 to dim a - 1
-        do if get a i <> get b i then raise Break done;
-
-        true
-      with Break -> false
-
-  let compare = compare
+  let equal = eq
+  let hash  = Hashtbl.hash
 end
 
 module Mapper : Unpack.MAPPER with type fd = Unix.file_descr =
@@ -117,13 +56,13 @@ end
 module ZC : Pack.Z =
 struct
   type t =
-    { state : Zlib.stream
-    ; used_in : int
-    ; used_out : int
-    ; in_pos : int
-    ; in_len : int
-    ; out_pos : int
-    ; out_len : int
+    { state          : Zlib.stream
+    ; used_in        : int
+    ; used_out       : int
+    ; in_pos         : int
+    ; in_len         : int
+    ; out_pos        : int
+    ; out_len        : int
     ; want_to_finish : bool }
   and error = Error
 

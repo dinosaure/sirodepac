@@ -24,21 +24,21 @@ sig
   type ctx
   type buffer = Cstruct.buffer
 
-  val length : int
-  val pp : Format.formatter -> t -> unit
+  val length    : int
+  val pp        : Format.formatter -> t -> unit
 
-  val init : unit -> ctx
-  val feed : ctx -> buffer -> unit
-  val get : ctx -> t
-
-  val of_pp_string : string -> t
-  val to_pp_string : t -> string
+  val init      : unit -> ctx
+  val feed      : ctx -> buffer -> unit
+  val get       : ctx -> t
 
   val of_string : string -> t
   val to_string : t -> string
 
-  val equal : t -> t -> bool
-  val compare : t -> t -> int
+  val equal     : t -> t -> bool
+  val compare   : t -> t -> int
+
+  val of_hex_string : string -> t
+  val to_hex_string : t -> string
 end
 
 module Hunk =
