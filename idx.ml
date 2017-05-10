@@ -174,7 +174,7 @@ struct
               | Some v64_offset ->
                 let n = Int32.to_int (Int32.logand off 0x7FFFFFFFl) in
 
-                if has t.map (v64_offset + (n * 8)) (v64_offset + ((n + 1) * 8))
+                if has t.map (v64_offset + (n * 8)) 8
                 then Ok (Cstruct.BE.get_uint64 t.map (v64_offset + (n * 8)))
                 else Error (Invalid_bigoffset_index n)
               | None -> Error Expected_bigoffset_table)
