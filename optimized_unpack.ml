@@ -312,6 +312,8 @@ let cstruct_copy x =
 let () =
   let old_idx = Result.unsafe_ok @@ IDXLazy.make (cstruct_map Sys.argv.(2)) in
 
+  Format.eprintf "IDX file loaded.\n%!";
+
   let rev_index = IDXLazy.fold old_idx (fun k (_, off) acc -> Rev.add off k acc) Rev.empty in
   let lru_cache = Cache.create (0x8000 * 10)  in
   let old_pack = Decoder.make (Unix.openfile Sys.argv.(1) [ Unix.O_RDONLY ] 0o644)
@@ -322,10 +324,12 @@ let () =
   in
 
   let max_length = IDXLazy.fold old_idx (fun hash _ acc -> match Decoder.needed old_pack hash z_tmp z_win with
-    | Ok length -> max length acc
-    | Error exn ->
-      Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
-      assert false) 0
+      | Ok length ->
+        Format.eprintf "get length for %a: %d\n%!" SHA1.pp hash (max length acc);
+        max length acc
+      | Error exn ->
+        Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
+        assert false) 0
   in
 
   Format.printf "Max length calculated: %d\n%!" max_length;
