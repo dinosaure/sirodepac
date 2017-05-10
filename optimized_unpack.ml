@@ -310,7 +310,7 @@ let () =
   let rev_index = Radix.fold (fun (k, (_, off)) acc -> Rev.add off k acc) Rev.empty old_tree_idx in
   let lru_cache = Cache.create 0x8000 in
   let old_pack = Decoder.make (Unix.openfile Sys.argv.(1) [ Unix.O_RDONLY ] 0o644)
-      (fun hash -> Cache.find hash lru_cachet)
+      (fun hash -> Cache.find hash lru_cache)
       (fun hash -> Radix.lookup old_tree_idx hash)
       (fun off  -> try Some (Rev.find off rev_index) with Not_found -> None)
       (fun hash -> None)
