@@ -234,7 +234,7 @@ struct
       loop 0 src t
   end
 
-  let rest ?boffsets (hash_idx, hash_pack) src t =
+  let rest ~boffsets (hash_idx, hash_pack) src t =
     match Queue.pop t.hashes, Queue.pop t.crcs, Queue.pop t.offsets with
     | hash, crc, (offset, true) -> Result ({ t with state = Ret (hash_idx, hash_pack) }, (hash, crc, Int64.of_int32 offset))
     | exception Queue.Empty -> ok t hash_pack
@@ -259,7 +259,7 @@ struct
 
      if hash_idx <> produce
      then error t (Invalid_hash (Hash.get t.hash, hash_idx))
-     else rest ?boffsets (hash_idx, hash_pack) src t)
+     else rest ~boffsets (hash_idx, hash_pack) src t)
     src t
 
   let rec boffsets arr idx max src t =
