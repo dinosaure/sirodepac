@@ -1001,7 +1001,9 @@ struct
     { file  : Mapper.fd
     ; max   : int64
     ; win   : Window.t Bucket.t
+    ; cache : Hash.t -> (kind * Cstruct.t) option
     ; idx   : Hash.t -> (Crc32.t * int64) option
+    ; rev   : int64 -> Hash.t option
     ; get   : Hash.t -> (kind * Cstruct.t) option
     ; hash  : Hash.t }
 
@@ -1136,6 +1138,8 @@ struct
 
       let () = Bucket.add t.win window in window, relative_offset
 
+  let result_bind ~err f = function Ok a -> f a | Error exn -> err
+
   let get_pack_object ?(chunk = 0x800) t reference source_length source_offset z_tmp z_win r_tmp =
     if Cstruct.len r_tmp < source_length
     then raise (Invalid_argument (Format.sprintf "Decoder.delta: expect %d and have %d" source_length (Cstruct.len r_tmp)));
@@ -1208,26 +1212,34 @@ struct
                            ensure all sources are before all targets.
          *)
         else Error (Invalid_offset off)
-      in aux absolute_offset
+      in (match result_bind ~err:None t.rev absolute_offset with
+          | None -> aux absolute_offset
+          | Some hash -> match t.cache hash with
+            | Some (kind, raw) -> Ok (Hash (hash, kind, raw))
+            | None -> aux absolute_offset)
     | H.Hash hash ->
-      match t.idx hash with
-      | Some (crc, absolute_offset) ->
-        let absolute_offset =
-          if absolute_offset < t.max && absolute_offset >= 0L
-          then Ok absolute_offset
-          else Error (Invalid_hash hash)
-        in
-        aux absolute_offset
-      | None -> match t.get hash with
-        | Some (kind, raw) -> Ok (Hash (hash, kind, raw))
-        | None -> Error (Invalid_hash hash)
+      match t.cache hash with
+      | Some (kind, raw) -> Ok (Hash (hash, kind, raw))
+      | None -> match t.idx hash with
+        | Some (crc, absolute_offset) ->
+          let absolute_offset =
+            if absolute_offset < t.max && absolute_offset >= 0L
+            then Ok absolute_offset
+            else Error (Invalid_hash hash)
+          in
+          aux absolute_offset
+        | None -> match t.get hash with
+          | Some (kind, raw) -> Ok (Hash (hash, kind, raw))
+          | None -> Error (Invalid_hash hash)
 
-  let make ?(bucket = 10) file idx get =
+  let make ?(bucket = 10) file cache idx rev get =
     { file
     ; max  = Mapper.length file
     ; win  = Bucket.make bucket
-    ; idx  = idx
-    ; get  = get
+    ; cache
+    ; idx
+    ; rev
+    ; get
     ; hash = (Hash.of_string (String.make Hash.length '\000')) (* TODO *) }
 
   (* XXX(dinosaure): this function returns the max length needed to undelta-ify a PACK object. *)
