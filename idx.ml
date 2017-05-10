@@ -361,7 +361,7 @@ struct
       | Hashes k -> k src t
       | Crcs k -> k src t
       | Offsets k -> k src t
-      | Ret (boffsets, hash_idx, hash_pack) -> rest ~boffsets (hash_idx, hash_pack) src t
+      | Ret (boffsets, hash_idx, hash_pack) -> rest ?boffsets (hash_idx, hash_pack) src t
       | Hash k -> k src t
       | End hash -> ok t hash
       | Exception exn -> error t exn
