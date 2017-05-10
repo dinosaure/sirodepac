@@ -14,6 +14,206 @@ sig
   val equal   : t -> t -> bool
 end
 
+module Lazy (Hash : HASH) =
+struct
+  type error = ..
+  type error += Invalid_header of string
+  type error += Invalid_version of Int32.t
+  type error += Invalid_index
+  type error += Expected_bigoffset_table
+  type error += Invalid_bigoffset_index of int
+
+  let pp = Format.fprintf
+  let pp_error fmt = function
+    | Invalid_header header -> pp fmt "(Invalid_header %s)" header
+    | Invalid_version version -> pp fmt "(Invalid_version %ld)" version
+    | Invalid_index -> pp fmt "Invalid_index"
+    | Expected_bigoffset_table -> pp fmt "Expected_bigoffset_table"
+
+  module Cache = Lru.M.Make(Hash)(struct type t = Crc32.t * int64 let weight _ = 1 end)
+
+  type t =
+    { map              : Cstruct.t
+    ; number_of_hashes : int
+    ; fanout_offset    : int
+    ; hashes_offset    : int
+    ; crcs_offset      : int
+    ; values_offset    : int
+    ; v64_offset       : int option
+    ; cache            : Cache.t }
+
+  let has map off len =
+    if (off < 0 || len < 0 || off + len > Cstruct.len map)
+    then raise (Invalid_argument (Printf.sprintf "%d:%d:%d" off len (Cstruct.len map)))
+    else true
+
+  let check_header map =
+    if has map 0 4
+    then (if Cstruct.get_char map 0 = '\255'
+          && Cstruct.get_char map 1 = '\116'
+          && Cstruct.get_char map 2 = '\079'
+          && Cstruct.get_char map 3 = '\099'
+          then Ok ()
+          else Error (Invalid_header (Cstruct.to_string @@ Cstruct.sub map 0 4)))
+    else Error Invalid_index
+
+  let check_version map =
+    if has map 4 4
+    then (if Cstruct.BE.get_uint32 map 4 = 2l
+          then Ok ()
+          else Error (Invalid_version (Cstruct.BE.get_uint32 map 4)))
+    else Error Invalid_index
+
+  let number_of_hashes map =
+    if has map 8 (256 * 4)
+    then let n = Cstruct.BE.get_uint32 map (8 + (255 * 4)) in
+         Ok (8, n)
+    else Error Invalid_index
+
+  let bind v f = match v with Ok v -> f v | Error _ as e -> e
+  let ( >>= ) = bind
+  let ( *> ) u v = match u with Ok _ -> v | Error _ as e -> e
+
+  let make map =
+    check_header map
+    *> check_version map
+    *> number_of_hashes map
+    >>= fun (fanout_offset, number_of_hashes) ->
+      let number_of_hashes = Int32.to_int number_of_hashes in
+      let hashes_offset = 8 + (256 * 4) in
+      let crcs_offset   = 8 + (256 * 4) + (number_of_hashes * 20) in
+      let values_offset = 8 + (256 * 4) + (number_of_hashes * 20) + (number_of_hashes * 4) in
+      let v64_offset    = 8 + (256 * 4) + (number_of_hashes * 20) + (number_of_hashes * 4) + (number_of_hashes * 4) in
+
+      let v64_offset = if v64_offset + (Hash.length * 2) = Cstruct.len map then None else Some v64_offset in
+
+      Ok { map
+         ; number_of_hashes
+         ; fanout_offset
+         ; hashes_offset
+         ; crcs_offset
+         ; values_offset
+         ; v64_offset
+         ; cache = Cache.create ~random:true 1024 }
+
+  exception Break
+
+  let compare buf off hash =
+    try for i = 0 to 19
+        do if Cstruct.get_char buf (off + i) <> Cstruct.get_char hash i
+           then raise Break
+        done; true
+    with Break -> false
+
+  exception ReturnT
+  exception ReturnF
+
+  let lt buf off hash =
+    try for i = 0 to 19
+        do let a = Cstruct.get_uint8 buf (off + i) in
+           let b = Cstruct.get_uint8 hash i in
+
+           if a > b
+           then raise ReturnT
+           else if a <> b then raise ReturnF;
+        done; false
+    with ReturnT -> true
+       | ReturnF -> false
+
+  let binary_search buf hash =
+    let rec aux off len buf =
+      if len = 20
+      then (off / 20)
+      else
+        let len' = ((len / 40) * 20) in
+        let off' = off + len' in
+
+        if compare buf off' hash
+        then (off' / 20)
+        else if lt buf off' hash
+        then (aux[@tailcall]) off len' buf
+        else (aux[@tailcall]) off' (len - len') buf
+    in
+
+    aux 0 (Cstruct.len buf) buf
+
+  let fanout_idx t hash =
+    match Cstruct.get_uint8 hash 0 with
+    | 0 ->
+      let n = Cstruct.BE.get_uint32 t.map t.fanout_offset in
+      Ok (binary_search (Cstruct.sub t.map t.hashes_offset (Int32.to_int n * 20)) hash)
+    | idx ->
+      if has t.map (t.fanout_offset + (4 * idx)) 4
+      && has t.map (t.fanout_offset + (4 * (idx - 1))) 4
+      then let off1 = Int32.to_int @@ Cstruct.BE.get_uint32 t.map (t.fanout_offset + (4 * idx)) in
+           let off0 = Int32.to_int @@ Cstruct.BE.get_uint32 t.map (t.fanout_offset + (4 * (idx - 1))) in
+
+           if has t.map (t.hashes_offset + (off0 * 20)) ((off1 - off0) * 20)
+           then Ok (binary_search (Cstruct.sub t.map (t.hashes_offset + (off0 * 20)) ((off1 - off0) * 20)) hash + off0)
+           else Error Invalid_index
+      else Error Invalid_index
+
+  let nth t n =
+    let off = Int32.to_int @@ Int32.mul 20l n in
+
+    Cstruct.sub t.map (t.hashes_offset + off) 20
+
+  let find t hash =
+    match Cache.find hash t.cache with
+    | Some (crc, offset) -> Some (crc, offset)
+    | None ->
+      match fanout_idx t (Cstruct.of_bigarray hash) with
+      | Ok idx ->
+        let crc = Cstruct.BE.get_uint32 t.map (t.crcs_offset + (idx * 4)) in
+        let off = Cstruct.BE.get_uint32 t.map (t.values_offset + (idx * 4)) in
+
+        let off =
+          if Int32.equal 0l (Int32.logand off 0x80000000l)
+          then Ok (Int64.of_int32 off)
+          else (match t.v64_offset with
+              | Some v64_offset ->
+                let n = Int32.to_int (Int32.logand off 0x7FFFFFFFl) in
+
+                if has t.map (v64_offset + (n * 8)) (v64_offset + ((n + 1) * 8))
+                then Ok (Cstruct.BE.get_uint64 t.map (v64_offset + (n * 8)))
+                else Error (Invalid_bigoffset_index n)
+              | None -> Error Expected_bigoffset_table)
+        in
+
+        (match off with
+         | Ok off ->
+           Cache.add hash (Crc32.of_int32 crc, off) t.cache;
+           Some (Crc32.of_int32 crc,  off)
+         | Error _ -> None)
+      | Error _ -> None
+
+  let iter t f =
+    for i = 0 to t.number_of_hashes - 1
+    do
+      let hash = Cstruct.sub t.map (t.hashes_offset + (i * Hash.length)) Hash.length in
+      let crc = Cstruct.BE.get_uint32 t.map (t.crcs_offset + (i * 4)) in
+      let off = Cstruct.BE.get_uint32 t.map (t.values_offset + (i * 4)) in
+
+      let off =
+        if Int32.equal 0l (Int32.logand off 0x80000000l)
+        then Int64.of_int32 off
+        else (match t.v64_offset with
+            | Some v64_offset ->
+              let n = Int32.to_int (Int32.logand off 0x7FFFFFFFl) in
+
+              Cstruct.BE.get_uint64 t.map (v64_offset + (n * 8))
+            | None -> raise (Invalid_argument "Expected big offset table"))
+      in
+
+      f (Cstruct.to_bigarray hash) (crc, off)
+    done
+
+  let fold t f a =
+    let a = ref a in
+
+    iter t (fun k v -> a := f k v !a); !a
+end
+
 module Option =
 struct
   let bind f = function Some x -> Some (f x) | None -> None

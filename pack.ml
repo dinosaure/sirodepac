@@ -835,6 +835,8 @@ struct
         (fun (window, acc) entry -> match get entry.Entry.hash_object with
           | None -> raise (Uncaught_hash entry.Entry.hash_object)
           | Some raw ->
+            Format.eprintf "try to delta: %a\n%!" Hash.pp entry.Entry.hash_object;
+
             let base   = { delta = Z } in
             let rabin  = Rabin.Index.make ~copy:false raw in (* we keep [rabin] with [raw] in the [window]. *)
             let window = Window.add entry (base, raw, rabin) window in

@@ -155,6 +155,7 @@ struct
     Deflate.eval src dst t
 end
 
+module IDXLazy     = Idx.Lazy(SHA1)
 module IDXDecoder  = Idx.Decoder(SHA1)
 module IDXEncoder  = Idx.Encoder(SHA1)
 module Decoder     = Unpack.MakeDecoder(SHA1)(Mapper)
@@ -309,29 +310,29 @@ let cstruct_copy x =
   r
 
 let () =
-  let (old_tree_idx, _) = idx_from_filename Sys.argv.(2) in
+  let old_idx = Result.unsafe_ok @@ IDXLazy.make (cstruct_map Sys.argv.(2)) in
 
-  let rev_index = Radix.fold (fun (k, (_, off)) acc -> Rev.add off k acc) Rev.empty old_tree_idx in
+  let rev_index = IDXLazy.fold old_idx (fun k (_, off) acc -> Rev.add off k acc) Rev.empty in
   let lru_cache = Cache.create (0x8000 * 10)  in
   let old_pack = Decoder.make (Unix.openfile Sys.argv.(1) [ Unix.O_RDONLY ] 0o644)
       (fun hash -> Cache.find hash lru_cache)
-      (fun hash -> Radix.lookup old_tree_idx hash)
+      (fun hash -> IDXLazy.find old_idx hash)
       (fun off  -> try Some (Rev.find off rev_index) with Not_found -> None)
       (fun hash -> None)
   in
 
-  let max_length = Radix.fold (fun (hash, _) acc -> match Decoder.needed old_pack hash z_tmp z_win with
+  let max_length = IDXLazy.fold old_idx (fun hash _ acc -> match Decoder.needed old_pack hash z_tmp z_win with
     | Ok length -> max length acc
     | Error exn ->
       Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
-      assert false) 0 old_tree_idx
+      assert false) 0
   in
 
   Format.printf "Max length calculated: %d\n%!" max_length;
 
   let old_raw0, old_raw1 = Cstruct.create max_length, Cstruct.create max_length in
 
-  let each_git_object (hash, (crc, offset)) acc =
+  let each_git_object hash (crc, offset) acc =
     match Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
     | Ok ({ Decoder.Object.kind = `Tree; _ } as base) ->
       if SHA1.neq (hash_of_object base) hash
@@ -353,7 +354,7 @@ let () =
        assert false)
   in
 
-  let entries = Radix.fold each_git_object [] old_tree_idx in
+  let entries = IDXLazy.fold old_idx each_git_object [] in
   let entries =
     List.map (fun x -> try let name = Hashtbl.find p_nam x.Delta.Entry.hash_object in
                  { x with Delta.Entry.hash_name = Delta.Entry.hash name
@@ -387,29 +388,29 @@ let () =
     Unix.close pack_out;
     Unix.close idx_out;
 
-    let (new_tree_idx, _) = idx_from_filename idx_filename in
+    let new_idx = Result.unsafe_ok @@ IDXLazy.make (cstruct_map idx_filename) in
 
-    let rev_index = Radix.fold (fun (k, (_, off)) acc -> Rev.add off k acc) Rev.empty new_tree_idx in
+    let rev_index = IDXLazy.fold new_idx (fun k (_, off) acc -> Rev.add off k acc) Rev.empty in
 
     let new_pack = Decoder.make (Unix.openfile pack_filename [ Unix.O_RDONLY ] 0o644)
         (fun hash -> Cache.find hash lru_cache)
-        (fun hash -> Radix.lookup new_tree_idx hash)
+        (fun hash -> IDXLazy.find new_idx hash)
         (fun off  -> try Some (Rev.find off rev_index) with Not_found -> None)
         (fun hash -> None)
     in
 
-    let max_length = Radix.fold (fun (hash, _) acc -> match Decoder.needed new_pack hash z_tmp z_win with
+    let max_length = IDXLazy.fold new_idx (fun hash _ acc -> match Decoder.needed new_pack hash z_tmp z_win with
       | Ok length -> max length acc
       | Error exn ->
         Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
-        assert false) 0 new_tree_idx
+        assert false) 0
     in
 
     Format.printf "Max length calculated: %d\n%!" max_length;
 
     let new_raw0, new_raw1 = Cstruct.create max_length, Cstruct.create max_length in
 
-    let each_git_object (hash, (crc, offset)) =
+    let each_git_object hash (crc, offset) =
       match Decoder.get' new_pack hash z_tmp z_win (new_raw0, new_raw1),
             Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
       | Ok new_base, Ok old_base ->
@@ -423,6 +424,6 @@ let () =
         assert false
     in
 
-    Radix.iter each_git_object new_tree_idx
+    IDXLazy.iter new_idx each_git_object
 
   | Error exn -> Format.eprintf "Delta error: %a\n%!" Delta.pp_error exn
