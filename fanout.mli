@@ -3,7 +3,7 @@ sig
   type t
 
   val compare : t -> t -> int
-  val get : t -> int -> char
+  val get     : t -> int -> char
 end
 
 module Make (Key : KEY) :

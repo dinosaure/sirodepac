@@ -3,7 +3,7 @@ sig
   type t
 
   val compare : t -> t -> int
-  val get : t -> int -> char
+  val get     : t -> int -> char
 end
 
 module Make (Key : KEY) =
@@ -15,7 +15,7 @@ struct
     { fanout = Array.make 256 [] }
 
   (* XXX(dinosaure): if, one day, we find a bug about the serialization of the IDX file,
-                    may be it's about this function (stable/unstable sort).
+                     may be it's about this function (stable/unstable sort).
   *)
   let merge lst key value =
     List.merge

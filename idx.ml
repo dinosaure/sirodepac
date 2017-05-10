@@ -4,205 +4,33 @@ sig
   type ctx
   type buffer = Cstruct.buffer
 
-  val pp : Format.formatter -> t -> unit
-  val length : int
-  val of_string : string -> t
-  val to_string : t -> string
-  val feed : ctx -> buffer -> unit
-  val get : ctx -> t
-  val init : unit -> ctx
+  val pp      : Format.formatter -> t -> unit
+  val length  : int
+  val feed    : ctx -> buffer -> unit
+  val get     : ctx -> t
+  val init    : unit -> ctx
   val compare : t -> t -> int
-  val hash : t -> int
-  val equal : t -> t -> bool
-end
-
-module Lazy (Hash : HASH) =
-struct
-  type error = ..
-  type error += Invalid_header of string
-  type error += Invalid_version of Int32.t
-  type error += Invalid_index
-
-  let pp = Format.fprintf
-  let pp_error fmt = function
-    | Invalid_header header -> pp fmt "(Invalid_header %s)" header
-    | Invalid_version version -> pp fmt "(Invalid_version %ld)" version
-    | Invalid_index -> pp fmt "Invalid_index"
-
-  module Cache = Lru.M.Make(Hash)(struct type t = Crc32.t * int64 let weight _ = 1 end)
-
-  type t =
-    { map           : Cstruct.t
-    ; fanout_offset : int
-    ; hashes_offset : int
-    ; crcs_offset   : int
-    ; values_offset : int
-    ; v64_offset    : int option
-    ; cache         : Cache.t }
-
-  let has map off len =
-    if (off < 0 || len < 0 || off + len > Cstruct.len map)
-    then raise (Invalid_argument (Printf.sprintf "%d:%d:%d" off len (Cstruct.len map)))
-    else true
-
-  let check_header map =
-    if has map 0 4
-    then (if Cstruct.get_char map 0 = '\255'
-          && Cstruct.get_char map 1 = '\116'
-          && Cstruct.get_char map 2 = '\079'
-          && Cstruct.get_char map 3 = '\099'
-          then Ok ()
-          else Error (Invalid_header (Cstruct.to_string @@ Cstruct.sub map 0 4)))
-    else Error Invalid_index
-
-  let check_version map =
-    if has map 4 4
-    then (if Cstruct.BE.get_uint32 map 4 = 2l
-          then Ok ()
-          else Error (Invalid_version (Cstruct.BE.get_uint32 map 4)))
-    else Error Invalid_index
-
-  let number_of_hashes map =
-    if has map 8 (256 * 4)
-    then let n = Cstruct.BE.get_uint32 map (8 + (255 * 4)) in
-         Ok (8, n)
-    else Error Invalid_index
-
-  let bind v f = match v with Ok v -> f v | Error _ as e -> e
-  let ( >>= ) = bind
-  let ( *> ) u v = match u with Ok _ -> v | Error _ as e -> e
-
-  let make map =
-    check_header map
-    *> check_version map
-    *> number_of_hashes map
-    >>= fun (fanout_offset, number_of_hashes) ->
-      let number_of_hashes = Int32.to_int number_of_hashes in
-      let hashes_offset = 8 + (256 * 4) in
-      let crcs_offset   = 8 + (256 * 4) + (number_of_hashes * 20) in
-      let values_offset = 8 + (256 * 4) + (number_of_hashes * 20) + (number_of_hashes * 4) in
-
-      Ok { map
-         ; fanout_offset
-         ; hashes_offset
-         ; crcs_offset
-         ; values_offset
-         ; v64_offset = None
-         ; cache = Cache.create ~random:true 1024 }
-
-  exception Break
-
-  let compare buf off hash =
-    try for i = 0 to 19
-        do if Cstruct.get_char buf (off + i) <> Cstruct.get_char hash i
-           then raise Break
-        done; true
-    with Break -> false
-
-  exception ReturnT
-  exception ReturnF
-
-  let lt buf off hash =
-    try for i = 0 to 19
-        do let a = Cstruct.get_uint8 buf (off + i) in
-           let b = Cstruct.get_uint8 hash i in
-
-           if a > b
-           then raise ReturnT
-           else if a <> b then raise ReturnF;
-        done; false
-    with ReturnT -> true
-       | ReturnF -> false
-
-  (* XXX(dinosaure): keep in your mind, it's important to implement this
-                     function in the tail-rec way. We can use the [@@tailcall]
-                     annotation...
-   *)
-  let binary_search buf hash =
-    let rec aux off len buf =
-      if len = 20
-      then begin
-        (off / 20)
-      end else
-        let len' = ((len / 40) * 20) in
-        let off' = off + len' in
-
-        if compare buf off' hash
-        then (off' / 20)
-        else if lt buf off' hash then aux off len' buf
-        else aux off' (len - len') buf
-    in
-
-    aux 0 (Cstruct.len buf) buf
-
-  (* XXX(dinosaure): we have a problem with a 32 bits architecture. Indeed, in
-                     the 32 bits architecture, the integer in OCaml is a 31
-                     bits, and the size of the IDX file can be around
-                     [max_int32]. We convert in this function the [int32] to the
-                     native integer. If this [int32] use all bits, we lost the
-                     information when we cast. It's a bug!
-
-                     In this case, the best is to use the [Decoder] module and
-                     generate a radix-tree (see [idx_to_tree]) to provide the
-                     function [string -> int64] to the PACK decoder.
-
-                     In the 64 bits architecture, the native integer is a 63
-                     bits integer, the cast between the [int32] to the native
-                     integer is safe.
-   *)
-  let fanout_idx t hash =
-    match Cstruct.get_uint8 hash 0 with
-    | 0 ->
-      let n = Cstruct.BE.get_uint32 t.map t.fanout_offset in
-      Ok (binary_search (Cstruct.sub t.map t.hashes_offset (Int32.to_int n * 20)) hash)
-    | idx ->
-      if has t.map (t.fanout_offset + (4 * idx)) 4
-      && has t.map (t.fanout_offset + (4 * (idx - 1))) 4
-      then let off1 = Int32.to_int @@ Cstruct.BE.get_uint32 t.map (t.fanout_offset + (4 * idx)) in
-           let off0 = Int32.to_int @@ Cstruct.BE.get_uint32 t.map (t.fanout_offset + (4 * (idx - 1))) in
-
-           if has t.map (t.hashes_offset + (off0 * 20)) ((off1 - off0) * 20)
-           then Ok (binary_search (Cstruct.sub t.map (t.hashes_offset + (off0 * 20)) ((off1 - off0) * 20)) hash + off0)
-           else Error Invalid_index
-      else Error Invalid_index
-
-  let nth t n =
-    let off = Int32.to_int @@ Int32.mul 20l n in
-
-    Cstruct.sub t.map (t.hashes_offset + off) 20
-
-  let find t hash =
-    match Cache.find hash t.cache with
-    | Some (crc, offset) -> Some (crc, offset)
-    | None ->
-      match fanout_idx t (Cstruct.of_bigarray hash) with
-      | Ok idx ->
-        let crc = Cstruct.BE.get_uint32 t.map (t.crcs_offset + (idx * 4)) in
-        let off = Int64.of_int32 @@ Cstruct.BE.get_uint32 t.map (t.values_offset + (idx * 4)) in
-        (* XXX(dinosaure): need to check if it's a big offset or not. TODO! *)
-
-        Cache.add hash (Crc32.of_int32 crc, off) t.cache;
-
-        Some (Crc32.of_int32 crc,  off)
-      | Error _ -> None
+  val hash    : t -> int
+  val equal   : t -> t -> bool
 end
 
 module Decoder (Hash : HASH) =
 struct
-  type error = ..
-  type error += Invalid_byte of int
-  type error += Invalid_version of Int32.t
-  type error += Invalid_index_of_bigoffset of int
-  type error += Expected_bigoffset_table
-  type error += Invalid_hash of Hash.t * Hash.t
+  type error =
+    | Invalid_byte of int
+    | Invalid_version of Int32.t
+    | Invalid_index_of_bigoffset of int
+    | Expected_bigoffset_table
+    | Invalid_hash of Hash.t * Hash.t
 
   let pp = Format.fprintf
+
   let pp_error fmt = function
-    | Invalid_byte byte -> pp fmt "(Invalid_byte %02x)" byte
-    | Invalid_version version -> pp fmt "(Invalid_version %ld)" version
+    | Invalid_byte byte              -> pp fmt "(Invalid_byte %02x)" byte
+    | Invalid_version version        -> pp fmt "(Invalid_version %ld)" version
     | Invalid_index_of_bigoffset idx -> pp fmt "(Invalid_index_of_bigoffset %d)" idx
-    | Expected_bigoffset_table -> pp fmt "Expected_bigoffset_table"
-    | Invalid_hash (has, expect) -> pp fmt "(Invalid_hash (%a, %a))" Hash.pp has Hash.pp expect
+    | Expected_bigoffset_table       -> pp fmt "Expected_bigoffset_table"
+    | Invalid_hash (has, expect)     -> pp fmt "(Invalid_hash (%a, %a))" Hash.pp has Hash.pp expect
 
   type t =
     { i_off     : int
@@ -233,15 +61,15 @@ struct
     | Ok     of t * Hash.t
 
   let pp_state fmt = function
-    | Header _ -> pp fmt "(Header #k)"
-    | Fanout _ -> pp fmt "(Fanout #k)"
-    | Hashes _ -> pp fmt "(Hashes #k)"
-    | Crcs _ -> pp fmt "(Crcs #k)"
-    | Offsets _ -> pp fmt "(Offsets #k)"
-    | Hash _ -> pp fmt "(Hash #k)"
+    | Header _                  -> pp fmt "(Header #k)"
+    | Fanout _                  -> pp fmt "(Fanout #k)"
+    | Hashes _                  -> pp fmt "(Hashes #k)"
+    | Crcs _                    -> pp fmt "(Crcs #k)"
+    | Offsets _                 -> pp fmt "(Offsets #k)"
+    | Hash _                    -> pp fmt "(Hash #k)"
     | Ret (hash_idx, hash_pack) -> pp fmt "(Ret (idx:%a, pack:%a))" Hash.pp hash_idx Hash.pp hash_pack
-    | End hash_pack -> pp fmt "(End %a)" Hash.pp hash_pack
-    | Exception exn -> pp fmt "(Exception %a)" pp_error exn
+    | End hash_pack             -> pp fmt "(End %a)" Hash.pp hash_pack
+    | Exception exn             -> pp fmt "(Exception %a)" pp_error exn
 
   let pp fmt t =
     pp fmt "{ @[<hov>i_off = %d;@ \
@@ -262,24 +90,65 @@ struct
   let ok t hash   = Ok ({ t with state = End hash }, hash)
 
   let to_int32 b0 b1 b2 b3 =
-    let ( << ) = Int32.shift_left in (* >> *)
+    let ( << ) = Int32.shift_left in (* >> (tuareg) *)
     let ( || ) = Int32.logor in
-    (Int32.of_int b0 << 24)
-    || (Int32.of_int b1 << 16)
-    || (Int32.of_int b2 << 8)
+    (Int32.of_int b0 << 24)          (* >> (tuareg) *)
+    || (Int32.of_int b1 << 16)       (* >> (tuareg) *)
+    || (Int32.of_int b2 << 8)        (* >> (tuareg) *)
     || (Int32.of_int b3)
 
   let to_int64 b0 b1 b2 b3 b4 b5 b6 b7 =
-    let ( << ) = Int64.shift_left in (* >> *)
+    let ( << ) = Int64.shift_left in (* >> (tuareg) *)
     let ( || ) = Int64.logor in
-    (Int64.of_int b0 << 56)
-    || (Int64.of_int b1 << 48) (* >> *)
-    || (Int64.of_int b2 << 40) (* >> *)
-    || (Int64.of_int b3 << 32) (* >> *)
-    || (Int64.of_int b4 << 24) (* >> *)
-    || (Int64.of_int b5 << 16) (* >> *)
-    || (Int64.of_int b6 << 8) (* >> *)
+    (Int64.of_int b0 << 56)          (* >> (tuareg) *)
+    || (Int64.of_int b1 << 48)       (* >> (tuareg) *)
+    || (Int64.of_int b2 << 40)       (* >> (tuareg) *)
+    || (Int64.of_int b3 << 32)       (* >> (tuareg) *)
+    || (Int64.of_int b4 << 24)       (* >> (tuareg) *)
+    || (Int64.of_int b5 << 16)       (* >> (tuareg) *)
+    || (Int64.of_int b6 << 8)        (* >> (tuareg) *)
     || (Int64.of_int b7)
+
+  let rec get_byte ~ctor k src t =
+      if (t.i_len - t.i_pos) > 0
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
+           k byte src { t with i_pos = t.i_pos + 1 }
+      else await src { t with state = ctor (fun src t -> (get_byte[@tailcall]) ~ctor k src t) }
+
+  let rec get_u32 ~ctor k src t =
+    if (t.i_len - t.i_pos) > 3
+    then let num = Cstruct.BE.get_uint32 src (t.i_off + t.i_pos) in
+          k num src
+            { t with i_pos = t.i_pos + 4 }
+    else if (t.i_len - t.i_pos) > 0
+    then (get_byte ~ctor
+          @@ fun byte0 -> get_byte ~ctor
+          @@ fun byte1 -> get_byte ~ctor
+          @@ fun byte2 -> get_byte ~ctor
+          @@ fun byte3 src t ->
+              k (to_int32 byte0 byte1 byte2 byte3) src t)
+          src t
+    else await src { t with state = Header (fun src t -> (get_u32[@tailcall]) ~ctor k src t) }
+
+  let rec get_u64 ~ctor k src t =
+    if (t.i_len - t.i_pos) > 7
+    then let num = Cstruct.BE.get_uint64 src (t.i_off + t.i_pos) in
+          k num src
+            { t with i_pos = t.i_pos + 8 }
+    else if (t.i_len - t.i_pos) > 0
+    then (get_byte ~ctor
+          @@ fun byte0 -> get_byte ~ctor
+          @@ fun byte1 -> get_byte ~ctor
+          @@ fun byte2 -> get_byte ~ctor
+          @@ fun byte3 -> get_byte ~ctor
+          @@ fun byte4 -> get_byte ~ctor
+          @@ fun byte5 -> get_byte ~ctor
+          @@ fun byte6 -> get_byte ~ctor
+          @@ fun byte7 src t ->
+              k (to_int64 byte0 byte1 byte2 byte3 byte4 byte5 byte6 byte7) src t)
+          src t
+    else await src { t with state = Offsets (fun src t -> (get_u64[@tailcall]) k ~ctor src t) }
+
 
   module KHeader =
   struct
@@ -291,70 +160,30 @@ struct
       else error { t with i_pos = t.i_pos + 1 }
                  (Invalid_byte (Cstruct.get_uint8 src (t.i_off + t.i_pos)))
 
-    let rec get_byte k src t =
-      if (t.i_len - t.i_pos) > 0
-      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
-           k byte src { t with i_pos = t.i_pos + 1 }
-      else await src { t with state = Header (fun src t -> (get_byte[@tailcall]) k src t) }
-
-    let rec get_u32 k src t =
-      if (t.i_len - t.i_pos) > 3
-      then let num = Cstruct.BE.get_uint32 src (t.i_off + t.i_pos) in
-           k num src
-             { t with i_pos = t.i_pos + 4 }
-      else if (t.i_len - t.i_pos) > 0
-      then (get_byte
-            @@ fun byte0 -> get_byte
-            @@ fun byte1 -> get_byte
-            @@ fun byte2 -> get_byte
-            @@ fun byte3 src t ->
-               k (to_int32 byte0 byte1 byte2 byte3) src t)
-            src t
-      else await src { t with state = Header (fun src t -> (get_u32[@tailcall]) k src t) }
+    let get_byte = get_byte ~ctor:(fun k -> Header k)
+    let get_u32  = get_u32  ~ctor:(fun k -> Header k)
   end
 
   module KFanoutTable =
   struct
-    let rec get_byte k src t =
-      if (t.i_len - t.i_pos) > 0
-      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
-           k byte src { t with i_pos = t.i_pos + 1 }
-      else await src { t with state = Fanout (fun src t -> (get_byte[@tailcall]) k src t) }
-
-    let rec get_u32 k src t =
-      if (t.i_len - t.i_pos) > 3
-      then let num = Cstruct.BE.get_uint32 src (t.i_off + t.i_pos) in
-           k num src
-             { t with i_pos = t.i_pos + 4 }
-      else if (t.i_len - t.i_pos) > 0
-      then (get_byte
-            @@ fun byte0 -> get_byte
-            @@ fun byte1 -> get_byte
-            @@ fun byte2 -> get_byte
-            @@ fun byte3 src t ->
-               k (to_int32 byte0 byte1 byte2 byte3) src t)
-            src t
-      else await src { t with state = Fanout (fun src t -> (get_u32[@tailcall]) k src t) }
+    let get_byte = get_byte ~ctor:(fun k -> Fanout k)
+    let get_u32  = get_u32  ~ctor:(fun k -> Fanout k)
   end
 
   module KHashes =
   struct
-    let rec get_byte k src t =
-      if (t.i_len - t.i_pos) > 0
-      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
-           k byte src { t with i_pos = t.i_pos + 1 }
-      else await src { t with state = Hashes (fun src t -> (get_byte[@tailcall]) k src t) }
+    let get_byte = get_byte ~ctor:(fun k -> Hashes k)
 
     let get_hash k src t =
-      let buf = Buffer.create Hash.length in
+      let res = Cstruct.create Hash.length in
 
       let rec loop i src t =
-        if i = 20
-        then k (Hash.of_string (Buffer.contents buf)) src t
+        if i = Hash.length
+        then k (Cstruct.to_bigarray res) src t
         else
           get_byte (fun byte src t ->
-                     Buffer.add_char buf (Char.chr byte);
-                     (loop[@tailcall]) (i + 1) src t)
+              Cstruct.set_uint8 res i byte;
+              (loop[@tailcall]) (i + 1) src t)
             src t
       in
 
@@ -363,75 +192,21 @@ struct
 
   module KCrcs =
   struct
-    let rec get_byte k src t =
-      if (t.i_len - t.i_pos) > 0
-      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
-           k byte src { t with i_pos = t.i_pos + 1 }
-      else await src { t with state = Crcs (fun src t -> (get_byte[@tailcall]) k src t) }
-
-    let rec get_u32 k src t =
-      if (t.i_len - t.i_pos) > 3
-      then let num = Cstruct.BE.get_uint32 src (t.i_off + t.i_pos) in
-           k num src
-             { t with i_pos = t.i_pos + 4 }
-      else if (t.i_len - t.i_pos) > 0
-      then (get_byte
-            @@ fun byte0 -> get_byte
-            @@ fun byte1 -> get_byte
-            @@ fun byte2 -> get_byte
-            @@ fun byte3 src t ->
-               k (to_int32 byte0 byte1 byte2 byte3) src t)
-            src t
-      else await src { t with state = Crcs (fun src t -> (get_u32[@tailcall]) k src t) }
+    let get_byte = get_byte ~ctor:(fun k -> Crcs k)
+    let get_u32  = get_u32  ~ctor:(fun k -> Crcs k)
   end
 
   module KOffsets =
   struct
-    let rec get_byte k src t =
-      if (t.i_len - t.i_pos) > 0
-      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
-           k byte src { t with i_pos = t.i_pos + 1 }
-      else await src { t with state = Offsets (fun src t -> (get_byte[@tailcall]) k src t) }
+    let get_byte = get_byte ~ctor:(fun k -> Offsets k)
 
-    let rec get_u32 k src t =
-      if (t.i_len - t.i_pos) > 3
-      then let num = Cstruct.BE.get_uint32 src (t.i_off + t.i_pos) in
-           k num src
-             { t with i_pos = t.i_pos + 4 }
-      else if (t.i_len - t.i_pos) > 0
-      then (get_byte
-            @@ fun byte0 -> get_byte
-            @@ fun byte1 -> get_byte
-            @@ fun byte2 -> get_byte
-            @@ fun byte3 src t ->
-               k (to_int32 byte0 byte1 byte2 byte3) src t)
-            src t
-      else await src { t with state = Offsets (fun src t -> (get_u32[@tailcall]) k src t) }
-
-    let get_u32 k src t =
-      get_u32
+    let get_u32_and_msb k src t =
+      get_u32 ~ctor:(fun k -> Offsets k)
         (fun u32 src t ->
           k (u32, Int32.equal 0l (Int32.logand u32 0x80000000l)) src t)
         src t
 
-    let rec get_u64 k src t =
-      if (t.i_len - t.i_pos) > 7
-      then let num = Cstruct.BE.get_uint64 src (t.i_off + t.i_pos) in
-           k num src
-             { t with i_pos = t.i_pos + 8 }
-      else if (t.i_len - t.i_pos) > 0
-      then (get_byte
-            @@ fun byte0 -> get_byte
-            @@ fun byte1 -> get_byte
-            @@ fun byte2 -> get_byte
-            @@ fun byte3 -> get_byte
-            @@ fun byte4 -> get_byte
-            @@ fun byte5 -> get_byte
-            @@ fun byte6 -> get_byte
-            @@ fun byte7 src t ->
-               k (to_int64 byte0 byte1 byte2 byte3 byte4 byte5 byte6 byte7) src t)
-            src t
-      else await src { t with state = Offsets (fun src t -> (get_u64[@tailcall]) k src t) }
+    let get_u64 = get_u64 ~ctor:(fun k -> Offsets k)
   end
 
   module KHash =
@@ -444,15 +219,15 @@ struct
            (* don't use [await] function. *)
 
     let get_hash k src t =
-      let buf = Buffer.create Hash.length in
+      let res = Cstruct.create Hash.length in
 
       let rec loop i src t =
-        if i = 20
-        then k (Hash.of_string (Buffer.contents buf)) src t
+        if i = Hash.length
+        then k (Cstruct.to_bigarray res) src t
         else
           get_byte (fun byte src t ->
-                     Buffer.add_char buf (Char.chr byte);
-                     (loop[@tailcall]) (i + 1) src t)
+              Cstruct.set_uint8 res i byte;
+              (loop[@tailcall]) (i + 1) src t)
             src t
       in
 
@@ -499,7 +274,7 @@ struct
   let rec offsets idx boffs max src t =
     if Int32.compare idx max >= 0
     then (if boffs > 0 then boffsets (Array.make boffs 0L) 0 boffs src t else hash src t)
-    else KOffsets.get_u32
+    else KOffsets.get_u32_and_msb
            (fun (offset, msb) src t ->
              Queue.add (offset, msb) t.offsets;
              (offsets[@tailcall])
@@ -598,28 +373,19 @@ end
 
 module Encoder (Hash : HASH) =
 struct
-  type error = ..
+  type error = unit
 
-  module Bigstring =
+  let pp_error fmt () = ()
+
+  module K =
   struct
-    type t = Cstruct.buffer
+    type t = Hash.t
 
     let get : t -> int -> char = Bigarray.Array1.get
-
-    exception Break of int
-
-    (* XXX(dinosaure): assert than a and b are hashes, so don't check length. *)
-    let compare : t -> t -> int = fun a b ->
-      try
-        for i = 0 to Bigarray.Array1.dim a
-        do if get a i <> get b i then raise (Break ((Char.code @@ get a i) - (Char.code @@ get b i))) done;
-        0
-      with Break x -> x
+    let compare = Hash.compare
   end
-  module Fanout = Fanout.Make(Bigstring)
 
-  let pp_error fmt = function
-    | _ -> Format.fprintf fmt "<error>"
+  module Fanout = Fanout.Make(K)
 
   type t =
     { o_off    : int
@@ -655,14 +421,14 @@ struct
   let pp = Format.fprintf
 
   let pp_state fmt = function
-    | Header _ -> pp fmt "(Header #k)"
-    | Fanout _ -> pp fmt "(Fanout #k)"
-    | Hashes _ -> pp fmt "(Hashes #k)"
-    | Crcs _ -> pp fmt "(Crcs #k)"
-    | Offsets _ -> pp fmt "(Offsets #k)"
+    | Header _     -> pp fmt "(Header #k)"
+    | Fanout _     -> pp fmt "(Fanout #k)"
+    | Hashes _     -> pp fmt "(Hashes #k)"
+    | Crcs _       -> pp fmt "(Crcs #k)"
+    | Offsets _    -> pp fmt "(Offsets #k)"
     | BigOffsets _ -> pp fmt "(BigOffsets #k)"
-    | Hash _ -> pp fmt "(Hash #k)"
-    | End -> pp fmt "End"
+    | Hash _       -> pp fmt "(Hash #k)"
+    | End          -> pp fmt "End"
 
   let pp fmt { o_off; o_pos; o_len; write; table; boffsets; hash; pack; state; } =
     pp fmt "{ @[<hov>o_off = %d;@ \
@@ -691,38 +457,37 @@ struct
     let ( ! )  = Int32.to_int
   end
 
+  let rec put_byte ~ctor chr k dst t =
+    if (t.o_len - t.o_pos) > 0
+    then begin
+      Cstruct.set_char dst (t.o_off + t.o_pos) chr;
+      k dst { t with o_pos = t.o_pos + 1
+                    ; write = t.write + 1 }
+    end else flush dst { t with state = ctor (fun dst t -> (put_byte[@tailcall]) ~ctor chr k dst t) }
+
+  let rec put_int32 ~ctor integer k dst t =
+    if (t.o_len - t.o_pos) >= 4
+    then begin
+      Cstruct.BE.set_uint32 dst (t.o_off + t.o_pos) integer;
+      k dst { t with o_pos = t.o_pos + 4
+                    ; write = t.write + 4 }
+    end else if (t.o_len - t.o_pos) > 0
+    then let i1 = Char.unsafe_chr @@ Int32.(! ((integer && 0xFF000000l) >> 24)) in
+          let i2 = Char.unsafe_chr @@ Int32.(! ((integer && 0x00FF0000l) >> 16)) in
+          let i3 = Char.unsafe_chr @@ Int32.(! ((integer && 0x0000FF00l) >> 8)) in
+          let i4 = Char.unsafe_chr @@ Int32.(! (integer && 0x000000FFl)) in
+
+          (put_byte ~ctor i1
+          @@ put_byte ~ctor i2
+          @@ put_byte ~ctor i3
+          @@ put_byte ~ctor i4 k)
+          dst t
+    else flush dst { t with state = ctor (fun dst t -> (put_int32[@tailcall]) ~ctor integer k dst t) }
+
   module KHeader =
   struct
-    let rec put_byte chr k dst t =
-      if (t.o_len - t.o_pos) > 0
-      then begin
-        Cstruct.set_char dst (t.o_off + t.o_pos) chr;
-        k dst { t with o_pos = t.o_pos + 1
-                     ; write = t.write + 1 }
-      end else flush dst { t with state = Header (put_byte chr k) }
-
-    (* XXX(dinosaure): we can abstract the constructor of the state and provide
-                       only one implementation of [put_int32] for all [K*]
-                       modules.
-     *)
-    let rec put_int32 integer k dst t =
-      if (t.o_len - t.o_pos) >= 4
-      then begin
-        Cstruct.BE.set_uint32 dst (t.o_off + t.o_pos) integer;
-        k dst { t with o_pos = t.o_pos + 4
-                     ; write = t.write + 4 }
-      end else if (t.o_len - t.o_pos) > 0
-      then let i1 = Char.unsafe_chr @@ Int32.(! ((integer && 0xFF000000l) >> 24)) in
-           let i2 = Char.unsafe_chr @@ Int32.(! ((integer && 0x00FF0000l) >> 16)) in
-           let i3 = Char.unsafe_chr @@ Int32.(! ((integer && 0x0000FF00l) >> 8)) in
-           let i4 = Char.unsafe_chr @@ Int32.(! (integer && 0x000000FFl)) in
-
-           (put_byte i1
-            @@ put_byte i2
-            @@ put_byte i3
-            @@ put_byte i4 k)
-           dst t
-      else flush dst { t with state = Header (put_int32 integer k) }
+    let put_byte = put_byte ~ctor:(fun k -> Header k)
+    let put_int32 = put_int32 ~ctor:(fun k -> Header k)
   end
 
   module Int64 =
@@ -738,32 +503,8 @@ struct
 
   module KFanout =
   struct
-    let rec put_byte chr k dst t =
-      if (t.o_len - t.o_pos) > 0
-      then begin
-        Cstruct.set_char dst (t.o_off + t.o_pos) chr;
-        k dst { t with o_pos = t.o_pos + 1
-                     ; write = t.write + 1 }
-      end else flush dst { t with state = Fanout (put_byte chr k) }
-
-    let rec put_int32 integer k dst t =
-      if (t.o_len - t.o_pos) >= 4
-      then begin
-        Cstruct.BE.set_uint32 dst (t.o_off + t.o_pos) integer;
-        k dst { t with o_pos = t.o_pos + 4
-                     ; write = t.write + 4 }
-      end else if (t.o_len - t.o_pos) > 0
-      then let i1 = Char.unsafe_chr @@ Int32.(! ((integer && 0xFF000000l) >> 24)) in
-           let i2 = Char.unsafe_chr @@ Int32.(! ((integer && 0x00FF0000l) >> 16)) in
-           let i3 = Char.unsafe_chr @@ Int32.(! ((integer && 0x0000FF00l) >> 8)) in
-           let i4 = Char.unsafe_chr @@ Int32.(! (integer && 0x000000FFl)) in
-
-           (put_byte i1
-            @@ put_byte i2
-            @@ put_byte i3
-            @@ put_byte i4 k)
-           dst t
-      else flush dst { t with state = Fanout (put_int32 integer k) }
+    let put_byte = put_byte ~ctor:(fun k -> Fanout k)
+    let put_int32 = put_int32 ~ctor:(fun k -> Fanout k)
   end
 
   module KHashes =
@@ -771,7 +512,7 @@ struct
     let put_hash hash k dst t =
       if t.o_len - t.o_pos >= Hash.length
       then begin
-        Cstruct.blit_from_string hash 0 dst (t.o_off + t.o_pos) Hash.length;
+        Cstruct.blit hash 0 dst (t.o_off + t.o_pos) Hash.length;
         k dst { t with o_pos = t.o_pos + Hash.length
                      ; write = t.write + Hash.length }
       end else
@@ -784,7 +525,7 @@ struct
             if n = 0
             then flush dst { t with state = Hashes (loop rest) }
             else begin
-              Cstruct.blit_from_string hash (Hash.length - rest) dst (t.o_off + t.o_pos) n;
+              Cstruct.blit hash (Hash.length - rest) dst (t.o_off + t.o_pos) n;
               flush dst { t with state = Hashes (loop (rest - n))
                                ; o_pos = t.o_pos + n
                                ; write = t.write + n }
@@ -796,73 +537,19 @@ struct
 
   module KCrcs =
   struct
-    let rec put_byte chr k dst t =
-      if (t.o_len - t.o_pos) > 0
-      then begin
-        Cstruct.set_char dst (t.o_off + t.o_pos) chr;
-        k dst { t with o_pos = t.o_pos + 1
-                     ; write = t.write + 1 }
-      end else flush dst { t with state = Crcs (put_byte chr k) }
-
-    let rec put_int32 integer k dst t =
-      if (t.o_len - t.o_pos) >= 4
-      then begin
-        Cstruct.BE.set_uint32 dst (t.o_off + t.o_pos) integer;
-        k dst { t with o_pos = t.o_pos + 4
-                     ; write = t.write + 4 }
-      end else if (t.o_len - t.o_pos) > 0
-      then let i1 = Char.unsafe_chr @@ Int32.(! ((integer && 0xFF000000l) >> 24)) in
-           let i2 = Char.unsafe_chr @@ Int32.(! ((integer && 0x00FF0000l) >> 16)) in
-           let i3 = Char.unsafe_chr @@ Int32.(! ((integer && 0x0000FF00l) >> 8)) in
-           let i4 = Char.unsafe_chr @@ Int32.(! (integer && 0x000000FFl)) in
-
-           (put_byte i1
-            @@ put_byte i2
-            @@ put_byte i3
-            @@ put_byte i4 k)
-           dst t
-      else flush dst { t with state = Crcs (put_int32 integer k) }
+    let put_byte = put_byte ~ctor:(fun k -> Crcs k)
+    let put_int32 = put_int32 ~ctor:(fun k -> Crcs k)
   end
 
   module KOffsets =
   struct
-    let rec put_byte chr k dst t =
-      if (t.o_len - t.o_pos) > 0
-      then begin
-        Cstruct.set_char dst (t.o_off + t.o_pos) chr;
-        k dst { t with o_pos = t.o_pos + 1
-                     ; write = t.write + 1 }
-      end else flush dst { t with state = Offsets (put_byte chr k) }
-
-    let rec put_int32 integer k dst t =
-      if (t.o_len - t.o_pos) >= 4
-      then begin
-        Cstruct.BE.set_uint32 dst (t.o_off + t.o_pos) integer;
-        k dst { t with o_pos = t.o_pos + 4
-                     ; write = t.write + 4 }
-      end else if (t.o_len - t.o_pos) > 0
-      then let i1 = Char.unsafe_chr @@ Int32.(! ((integer && 0xFF000000l) >> 24)) in
-           let i2 = Char.unsafe_chr @@ Int32.(! ((integer && 0x00FF0000l) >> 16)) in
-           let i3 = Char.unsafe_chr @@ Int32.(! ((integer && 0x0000FF00l) >> 8)) in
-           let i4 = Char.unsafe_chr @@ Int32.(! (integer && 0x000000FFl)) in
-
-           (put_byte i1
-            @@ put_byte i2
-            @@ put_byte i3
-            @@ put_byte i4 k)
-           dst t
-      else flush dst { t with state = Offsets (put_int32 integer k) }
+    let put_byte = put_byte ~ctor:(fun k -> Offsets k)
+    let put_int32 = put_int32 ~ctor:(fun k -> Offsets k)
   end
 
   module KBOffsets =
   struct
-    let rec put_byte chr k dst t =
-      if (t.o_len - t.o_pos) > 0
-      then begin
-        Cstruct.set_char dst (t.o_off + t.o_pos) chr;
-        k dst { t with o_pos = t.o_pos + 1
-                     ; write = t.write + 1 }
-      end else flush dst { t with state = BigOffsets (put_byte chr k) }
+    let put_byte = put_byte ~ctor:(fun k -> BigOffsets k)
 
     let rec put_int64 integer k dst t =
       if (t.o_len - t.o_pos) >= 8
@@ -972,7 +659,7 @@ struct
     else let rec aux acc dst t = match acc with
            | [] -> Cont { t with state = Hashes (hashes (idx + 1)) }
            | (hash, _) :: r ->
-             KHashes.put_hash (Hash.to_string hash) (aux r) dst t
+             KHashes.put_hash (Cstruct.of_bigarray hash) (aux r) dst t
          in
          aux (Fanout.get idx t.table) dst t
 
