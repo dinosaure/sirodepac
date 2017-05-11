@@ -17,10 +17,12 @@ let hash buf off =
 let derive hash buf off =
   rabin_derive_bigarray hash (Cstruct.to_bigarray buf) off
 
+type ptr = Entry of int | Null
+
 type unpacked_entry =
   { offset    : int
   ; hash      : int
-  ; next      : [ `Null | `Entry of int ] }
+  ; next      : ptr }
 
 let pp_list ?(sep = (fun fmt () -> ())) pp_data fmt lst =
   let rec aux = function
@@ -32,8 +34,8 @@ let pp_list ?(sep = (fun fmt () -> ())) pp_data fmt lst =
 
 let pp_unpacked_entry fmt entry =
   let pp_next fmt = function
-    | `Entry idx -> Format.fprintf fmt "%d" idx
-    | `Null -> Format.fprintf fmt "<null>"
+    | Entry idx -> Format.fprintf fmt "%d" idx
+    | Null -> Format.fprintf fmt "<null>"
   in
 
   Format.fprintf fmt "{ @[<hov>offset = %d;@ \
@@ -57,8 +59,8 @@ let pp_array pp_data fmt arr =
 
   Format.fprintf fmt "[| @[<hov>%a@] |]"aux 0
 
-let unsafe = function `Entry idx -> idx | `Null -> assert false
-let safe arr = function `Entry idx -> arr.(idx).next | `Null -> `Null
+let unsafe = function Entry idx -> idx | Null -> assert false
+let safe arr = function Entry idx -> arr.(idx).next | Null -> Null
 
 module Entry =
 struct
@@ -120,14 +122,14 @@ struct
     let max = (len - 1) / rabin_window in
     let idx = ref (max * rabin_window - rabin_window) in
     let rev = ref 0 in
-    let unpacked = Array.make max { offset = 0; hash = 0; next = `Null; } in
+    let unpacked = Array.make max { offset = 0; hash = 0; next = Null; } in
 
     let hsize, hmask =
       let res = ref 4 in
       while (1 lsl !res) < (max / 4) do incr res done;
       1 lsl !res, (1 lsl !res) - 1
     in
-    let htable = Array.make hsize `Null in
+    let htable = Array.make hsize Null in
     let hcount = Array.make hsize 0 in
 
     let previous = ref (lnot 0) in
@@ -151,7 +153,7 @@ struct
           ; hash
           ; next   = htable.(hash land hmask) };
 
-        htable.(hash land hmask) <- `Entry (!rev);
+        htable.(hash land hmask) <- Entry (!rev);
         hcount.(hash land hmask) <- hcount.(hash land hmask) + 1;
         rev := !rev + 1;
       end;
@@ -196,15 +198,15 @@ struct
       *)
 
       match htable.(i) with
-      | `Entry idx when hcount.(i) > hash_limit ->
+      | Entry idx when hcount.(i) > hash_limit ->
         (* XXX(dinosaure): htable.(i) = `Null and hcount.(i) > 0 can't appear. *)
 
         entries := !entries - (hcount.(i) - hash_limit);
         (* we leave exactly HASH_LIMIT entries in the bucket *)
 
         let acc   = ref (hcount.(i) - (2 * hash_limit)) in
-        let entry = ref (`Entry idx) in
-        let keep  = `Entry idx in
+        let entry = ref (Entry idx) in
+        let keep  = Entry idx in
 
         entry := safe unpacked !entry;
 
@@ -220,7 +222,7 @@ struct
 
         entry := safe unpacked !entry;
 
-        while !entry <> `Null
+        while !entry <> Null
         do
           acc := !acc + (hcount.(i) - hash_limit);
 
@@ -245,7 +247,7 @@ struct
 
           entry := safe unpacked !entry;
         done
-      | `Entry _ | `Null -> ()
+      | Entry _ | Null -> ()
     done;
 
     (* let unpacked = Array.sub unpacked 0 !entries in
@@ -262,8 +264,8 @@ struct
          into consecutive array entries.
        *)
       let rec aux acc = function
-        | `Null -> List.rev acc
-        | `Entry idx ->
+        | Null -> List.rev acc
+        | Entry idx ->
           let { offset; hash; next; } = unpacked.(idx) in
           aux (Entry.{ offset; hash; } :: acc) next
       in

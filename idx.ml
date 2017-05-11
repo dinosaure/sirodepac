@@ -16,12 +16,12 @@ end
 
 module Lazy (Hash : HASH) =
 struct
-  type error = ..
-  type error += Invalid_header of string
-  type error += Invalid_version of Int32.t
-  type error += Invalid_index
-  type error += Expected_bigoffset_table
-  type error += Invalid_bigoffset_index of int
+  type error =
+    | Invalid_header of string
+    | Invalid_version of Int32.t
+    | Invalid_index
+    | Expected_bigoffset_table
+    | Invalid_bigoffset_index of int
 
   let pp = Format.fprintf
   let pp_error fmt = function
@@ -29,6 +29,7 @@ struct
     | Invalid_version version -> pp fmt "(Invalid_version %ld)" version
     | Invalid_index -> pp fmt "Invalid_index"
     | Expected_bigoffset_table -> pp fmt "Expected_bigoffset_table"
+    | Invalid_bigoffset_index index -> pp fmt "(Invalid_bigoffset_index %d)" index
 
   module Cache = Lru.M.Make(Hash)(struct type t = Crc32.t * int64 let weight _ = 1 end)
 

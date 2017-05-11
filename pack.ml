@@ -835,7 +835,7 @@ struct
         (fun (window, acc) entry -> match get entry.Entry.hash_object with
           | None -> raise (Uncaught_hash entry.Entry.hash_object)
           | Some raw ->
-            Format.eprintf "try to delta: %a\n%!" Hash.pp entry.Entry.hash_object;
+            Format.eprintf "try to delta: %a (length of window: %d)\n%!" Hash.pp entry.Entry.hash_object (Window.items window);
 
             let base   = { delta = Z } in
             let rabin  = Rabin.Index.make ~copy:false raw in (* we keep [rabin] with [raw] in the [window]. *)
@@ -891,11 +891,11 @@ struct
 
   module Deflate = Decompress.Deflate
 
-  type error = ..
-  type error += Deflate_error of Deflate.error
-  type error += Hunk_error of HunkEncoder.error
-  type error += Invalid_entry of Entry.t * Delta.t
-  type error += Invalid_hash of Hash.t
+  type error =
+    | Deflate_error of Deflate.error
+    | Hunk_error of HunkEncoder.error
+    | Invalid_entry of Entry.t * Delta.t
+    | Invalid_hash of Hash.t
 
   let pp_error fmt = function
     | Deflate_error exn -> Format.fprintf fmt "(Deflate_error %a)" Deflate.pp_error exn

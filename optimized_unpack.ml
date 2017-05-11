@@ -310,23 +310,27 @@ let cstruct_copy x =
   r
 
 let () =
+  Format.eprintf "Start program.\n%!";
+  Gc.print_stat stderr; Format.eprintf "\n%!";
+
   let old_idx = Result.unsafe_ok @@ IDXLazy.make (cstruct_map Sys.argv.(2)) in
 
   Format.eprintf "IDX file loaded.\n%!";
+  Gc.print_stat stderr; Format.eprintf "\n%!";
 
-  let rev_index = IDXLazy.fold old_idx (fun k (_, off) acc -> Rev.add off k acc) Rev.empty in
-  let lru_cache = Cache.create (0x8000 * 10)  in
   let old_pack = Decoder.make (Unix.openfile Sys.argv.(1) [ Unix.O_RDONLY ] 0o644)
-      (fun hash -> Cache.find hash lru_cache)
+      (fun hash -> None)
       (fun hash -> IDXLazy.find old_idx hash)
-      (fun off  -> try Some (Rev.find off rev_index) with Not_found -> None)
+      (fun off  -> None)
       (fun hash -> None)
   in
+
+  Format.eprintf "PACK file loaded.\n%!";
+  Gc.print_stat stderr; Format.eprintf "\n%!";
 
   let max_length = IDXLazy.fold old_idx (fun hash _ acc -> match Decoder.needed old_pack hash z_tmp z_win with
       | Ok length ->
         Format.eprintf "get length for %a: %d\n%!" SHA1.pp hash (max length acc);
-        Gc.compact ();
         max length acc
       | Error exn ->
         Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
@@ -334,6 +338,7 @@ let () =
   in
 
   Format.printf "Max length calculated: %d\n%!" max_length;
+  Gc.print_stat stderr; Format.eprintf "\n%!";
 
   let old_raw0, old_raw1 = Cstruct.create max_length, Cstruct.create max_length in
 
@@ -345,14 +350,12 @@ let () =
 
       Format.eprintf "unpack object: %a\n%!" SHA1.pp hash;
       save_names_of_tree hash base.Decoder.Object.raw;
-      Cache.add hash (`Tree, cstruct_copy base.Decoder.Object.raw) lru_cache;
       object_to_entry hash base :: acc
     | Ok base ->
       if SHA1.neq (hash_of_object base) hash
       then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object base) SHA1.pp hash;
 
       Format.eprintf "unpack object: %a\n%!" SHA1.pp hash;
-      Cache.add hash (base.Decoder.Object.kind, cstruct_copy base.Decoder.Object.raw) lru_cache;
       object_to_entry hash base :: acc
     | Error exn ->
       (Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
@@ -368,14 +371,17 @@ let () =
       entries
   in
 
-  match Delta.deltas ~memory:true entries
+  Gc.compact ();
+  Gc.print_stat stderr; Format.eprintf "\n%!";
+
+  match Delta.deltas entries
       (fun hash -> match Decoder.get old_pack hash z_tmp z_win with
          | Ok base -> Some base.Decoder.Object.raw
          | Error exn ->
            Format.eprintf "Silent error with %a: %a\n%!" SHA1.pp hash Decoder.pp_error exn;
            None)
       (fun hash -> false) (* we tag all object to [false]. *)
-      (max_length * 10) 50 with
+      10 50 with
   | Ok entries ->
     Format.eprintf "Start to write the new PACK file.\n%!";
 
@@ -393,14 +399,15 @@ let () =
     Unix.close pack_out;
     Unix.close idx_out;
 
+    Gc.compact ();
+    Gc.print_stat stderr; Format.eprintf "\n%!";
+
     let new_idx = Result.unsafe_ok @@ IDXLazy.make (cstruct_map idx_filename) in
 
-    let rev_index = IDXLazy.fold new_idx (fun k (_, off) acc -> Rev.add off k acc) Rev.empty in
-
     let new_pack = Decoder.make (Unix.openfile pack_filename [ Unix.O_RDONLY ] 0o644)
-        (fun hash -> Cache.find hash lru_cache)
+        (fun hash -> None)
         (fun hash -> IDXLazy.find new_idx hash)
-        (fun off  -> try Some (Rev.find off rev_index) with Not_found -> None)
+        (fun off  -> None)
         (fun hash -> None)
     in
 
@@ -423,7 +430,6 @@ let () =
         then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object new_base) SHA1.pp hash;
 
         Format.eprintf "unpack object: %a\n%!" SHA1.pp hash;
-        Cache.add hash (new_base.Decoder.Object.kind, cstruct_copy new_base.Decoder.Object.raw) lru_cache;
       | Error exn, _ | _, Error exn ->
         Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
         assert false
