@@ -14,11 +14,9 @@ end
 
 module SHA1 =
 struct
-  include Rakia.SHA1.Bigstring
+  include Digestif.SHA1.Bigstring
 
-  type ctx = Rakia.SHA1.ctx
-
-  let length = Rakia.SHA1.digest_size
+  let length = Digestif.SHA1.digest_size
 
   let to_cstruct x = Cstruct.of_bigarray x
   let of_cstruct x = (Cstruct.to_bigarray x :> t)
@@ -274,11 +272,11 @@ end
 module IDXLazy     = Idx.Lazy(SHA1)
 module IDXDecoder  = Idx.Decoder(SHA1)
 module IDXEncoder  = Idx.Encoder(SHA1)
-module Decoder     = Unpack.MakeDecoder(SHA1)(Mapper)(InflateC)
+module Decoder     = Unpack.MakeDecoder(SHA1)(Mapper)(InflateO)
 module PACKDecoder = Decoder.P
-module Radix       = Radix.Make(Rakia.Bi)
 module Delta       = Pack.MakeDelta(SHA1)
 module PACKEncoder = Pack.MakePACKEncoder(SHA1)(ZO)
+module Radix       = PACKEncoder.Radix
 
 module Commit = Minigit.Commit(SHA1)
 module Tree   = Minigit.Tree(SHA1)
@@ -330,17 +328,13 @@ let object_to_entry hash base =
 
   match base.kind with
   | `Commit ->
-    Delta.Entry.from_commit hash
-    @@ Result.unsafe_ok (Commit.Decoder.to_result base.raw)
+    Delta.Entry.make hash Pack.Kind.Commit base.length
   | `Tree ->
-    Delta.Entry.from_tree hash ?path:(try Some (Hashtbl.find p_nam hash) with Not_found -> None)
-    @@ Result.unsafe_ok (Tree.Decoder.to_result base.raw)
+    Delta.Entry.make hash Pack.Kind.Tree ?name:(try Some (Hashtbl.find p_nam hash) with Not_found -> None) base.length
   | `Tag ->
-    Delta.Entry.from_tag hash
-    @@ Result.unsafe_ok (Tag.Decoder.to_result base.raw)
+    Delta.Entry.make hash Pack.Kind.Tag base.length
   | `Blob ->
-    Delta.Entry.from_blob hash ?path:(try Some (Hashtbl.find p_nam hash) with Not_found -> None)
-    @@ Result.unsafe_ok (Blob.Decoder.to_result base.raw)
+    Delta.Entry.make hash Pack.Kind.Blob ?name:(try Some (Hashtbl.find p_nam hash) with Not_found -> None) base.length
 
 let pp_option pp_data fmt = function
   | Some x -> pp_data fmt x
@@ -392,19 +386,6 @@ let make_pack pack_out idx_out pack access entries =
 let idx_filename  = "pack.idx"
 let pack_filename = "pack.pack"
 
-let hash_of_object base =
-  let typename = match base.Decoder.Object.kind with
-    | `Commit -> "commit"
-    | `Tree -> "tree"
-    | `Blob -> "blob"
-    | `Tag -> "tag"
-  in
-
-  let hdr = Format.sprintf "%s %Ld\000" typename base.Decoder.Object.length in
-
-  SHA1.digestv [ (Cstruct.to_bigarray (Cstruct.of_string hdr))
-               ; (Cstruct.to_bigarray base.Decoder.Object.raw) ]
-
 let pp_pair pp_one pp_two fmt (a, b) =
   Format.fprintf fmt "@[<hov>(@[<hov>%a@],@ @[<hov>%a@])@]"
     pp_one a pp_two b
@@ -427,12 +408,10 @@ let cstruct_copy x =
 
 let () =
   Format.eprintf "Start program.\n%!";
-  Gc.print_stat stderr; Format.eprintf "\n%!";
 
   let old_idx = Result.unsafe_ok @@ IDXLazy.make (cstruct_map Sys.argv.(2)) in
 
   Format.eprintf "IDX file loaded.\n%!";
-  Gc.print_stat stderr; Format.eprintf "\n%!";
 
   let old_pack = Decoder.make (Unix.openfile Sys.argv.(1) [ Unix.O_RDONLY ] 0o644)
       (fun hash -> None)
@@ -442,9 +421,8 @@ let () =
   in
 
   Format.eprintf "PACK file loaded.\n%!";
-  Gc.print_stat stderr; Format.eprintf "\n%!";
 
-  let max_length = IDXLazy.fold old_idx (fun hash _ acc -> match Decoder.needed old_pack hash z_tmp () with
+  let max_length = IDXLazy.fold old_idx (fun hash _ acc -> match Decoder.needed old_pack hash z_tmp z_win with
       | Ok length ->
         Format.eprintf "get length for %a: %d\n%!" SHA1.pp hash (max length acc);
         max length acc
@@ -454,23 +432,16 @@ let () =
   in
 
   Format.printf "Max length calculated: %d\n%!" max_length;
-  Gc.print_stat stderr; Format.eprintf "\n%!";
 
   let old_raw0, old_raw1 = Cstruct.create max_length, Cstruct.create max_length in
 
   let each_git_object hash (crc, offset) acc =
-    match Decoder.get' old_pack hash z_tmp () (old_raw0, old_raw1) with
+    match Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
     | Ok ({ Decoder.Object.kind = `Tree; _ } as base) ->
-      if SHA1.neq (hash_of_object base) hash
-      then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object base) SHA1.pp hash;
-
       Format.eprintf "unpack object: %a\n%!" SHA1.pp hash;
       save_names_of_tree hash base.Decoder.Object.raw;
       object_to_entry hash base :: acc
     | Ok base ->
-      if SHA1.neq (hash_of_object base) hash
-      then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object base) SHA1.pp hash;
-
       Format.eprintf "unpack object: %a\n%!" SHA1.pp hash;
       object_to_entry hash base :: acc
     | Error exn ->
@@ -487,11 +458,8 @@ let () =
       entries
   in
 
-  Gc.compact ();
-  Gc.print_stat stderr; Format.eprintf "\n%!";
-
   match Delta.deltas entries
-      (fun hash -> match Decoder.get old_pack hash z_tmp () with
+      (fun hash -> match Decoder.get old_pack hash z_tmp z_win with
          | Ok base -> Some base.Decoder.Object.raw
          | Error exn ->
            Format.eprintf "Silent error with %a: %a\n%!" SHA1.pp hash Decoder.pp_error exn;
@@ -504,7 +472,7 @@ let () =
     let pack_out = Unix.openfile pack_filename [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o644 in
     let idx_out  = Unix.openfile idx_filename [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o644 in
 
-    let access hash = match Decoder.get' old_pack hash z_tmp () (old_raw0, old_raw1) with
+    let access hash = match Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
       | Ok base -> Some base.Decoder.Object.raw
       | Error exn ->
         Format.eprintf "Silent error with %a: %a\n%!" SHA1.pp hash Decoder.pp_error exn;
@@ -515,9 +483,6 @@ let () =
     Unix.close pack_out;
     Unix.close idx_out;
 
-    Gc.compact ();
-    Gc.print_stat stderr; Format.eprintf "\n%!";
-
     let new_idx = Result.unsafe_ok @@ IDXLazy.make (cstruct_map idx_filename) in
 
     let new_pack = Decoder.make (Unix.openfile pack_filename [ Unix.O_RDONLY ] 0o644)
@@ -527,7 +492,7 @@ let () =
         (fun hash -> None)
     in
 
-    let max_length = IDXLazy.fold new_idx (fun hash _ acc -> match Decoder.needed new_pack hash z_tmp () with
+    let max_length = IDXLazy.fold new_idx (fun hash _ acc -> match Decoder.needed new_pack hash z_tmp z_win with
       | Ok length -> max length acc
       | Error exn ->
         Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
@@ -539,12 +504,9 @@ let () =
     let new_raw0, new_raw1 = Cstruct.create max_length, Cstruct.create max_length in
 
     let each_git_object hash (crc, offset) =
-      match Decoder.get' new_pack hash z_tmp () (new_raw0, new_raw1),
-            Decoder.get' old_pack hash z_tmp () (old_raw0, old_raw1) with
+      match Decoder.get' new_pack hash z_tmp z_win (new_raw0, new_raw1),
+            Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
       | Ok new_base, Ok old_base ->
-        if SHA1.neq (hash_of_object new_base) hash
-        then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object new_base) SHA1.pp hash;
-
         Format.eprintf "unpack object: %a\n%!" SHA1.pp hash;
       | Error exn, _ | _, Error exn ->
         Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;

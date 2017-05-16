@@ -20,7 +20,7 @@ let pp_array pp_data fmt arr =
 
 module type HASH =
 sig
-  type t = Rakia.Bi.t
+  type t = Cstruct.buffer
   type ctx
   type buffer = Cstruct.buffer
 
@@ -173,43 +173,18 @@ struct
   let name entry = entry.name
 
   let make
-    : type delta. Hash.t -> ?name:string -> ?preferred:bool -> ?delta:source -> kind -> t
-    = fun hash_object ?name ?(preferred = false) ?(delta = None) obj ->
+
+    : type delta. Hash.t -> ?name:string -> ?preferred:bool -> ?delta:source -> Kind.t -> int64 -> t
+    = fun hash_object ?name ?(preferred = false) ?(delta = None) kind length ->
     let hash_name = Option.(value ~default:0 (name >>| hash)) in
 
-    match obj with
-    | Tag tag ->
-      { hash_name
-      ; hash_object
-      ; name
-      ; kind = Kind.Tag
-      ; preferred
-      ; delta
-      ; length = Tag.raw_length tag }
-    | Commit commit ->
-      { hash_name
-      ; hash_object
-      ; name
-      ; kind = Kind.Commit
-      ; preferred
-      ; delta
-      ; length = Commit.raw_length commit }
-    | Tree tree ->
-      { hash_name
-      ; hash_object
-      ; name
-      ; kind = Kind.Tree
-      ; preferred
-      ; delta
-      ; length = Tree.raw_length tree }
-    | Blob blob ->
-      { hash_name
-      ; hash_object
-      ; name
-      ; kind = Kind.Blob
-      ; preferred
-      ; delta
-      ; length = Blob.raw_length blob }
+    { hash_name
+    ; hash_object
+    ; name
+    ; kind
+    ; preferred
+    ; delta
+    ; length }
 
   let compare a b =
     (* - first, sort by type. Different objects never delta with each other.
@@ -244,16 +219,16 @@ struct
     (* XXX(dinosaure): git compare the memory position then but it's irrelevant in OCaml. *)
 
   let from_commit hash ?preferred ?delta commit =
-    make ?preferred ?delta hash (Commit commit)
+    make ?preferred ?delta hash Kind.Commit (Commit.raw_length commit)
 
   let from_tag hash ?preferred ?delta tag =
-    make ?preferred ?delta hash (Tag tag)
+    make ?preferred ?delta hash Kind.Tag (Tag.raw_length tag)
 
   let from_tree hash ?preferred ?delta ?path:name tree =
-    make ?preferred ?delta hash ?name (Tree tree)
+    make ?preferred ?delta hash ?name Kind.Tree (Tree.raw_length tree)
 
   let from_blob hash ?preferred ?delta ?path:name blob =
-    make ?preferred ?delta hash ?name (Blob blob)
+    make ?preferred ?delta hash ?name Kind.Blob (Blob.raw_length blob)
 
   let topological_sort lst =
     let lst =
@@ -885,7 +860,7 @@ module MakePACKEncoder (Hash : HASH) (Deflate : Z) =
 struct
   module Entry = Entry(Hash)
   module Delta = MakeDelta(Hash)
-  module Radix = Radix.Make(Rakia.Bi)
+  module Radix = Radix.Make(struct include Hash let get = Bigarray.Array1.get let length _ = Hash.length end)
   module Write = Set.Make(Hash)
   module HunkEncoder = MakeHunkEncoder(Hash)
 
