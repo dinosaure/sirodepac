@@ -881,15 +881,13 @@ sig
   val eval     : Cstruct.t -> Cstruct.t -> t -> [ `Flush of t | `Await of t | `Error of (t * error) | `End of t ]
 end
 
-module MakePACKEncoder (Hash : HASH) (_ : Z) =
+module MakePACKEncoder (Hash : HASH) (Deflate : Z) =
 struct
   module Entry = Entry(Hash)
   module Delta = MakeDelta(Hash)
   module Radix = Radix.Make(Rakia.Bi)
   module Write = Set.Make(Hash)
   module HunkEncoder = MakeHunkEncoder(Hash)
-
-  module Deflate = Decompress.Deflate
 
   type error =
     | Deflate_error of Deflate.error
@@ -898,11 +896,15 @@ struct
     | Invalid_hash of Hash.t
 
   let pp_error fmt = function
-    | Deflate_error exn -> Format.fprintf fmt "(Deflate_error %a)" Deflate.pp_error exn
-    | Hunk_error exn -> Format.fprintf fmt "(Hunk_error %a)" HunkEncoder.pp_error exn
-    | Invalid_entry (entry, delta) -> Format.fprintf fmt "(Invalid_entry @[<hov>(%a,@ %a)@])"
-                                        Entry.pp entry Delta.pp delta
-    | Invalid_hash hash -> Format.fprintf fmt "(Invalid_hash %a)" Hash.pp hash
+    | Deflate_error exn ->
+      Format.fprintf fmt "(Deflate_error %a)" Deflate.pp_error exn
+    | Hunk_error exn ->
+      Format.fprintf fmt "(Hunk_error %a)" HunkEncoder.pp_error exn
+    | Invalid_entry (entry, delta) ->
+      Format.fprintf fmt "(Invalid_entry @[<hov>(%a,@ %a)@])"
+        Entry.pp entry Delta.pp delta
+    | Invalid_hash hash ->
+      Format.fprintf fmt "(Invalid_hash %a)" Hash.pp hash
 
   let pp_option pp_data fmt = function
     | Some x -> pp_data fmt x
@@ -928,14 +930,14 @@ struct
                 ; crc : Crc32.t
                 ; off : int64
                 ; ui  : int
-                ; z   : (Decompress.B.bs, Decompress.B.bs) Deflate.t }
+                ; z   : Deflate.t }
     | WriteH of { x   : Entry.t * Delta.t * Cstruct.t
                 ; r   : (Entry.t * Delta.t) list
                 ; crc : Crc32.t
                 ; off : int64
                 ; ui  : int
                 ; h   : HunkEncoder.t
-                ; z   : (Decompress.B.bs, Decompress.B.bs) Deflate.t }
+                ; z   : Deflate.t }
     | Save   of { x   : Entry.t
                 ; r   : (Entry.t * Delta.t) list
                 ; crc : Crc32.t
@@ -1146,7 +1148,7 @@ struct
 
       (KWriteK.header (Kind.to_bin entry.Entry.kind) entry.Entry.length Crc32.default
        @@ fun crc dst t ->
-       let z = Deflate.default ~proof:Decompress.B.proof_bigstring 4 in
+       let z = Deflate.default 4 in
        let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos) z in
 
        Cont { t with state = WriteZ { x = (entry, entry_raw)
@@ -1175,7 +1177,7 @@ struct
       (KWriteK.header 0b111 (Int64.of_int length) Crc32.default
        @@ fun crc -> KWriteK.hash (Cstruct.of_bigarray src_hash) crc
        @@ fun crc dst t ->
-       let z = Deflate.default ~proof:Decompress.B.proof_bigstring 4 in
+       let z = Deflate.default 4 in
        let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos) z in
 
        Cont { t with state = WriteH { x = (entry, entry_delta, entry_raw)
@@ -1207,7 +1209,7 @@ struct
          (KWriteK.header 0b110 (Int64.of_int length) Crc32.default
           @@ fun crc -> KWriteK.offset rel_off crc
           @@ fun crc dst t ->
-          let z = Deflate.default ~proof:Decompress.B.proof_bigstring 4 in
+          let z = Deflate.default 4 in
           let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos) z in
 
           Cont { t with state = WriteH { x = (entry, entry_delta, entry_raw)
@@ -1229,15 +1231,23 @@ struct
    *)
 
   let writez dst t ((entry, entry_raw) as x) r crc off used_in z =
-    let src' = Decompress.B.from_bigstring (Cstruct.to_bigarray entry_raw) in
-    let dst' = Decompress.B.from_bigstring (Cstruct.to_bigarray dst) in
-
     (* assert than [entry_raw] is physically the same and immutable at each call of [writez].
        that means the deflate state compute all the time the same [src'] buffer.
        so, [used_in] is equivalent semantically for each call.
-     *)
 
-    let rec loop used_in z = match Deflate.eval src' dst' z with
+       XXX(dinosaure): for a huge file, it's may be more relevant to compute the
+                       raw entry by a limited chunk. We know, the compute of the
+                       hunk is a *stop the world* algorithm and can't be
+                       factorized to a non-blocking computation with a limited
+                       input stream.
+
+                       However, it's not the same case for the serialization and
+                       this politic can be irrelevant (and raise an
+                       [Out_of_memory]) for a huge file. So TODO!
+
+    *)
+
+    let rec loop used_in z = match Deflate.eval entry_raw dst z with
       | `Await z ->
         if used_in = Cstruct.len entry_raw
         then loop used_in (Deflate.finish z)
@@ -1260,10 +1270,7 @@ struct
     loop used_in z
 
   let writeh dst t ((entry, entry_delta, entry_raw) as x) r crc off used_in h z =
-    let src' = Decompress.B.from_bigstring (Cstruct.to_bigarray t.h_tmp) in
-    let dst' = Decompress.B.from_bigstring (Cstruct.to_bigarray dst) in
-
-    match Deflate.eval src' dst' z with
+    match Deflate.eval t.h_tmp dst z with
     | `Await z ->
       (match HunkEncoder.eval t.h_tmp h with
        | `Flush h ->

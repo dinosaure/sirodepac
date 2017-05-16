@@ -155,14 +155,130 @@ struct
     Deflate.eval src dst t
 end
 
+module InflateO : Unpack.Z with type window = Decompress.B.bs Decompress.Window.t =
+struct
+  open Decompress
+
+  type t = (B.bs, B.bs) Inflate.t
+  type error = Inflate.error
+  type window = B.bs Window.t
+
+  let pp_error = Inflate.pp_error
+  let pp = Inflate.pp
+
+  let default : window -> t = fun window -> Inflate.default window
+  let window_reset window = Window.reset window
+
+  let used_in = Inflate.used_in
+  let used_out = Inflate.used_out
+  let flush = Inflate.flush
+  let refill = Inflate.refill
+  let write = Inflate.write
+  let eval src' dst' t =
+    let src = B.from_bigstring @@ Cstruct.to_bigarray src' in
+    let dst = B.from_bigstring @@ Cstruct.to_bigarray dst' in
+
+    Inflate.eval src dst t
+end
+
+module InflateC : Unpack.Z with type window = unit =
+struct
+  type t =
+    { state          : Zlib.stream
+    ; used_in        : int
+    ; used_out       : int
+    ; in_pos         : int
+    ; in_len         : int
+    ; out_pos        : int
+    ; out_len        : int
+    ; write          : int
+    ; finish         : bool }
+  and error = Error
+  and window = unit
+
+  let pp_error fmt Error = Format.fprintf fmt "(Deflate_error #zlib)" (* lazy *)
+  let pp fmt _ = Format.fprintf fmt "#inflateState"
+
+  let empty_in = Bytes.create 0
+  let empty_out = Bytes.create 0
+  let window_reset () = ()
+  let write { write; _ } = write
+
+  let default level =
+    { state = Zlib.inflate_init true
+    ; used_in = 0
+    ; used_out = 0
+    ; in_pos = 0
+    ; in_len = 0
+    ; out_pos = 0
+    ; out_len = 0
+    ; write = 0
+    ; finish = false }
+
+  let used_in { used_in; _ }   = used_in
+  let used_out { used_out; _ } = used_out
+
+  let refill off len t =
+    { t with in_pos = off; in_len = len; used_in = 0 }
+
+  let flush off len t =
+    { t with out_pos = off; out_len = len; used_out = 0 }
+
+  let eval src' dst' t =
+    if t.finish
+    then `End t
+    else if t.in_len - t.used_in = 0
+    then `Await t
+    else if t.out_len - t.used_out = 0
+    then `Flush t
+    else begin
+      let src = Bytes.create t.in_len in
+      let dst = Bytes.create t.out_len in
+
+      Cstruct.blit_to_bytes src' t.in_pos src 0 t.in_len;
+
+      let (finished, used_in, used_out) =
+        Zlib.inflate t.state src
+          (if t.finish then 0 else t.used_in)
+          (if t.finish then 0 else t.in_len - t.used_in)
+          dst
+          t.used_out
+          (t.out_len - t.used_out)
+          Zlib.Z_SYNC_FLUSH
+      in
+
+      Cstruct.blit_from_bytes dst t.used_out dst' (t.out_pos + t.used_out) used_out;
+
+      if finished
+      then begin
+        Zlib.inflate_end t.state;
+
+        `End { t with used_in = t.used_in + used_in
+                    ; used_out = t.used_out + used_out
+                    ; write = t.write + used_out
+                    ; finish = true }
+      end else
+        (if t.used_out + used_out = t.out_len
+         then
+           `Flush { t with used_in = t.used_in + used_in
+                         ; used_out = t.used_out + used_out
+                         ; write = t.write + used_out }
+         else
+           `Await { t with used_in = t.used_in + used_in
+                         ; used_out = t.used_out + used_out
+                         ; write = t.write + used_out })
+    end
+
+end
+
 module IDXLazy     = Idx.Lazy(SHA1)
 module IDXDecoder  = Idx.Decoder(SHA1)
 module IDXEncoder  = Idx.Encoder(SHA1)
-module Decoder     = Unpack.MakeDecoder(SHA1)(Mapper)
+module Decoder     = Unpack.MakeDecoder(SHA1)(Mapper)(InflateC)
 module PACKDecoder = Decoder.P
 module Radix       = Radix.Make(Rakia.Bi)
 module Delta       = Pack.MakeDelta(SHA1)
-module PACKEncoder = Pack.MakePACKEncoder(SHA1)(ZC)
+module PACKEncoder = Pack.MakePACKEncoder(SHA1)(ZO)
 
 module Commit = Minigit.Commit(SHA1)
 module Tree   = Minigit.Tree(SHA1)
@@ -328,7 +444,7 @@ let () =
   Format.eprintf "PACK file loaded.\n%!";
   Gc.print_stat stderr; Format.eprintf "\n%!";
 
-  let max_length = IDXLazy.fold old_idx (fun hash _ acc -> match Decoder.needed old_pack hash z_tmp z_win with
+  let max_length = IDXLazy.fold old_idx (fun hash _ acc -> match Decoder.needed old_pack hash z_tmp () with
       | Ok length ->
         Format.eprintf "get length for %a: %d\n%!" SHA1.pp hash (max length acc);
         max length acc
@@ -343,7 +459,7 @@ let () =
   let old_raw0, old_raw1 = Cstruct.create max_length, Cstruct.create max_length in
 
   let each_git_object hash (crc, offset) acc =
-    match Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
+    match Decoder.get' old_pack hash z_tmp () (old_raw0, old_raw1) with
     | Ok ({ Decoder.Object.kind = `Tree; _ } as base) ->
       if SHA1.neq (hash_of_object base) hash
       then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object base) SHA1.pp hash;
@@ -375,7 +491,7 @@ let () =
   Gc.print_stat stderr; Format.eprintf "\n%!";
 
   match Delta.deltas entries
-      (fun hash -> match Decoder.get old_pack hash z_tmp z_win with
+      (fun hash -> match Decoder.get old_pack hash z_tmp () with
          | Ok base -> Some base.Decoder.Object.raw
          | Error exn ->
            Format.eprintf "Silent error with %a: %a\n%!" SHA1.pp hash Decoder.pp_error exn;
@@ -388,7 +504,7 @@ let () =
     let pack_out = Unix.openfile pack_filename [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o644 in
     let idx_out  = Unix.openfile idx_filename [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o644 in
 
-    let access hash = match Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
+    let access hash = match Decoder.get' old_pack hash z_tmp () (old_raw0, old_raw1) with
       | Ok base -> Some base.Decoder.Object.raw
       | Error exn ->
         Format.eprintf "Silent error with %a: %a\n%!" SHA1.pp hash Decoder.pp_error exn;
@@ -411,7 +527,7 @@ let () =
         (fun hash -> None)
     in
 
-    let max_length = IDXLazy.fold new_idx (fun hash _ acc -> match Decoder.needed new_pack hash z_tmp z_win with
+    let max_length = IDXLazy.fold new_idx (fun hash _ acc -> match Decoder.needed new_pack hash z_tmp () with
       | Ok length -> max length acc
       | Error exn ->
         Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
@@ -423,8 +539,8 @@ let () =
     let new_raw0, new_raw1 = Cstruct.create max_length, Cstruct.create max_length in
 
     let each_git_object hash (crc, offset) =
-      match Decoder.get' new_pack hash z_tmp z_win (new_raw0, new_raw1),
-            Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
+      match Decoder.get' new_pack hash z_tmp () (new_raw0, new_raw1),
+            Decoder.get' old_pack hash z_tmp () (old_raw0, old_raw1) with
       | Ok new_base, Ok old_base ->
         if SHA1.neq (hash_of_object new_base) hash
         then Format.eprintf "Invalid object %a (expect: %a)\n%!" SHA1.pp (hash_of_object new_base) SHA1.pp hash;

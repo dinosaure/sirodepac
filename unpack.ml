@@ -92,6 +92,13 @@ struct
     ; source_length : int
     ; target_length : int }
 
+  let partial_hunks t =
+    { reference     = t._reference
+    ; hunks         = []
+    ; length        = t._length
+    ; source_length = t._source_length
+    ; target_length = t._target_length }
+
   let pp_list ~sep pp_data fmt lst =
     let rec aux = function
       | [] -> ()
@@ -332,8 +339,28 @@ struct
   let ( || ) = Int32.logor
 end
 
+module type Z =
+sig
+  type t
+  type error
+  type window
+
+  val pp_error : Format.formatter -> error -> unit
+  val pp       : Format.formatter -> t -> unit
+
+  val window_reset : window -> window
+
+  val default  : window -> t
+  val eval     : Cstruct.t -> Cstruct.t -> t -> [ `Await of t | `Flush of t | `Error of (t * error) | `End of t ]
+  val used_in  : t -> int
+  val used_out : t -> int
+  val write    : t -> int
+  val flush    : int -> int -> t -> t
+  val refill   : int -> int -> t -> t
+end
+
 (* Implementatioon of deserialization of a PACK file *)
-module MakePACKDecoder (Hash : HASH) =
+module MakePACKDecoder (Hash : HASH) (Inflate : Z) =
 struct
   module HunkDecoder = MakeHunkDecoder(Hash)
 
@@ -341,7 +368,7 @@ struct
     | Invalid_byte of int
     | Reserved_kind of int
     | Invalid_kind of int
-    | Inflate_error of Decompress.Inflate.error
+    | Inflate_error of Inflate.error
     | Hunk_error of HunkDecoder.error
     | Hunk_input of int * int
     | Invalid_length of int * int
@@ -350,19 +377,24 @@ struct
     | Invalid_byte byte              -> Format.fprintf fmt "(Invalid_byte %02x)" byte
     | Reserved_kind byte             -> Format.fprintf fmt "(Reserved_byte %02x)" byte
     | Invalid_kind byte              -> Format.fprintf fmt "(Invalid_kind %02x)" byte
-    | Inflate_error err              -> Format.fprintf fmt "(Inflate_error %a)" Decompress.Inflate.pp_error err
+    | Inflate_error err              -> Format.fprintf fmt "(Inflate_error %a)" Inflate.pp_error err
     | Invalid_length (expected, has) -> Format.fprintf fmt "(Invalid_length (%d <> %d))" expected has
     | Hunk_error err                 -> Format.fprintf fmt "(Hunk_error %a)" HunkDecoder.pp_error err
     | Hunk_input (expected, has)     -> Format.fprintf fmt "(Hunk_input (%d <> %d))" expected has
+
+  type process =
+    [ `All
+    | `One
+    | `Length ]
 
   type t =
     { i_off   : int
     ; i_pos   : int
     ; i_len   : int
-    ; local   : bool
+    ; process : process
     ; read    : int64
     ; o_z     : Cstruct.t
-    ; o_w     : Decompress.B.bs Decompress.Window.t
+    ; o_w     : Inflate.window
     ; version : int32
     ; objects : int32
     ; counter : int32
@@ -377,12 +409,12 @@ struct
                    ; length   : int
                    ; kind     : kind
                    ; crc      : Crc32.t
-                   ; z        : (Decompress.B.bs, Decompress.B.bs) Decompress.Inflate.t }
+                   ; z        : Inflate.t }
     | Hunks     of { offset   : int64
                    ; length   : int
                    ; consumed : int
                    ; crc      : Crc32.t
-                   ; z        : (Decompress.B.bs, Decompress.B.bs) Decompress.Inflate.t
+                   ; z        : Inflate.t
                    ; h        : HunkDecoder.t }
     | Next      of { offset   : int64
                    ; consumed : int
@@ -440,7 +472,7 @@ struct
                                           kind = @[<hov>%a@];@ \
                                           z = @[<hov>%a@];@] })"
         offset consumed length pp_kind kind
-        Decompress.Inflate.pp z
+        Inflate.pp z
     | Hunks { offset
             ; length
             ; consumed
@@ -452,7 +484,7 @@ struct
                                           z = %a;@ \
                                           h = @[<hov>%a@];@] })"
         offset consumed length
-        Decompress.Inflate.pp z HunkDecoder.pp h
+        Inflate.pp z HunkDecoder.pp h
     | Next { offset
           ; consumed
           ; length
@@ -591,12 +623,7 @@ struct
     | false -> k off crc src t
 
   let hunks src t offset length consumed crc z h =
-    let open Decompress in
-
-    let dst' = B.from_bigstring (Cstruct.to_bigarray t.o_z) in
-    let src' = B.from_bigstring (Cstruct.to_bigarray src) in
-
-    match Inflate.eval src' dst' z with
+    match Inflate.eval src t.o_z z with
     | `Await z ->
       let consumed = consumed + Inflate.used_in z in
       let crc = Crc32.digest ~off:(t.i_off + t.i_pos) ~len:(Inflate.used_in z) crc src in
@@ -607,7 +634,6 @@ struct
     | `Error (z, exn) ->
       error t (Inflate_error exn)
     | `End z ->
-
       let ret = if Inflate.used_out z <> 0
                 then HunkDecoder.eval t.o_z (HunkDecoder.refill 0 (Inflate.used_out z) h)
                 else HunkDecoder.eval t.o_z h
@@ -657,8 +683,6 @@ struct
     loop 1 (Int64.shift_right off 7)
 
   let switch typ off len crc src t =
-    let open Decompress in
-
     match typ with
     | 0b000 | 0b101 -> error t (Reserved_kind typ)
     | 0b001 ->
@@ -669,7 +693,7 @@ struct
                                   ; kind = Commit
                                   ; z = Inflate.flush 0 (Cstruct.len t.o_z)
                                         @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Inflate.default (Window.reset t.o_w) } }
+                                        @@ Inflate.default (Inflate.window_reset t.o_w) } }
     | 0b010 ->
       Cont { t with state = Unzip { offset   = off
                                   ; length   = len
@@ -678,7 +702,7 @@ struct
                                   ; kind     = Tree
                                   ; z = Inflate.flush 0 (Cstruct.len t.o_z)
                                         @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Inflate.default (Window.reset t.o_w) } }
+                                        @@ Inflate.default (Inflate.window_reset t.o_w) } }
     | 0b011 ->
       Cont { t with state = Unzip { offset   = off
                                   ; length   = len
@@ -687,7 +711,7 @@ struct
                                   ; kind     = Blob
                                   ; z = Inflate.flush 0 (Cstruct.len t.o_z)
                                         @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Inflate.default (Window.reset t.o_w) } }
+                                        @@ Inflate.default (Inflate.window_reset t.o_w) } }
     | 0b100 ->
       Cont { t with state = Unzip { offset   = off
                                   ; length   = len
@@ -696,7 +720,7 @@ struct
                                   ; kind     = Tag
                                   ; z = Inflate.flush 0 (Cstruct.len t.o_z)
                                         @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                        @@ Inflate.default (Window.reset t.o_w) } }
+                                        @@ Inflate.default (Inflate.window_reset t.o_w) } }
     | 0b110 ->
       KObject.get_byte
         (fun byte src t ->
@@ -711,7 +735,7 @@ struct
                                            ; crc
                                            ; z = Inflate.flush 0 (Cstruct.len t.o_z)
                                                @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                               @@ Inflate.default (Window.reset t.o_w)
+                                               @@ Inflate.default (Inflate.window_reset t.o_w)
                                            ; h = HunkDecoder.default len (HunkDecoder.Offset offset) } })
             src t)
         src t
@@ -724,7 +748,7 @@ struct
                                       ; crc
                                       ; z = Inflate.flush 0 (Cstruct.len t.o_z)
                                             @@ Inflate.refill (t.i_off + t.i_pos) (t.i_len - t.i_pos)
-                                            @@ Inflate.default (Window.reset t.o_w)
+                                            @@ Inflate.default (Inflate.window_reset t.o_w)
                                       ; h = HunkDecoder.default len (HunkDecoder.Hash hash) } })
         src t
     | _  -> error t (Invalid_kind typ)
@@ -747,12 +771,7 @@ struct
       src t
 
   let unzip src t offset length consumed crc kind z =
-    let open Decompress in
-
-    let dst' = B.from_bigstring (Cstruct.to_bigarray t.o_z) in
-    let src' = B.from_bigstring (Cstruct.to_bigarray src) in
-
-    match Inflate.eval src' dst' z with
+    match Inflate.eval src t.o_z z with
     | `Await z ->
       let crc = Crc32.digest ~off:(t.i_off + t.i_pos) ~len:(Inflate.used_in z) crc src in
       let consumed = consumed + Inflate.used_in z in
@@ -819,7 +838,7 @@ struct
     { i_off   = 0
     ; i_pos   = 0
     ; i_len   = 0
-    ; local   = false
+    ; process = `All
     ; o_z     = z_tmp
     ; o_w     = z_win
     ; read    = 0L
@@ -839,7 +858,20 @@ struct
     { i_off   = 0
     ; i_pos   = 0
     ; i_len   = 0
-    ; local   = true
+    ; process = `One
+    ; o_z     = z_tmp
+    ; o_w     = z_win
+    ; read    = Int64.add window.Window.off (Int64.of_int win_offset)
+    ; version = 0l
+    ; objects = 1l
+    ; counter = 1l
+    ; state   = Object kind }
+
+  let process_length window win_offset z_tmp z_win =
+    { i_off   = 0
+    ; i_pos   = 0
+    ; i_len   = 0
+    ; process = `Length
     ; o_z     = z_tmp
     ; o_w     = z_win
     ; read    = Int64.add window.Window.off (Int64.of_int win_offset)
@@ -860,7 +892,7 @@ struct
                                   ; consumed
                                   ; crc
                                   ; kind
-                                  ; z = Decompress.Inflate.refill off len z } }
+                                  ; z = Inflate.refill off len z } }
         | Hunks { offset; length; consumed; crc; z; h; } ->
           { t with i_off = off
                   ; i_len = len
@@ -869,7 +901,7 @@ struct
                                   ; length
                                   ; consumed
                                   ; crc
-                                  ; z = Decompress.Inflate.refill off len z; h; } }
+                                  ; z = Inflate.refill off len z; h; } }
         | _ -> { t with i_off = off
                       ; i_len = len
                       ; i_pos = 0 }
@@ -882,16 +914,16 @@ struct
                              ; consumed
                              ; crc
                              ; kind
-                             ; z = Decompress.Inflate.flush off len z } }
+                             ; z = Inflate.flush off len z } }
     | _ -> raise (Invalid_argument "PACKDecoder.flush: bad state")
 
   let output t = match t.state with
     | Unzip { z; _ } ->
-      t.o_z, Decompress.Inflate.used_out z
+      t.o_z, Inflate.used_out z
     | _ -> raise (Invalid_argument "PACKDecoder.output: bad state")
 
   let next_object t = match t.state with
-    | Next _ when not t.local ->
+    | Next _ when t.process = `All ->
       if Int32.pred t.counter = 0l
       then { t with state = Checksum checksum
                   ; counter = Int32.pred t.counter }
@@ -902,6 +934,8 @@ struct
     | _ -> raise (Invalid_argument "PACKDecoder.next_object: bad state")
 
   let kind t = match t.state with
+    | Unzip { kind; _ } -> kind
+    | Hunks { h; _ } -> Hunk (HunkDecoder.partial_hunks h)
     | Next { kind; _ } -> kind
     | _ -> raise (Invalid_argument "PACKDecoder.kind: bad state")
 
@@ -922,6 +956,8 @@ struct
     | _ -> raise (Invalid_argument "PACKDecoder.consumed: bad state")
 
   let offset t = match t.state with
+    | Unzip { offset; _ } -> offset
+    | Hunks { offset; _ } -> offset
     | Next { offset; _ } -> offset
     | _ -> raise (Invalid_argument "PACKDecoder.offset: bad state")
 
@@ -955,6 +991,34 @@ struct
     in
 
     loop t
+
+  let rec eval_length src t =
+    let eval0 t = match t.state with
+      | Header k -> k src t
+      | Object k -> k src t
+      | VariableLength k -> k src t
+      | Unzip { offset; length; consumed; crc; kind; z; } ->
+        unzip src t offset length consumed crc kind z
+      | Hunks { offset; length; consumed; crc; z; h; } ->
+        hunks src t offset length consumed crc z h
+      | Next { length; length'; kind; } -> next src t length length' kind
+      | Checksum k -> k src t
+      | End hash -> ok t hash
+      | Exception exn -> error t exn
+    in
+
+    let rec loop t =
+      match eval0 t with
+      | Cont (({ state = Next _ } | { state = Unzip _ } | { state = Hunks { h = { HunkDecoder.state = HunkDecoder.List _ } } }) as t) -> `Length t
+      | Cont t -> loop t
+      | Wait t -> `Await t
+      | Flush t -> `Flush t
+      | Ok (t, hash) -> `End (t, hash)
+      | Error (t, exn) -> `Error (t, exn)
+    in
+
+    assert (t.process = `Length);
+    loop t
 end
 
 module type MAPPER =
@@ -965,12 +1029,12 @@ sig
   val map    : fd -> ?pos:int64 -> share:bool -> int -> Cstruct.t
 end
 
-module MakeDecoder (Hash : HASH) (Mapper : MAPPER) =
+module MakeDecoder (Hash : HASH) (Mapper : MAPPER) (Inflate : Z) =
 struct
   module Hash   = Hash
   module Mapper = Mapper
 
-  module P      = MakePACKDecoder(Hash)
+  module P      = MakePACKDecoder(Hash)(Inflate)
   module H      = MakeHunkDecoder(Hash)
 
   type error =
@@ -1140,7 +1204,7 @@ struct
 
   let result_bind ~err f = function Ok a -> f a | Error exn -> err
 
-  let get_pack_object ?(chunk = 0x800) t reference source_length source_offset z_tmp z_win r_tmp =
+  let get_pack_object ?(chunk = 0x8000) t reference source_length source_offset z_tmp z_win r_tmp =
     if Cstruct.len r_tmp < source_length
     then raise (Invalid_argument (Format.sprintf "Decoder.delta: expect %d and have %d" source_length (Cstruct.len r_tmp)));
 
@@ -1246,10 +1310,10 @@ struct
   let needed ?(chunk = 0x8000) t hash z_tmp z_win =
     let get absolute_offset =
       let window, relative_offset = find t absolute_offset in
-      let state = P.from_window window relative_offset z_tmp z_win in
+      let state = P.process_length window relative_offset z_tmp z_win in
 
       let rec loop window consumed_in_window state =
-        match P.eval window.Window.raw state with
+        match P.eval_length window.Window.raw state with
         | `Await state ->
           let rest_in_window = min (window.Window.len - consumed_in_window) chunk in
 
@@ -1266,6 +1330,7 @@ struct
               (P.refill 0 0 state)
         | `Flush state ->
           `Direct (P.length state)
+        | `Length state
         | `Object state ->
           (match P.kind state with
            | P.Hunk ({ H.reference = H.Offset off; _ } as hunks) ->
