@@ -22,3 +22,6 @@ let pp fmt x =
   Format.fprintf fmt "%08lx" (to_int32 x)
 
 let default = of_int32 0l
+
+let eq : t -> t -> bool = fun a b -> Int32.equal (to_int32 a) (to_int32 b)
+let neq : t -> t -> bool = fun a b -> not (eq a b)
