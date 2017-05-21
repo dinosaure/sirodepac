@@ -577,15 +577,20 @@ struct
            ; src_hash   : Hash.t }
     (* XXX(dinosaure): I try to use GADT (peano number) and ... I really crazy. *)
 
-  module MV =
+  module WeightByMemory =
   struct
     type nonrec t = t * Cstruct.t * Rabin.Index.t
 
     let weight (_, raw, rabin) =
+      (* XXX(dinosaure): 1 word for [t]
+                         len of raw
+                         1 for ... I don't know
+                         memory size of the rabin's fingerprint
+       *)
       1 + Cstruct.len raw + 1 + (Rabin.Index.memory_size rabin)
   end
 
-  module AV = struct type nonrec t = t * Cstruct.t * Rabin.Index.t let weight _ = 1 end
+  module WeightByElement = struct type nonrec t = t * Cstruct.t * Rabin.Index.t let weight _ = 1 end
 
   module type WINDOW = Lru.F.S with type k = Entry.t and type v = t * Cstruct.t * Rabin.Index.t
   type window = (module WINDOW)
@@ -709,7 +714,7 @@ struct
                      - tree
                      - rest
 
-                     We can't don't care about that in other side ...
+                     We can don't care about that in other side ...
    *)
   let sort tag lst =
     let compare a b =
@@ -730,8 +735,8 @@ struct
 
   exception Uncaught_hash of Hash.t
 
-  module MemoryCache = Lru.F.Make(Entry)(MV)
-  module AbstractCache = Lru.F.Make(Entry)(AV)
+  module MemoryCache = Lru.F.Make(Entry)(WeightByMemory)
+  module ElementCache = Lru.F.Make(Entry)(WeightByElement)
 
   let deltas ?(memory = false) entries get tag window max =
     let to_delta e = match e.Entry.delta, e.Entry.preferred with
@@ -753,7 +758,7 @@ struct
       let window_pack =
         if memory
         then (module MemoryCache : WINDOW)
-        else (module AbstractCache : WINDOW)
+        else (module ElementCache : WINDOW)
       in
 
       let module Window = (val window_pack) in
@@ -889,6 +894,9 @@ struct
     { o_off   : int
     ; o_pos   : int
     ; o_len   : int
+    ; i_off   : int
+    ; i_pos   : int
+    ; i_len   : int
     ; write   : int64
     ; radix   : (Crc32.t * int64) Radix.t
     ; access  : (Hash.t -> Cstruct.t option)
@@ -922,6 +930,7 @@ struct
     | Exception of error
   and res =
     | Flush of t
+    | Wait of t
     | Error of t * error
     | Cont of t
     | Ok of t * Hash.t
@@ -936,6 +945,7 @@ struct
     Hash.feed t.hash (Cstruct.to_bigarray (Cstruct.sub dst t.o_off t.o_pos));
     Flush t
 
+  let await t = Wait t
   let error t exn = Error ({ t with state = Exception exn }, exn)
   let ok t hash   = Ok ({ t with state = End hash }, hash)
 
@@ -1131,7 +1141,10 @@ struct
                                     ; crc
                                     ; off = abs_off
                                     ; ui = 0
-                                    ; z } })
+                                    ; z }
+                   ; i_off = 0
+                   ; i_pos = 0
+                   ; i_len = 0 })
       dst t
 
     | KindHash, { Delta.delta = Delta.S { length; depth; hunks; src; src_length; src_hash; } } ->
@@ -1155,13 +1168,18 @@ struct
        let z = Deflate.default 4 in
        let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos) z in
 
+       Format.eprintf "CRC-32 after hash header: %a\n%!" Crc32.pp crc;
+
        Cont { t with state = WriteH { x = (entry, entry_delta, entry_raw)
                                     ; r = rest
                                     ; crc
                                     ; off = abs_off
                                     ; ui = 0
                                     ; h
-                                    ; z } })
+                                    ; z }
+                   ; i_off = 0
+                   ; i_len = 0
+                   ; i_pos = 0 })
         dst t
 
     | KindOffset, { Delta.delta = Delta.S { length; depth; hunks; src; src_length; src_hash; } } ->
@@ -1193,7 +1211,10 @@ struct
                                        ; off = abs_off
                                        ; ui = 0
                                        ; h
-                                       ; z } })
+                                       ; z }
+                      ; i_off = 0
+                      ; i_len = 0
+                      ; i_pos = 0 })
            dst t
        | None -> assert false)
 
@@ -1205,57 +1226,55 @@ struct
                      state to an error.
    *)
 
-  let writez dst t ((entry, entry_raw) as x) r crc off used_in z =
-    (* assert than [entry_raw] is physically the same and immutable at each call of [writez].
-       that means the deflate state compute all the time the same [src'] buffer.
-       so, [used_in] is equivalent semantically for each call.
+  let writez src dst t ((entry, entry_raw) as x) r crc off used_in z =
+    (* XXX(dinosaure): to be clear, we follow the semantic provided by [Deflate]. That means, concretely,
+                       we follow [Decompress] or [Zlib]. For [writez], normally, we don't have any
+                       problem because we just want to compress an input stream.
 
-       XXX(dinosaure): for a huge file, it's may be more relevant to compute the
-                       raw entry by a limited chunk. We know, the compute of the
-                       hunk is a *stop the world* algorithm and can't be
-                       factorized to a non-blocking computation with a limited
-                       input stream.
+                       [writek] needs more explications.
+     *)
 
-                       However, it's not the same case for the serialization and
-                       this politic can be irrelevant (and raise an
-                       [Out_of_memory]) for a huge file. So TODO!
-
-    *)
-
-    let rec loop used_in z = match Deflate.eval entry_raw dst z with
+    let rec loop used_in z = match Deflate.eval src dst z with
       | `Await z ->
-        if used_in = Cstruct.len entry_raw
-        then loop used_in (Deflate.finish z)
-        else loop (Deflate.used_in z) (Deflate.no_flush (Deflate.used_in z) (Cstruct.len entry_raw - Deflate.used_in z) z)
+        await { t with state = WriteZ { x; r; crc; off; ui = used_in; z; }
+                     ; i_pos = t.i_pos + Deflate.used_in z }
       | `Flush z ->
         let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
+        Format.eprintf "Update CRC-32: %a\n%!" Crc32.pp crc;
 
         flush dst { t with state = WriteZ { x; r; crc; off; ui = (Deflate.used_in z); z; }
                          ; o_pos = t.o_pos + (Deflate.used_out z)
+                         ; i_pos = t.i_pos + (Deflate.used_in z)
                          ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
       | `End z ->
         let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
+        Format.eprintf "Update CRC-32: %a\n%!" Crc32.pp crc;
 
         Cont { t with state = Save { x = entry; r; crc; off; }
                     ; o_pos = t.o_pos + (Deflate.used_out z)
+                    ; i_pos = t.i_pos + (Deflate.used_in z)
                     ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
       | `Error (z, exn) -> error t (Deflate_error exn)
     in
 
     loop used_in z
 
-  let writeh dst t ((entry, entry_delta, entry_raw) as x) r crc off used_in h z =
+  let writeh src dst t ((entry, entry_delta, entry_raw) as x) r crc off used_in h z =
     match Deflate.eval t.h_tmp dst z with
     | `Await z ->
       (match HunkEncoder.eval t.h_tmp h with
        | `Flush h ->
          let used_in' = used_in + Deflate.used_in z in
-           (* ce qu'a consommé [zlib] ou [decompress] entre [used_in] et [HunkEncoder.used_out h]:
-              - dans le cas de [decompress], [used_in] retournera toujours le nombre de bytes qu'à écrit [HunkEncoder]
-              - dans le cas de [zlib], [used_in] peut retourner un nombre inférieur à ce qu'à donné [HunkDecoder]
+         (* Description of this state:
+            - in the [Decompress] case, [used_in] returns all the time the
+              number of bytes than [HunkEncoder] wrote
+            - in the [zlib] case, [used_in] can returns a number lowest than
+              what is provided by [HunkEncoder] - in other words, [zlib] can not
+              consume all bytes available in [t.h_tmp].
 
-              tant que [used_in] ne sera pas équivalent à [HunkEncoder.used_out], [t.h_tmp] est considéré comme physiquement le même et immutable.
-           *)
+            While [used_in] is not equal to [HunkEncoder.used_out], [t.h_tmp] is
+            considered as the same (physically) and it is immutable.
+          *)
 
          let z, h, ui =
            if used_in' = HunkEncoder.used_out h
@@ -1263,8 +1282,8 @@ struct
            else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
          in
 
-         (* on assure que, dans ce contexte, [HunkEncoder.used_out] est constant.
-            en effet, tant qu'on aura pas tout consommé, [h] reste exactement le même.
+         (* We ensure than, in this context, [HunkEncoder.used_out] is constant.
+            Indeed, while were are not consumed all, [h] stay exactly the same.
           *)
 
          Cont { t with state = WriteH { x; r; crc; off; ui; h; z; } }
@@ -1332,13 +1351,13 @@ struct
 
   let idx t = t.radix
 
-  let eval dst t =
+  let eval src dst t =
     let eval0 t = match t.state with
       | Header k -> k dst t
       | Object k -> k dst t
       | WriteK k -> k dst t
-      | WriteZ { x; r; crc; off; ui; z; } -> writez dst t x r crc off ui z
-      | WriteH { x; r; crc; off; ui; h; z; } -> writeh dst t x r crc off ui h z
+      | WriteZ { x; r; crc; off; ui; z; } -> writez src dst t x r crc off ui z
+      | WriteH { x; r; crc; off; ui; h; z; } -> writeh src dst t x r crc off ui h z
       | Save { x; r; crc; off; } -> save dst t x r crc off
       | Exception exn -> error t exn
       | Hash k -> k dst t
@@ -1349,6 +1368,7 @@ struct
       match eval0 t with
       | Cont t -> loop t
       | Flush t -> `Flush t
+      | Wait t -> `Await t
       | Ok (t, hash) -> `End (t, hash)
       | Error (t, exn) -> `Error (t, exn)
     in
@@ -1375,10 +1395,44 @@ struct
                ; o_pos = 0 }
     else raise (Invalid_argument (Format.sprintf "PACKEncoder.flush: you lost something (pos: %d, len: %d)" t.o_pos t.o_len))
 
+  let expect t =
+    match t.state with
+    | WriteZ { x = ({ Entry.hash_object; _ }, _); _ } -> hash_object
+    | _ -> raise (Invalid_argument "PACKEncoder.expect")
+
+  let refill offset len t =
+    Format.eprintf "refill: %d, %d\n%!" offset len;
+
+    if (t.i_len - t.i_pos) = 0
+    then
+      match t.state with
+      | WriteZ { x; r; crc; off; ui; z; } ->
+        { t with i_off = offset
+               ; i_len = len
+               ; i_pos = 0
+               ; state = WriteZ { x; r; crc; off; ui; z = Deflate.no_flush offset len z } }
+      | _ -> { t with i_off = offset
+                    ; i_len = len
+                    ; i_pos = 0 }
+    else raise (Invalid_argument (Format.sprintf "PACKEncoder.refill: you lost something (pos: %d, len: %d)" t.i_pos t.i_len))
+
+  let finish t =
+    if (t.i_len - t.i_pos) = 0
+    then match t.state with
+      | WriteZ { x; r; crc; off; ui; z; } ->
+        { t with state = WriteZ { x; r; crc; off; ui; z = Deflate.finish z } }
+      | _ -> t
+    else raise (Invalid_argument (Format.sprintf "PACKEncoder.finish: you lost something (pos: %d, len: %d)" t.i_pos t.i_len))
+
+  let used_in t = t.i_pos
+
   let default h_tmp access objects =
     { o_off = 0
-    ; o_pos = 0
+    ; o_pos = 0 
     ; o_len = 0
+    ; i_off = 0
+    ; i_pos = 0
+    ; i_len = 0
     ; write = 0L
     ; radix = Radix.empty
     ; access

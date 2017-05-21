@@ -1,3 +1,5 @@
+let () = Printexc.record_backtrace true
+
 module Result =
 struct
   let ( >>| ) x f =
@@ -10,6 +12,12 @@ struct
     match x with Ok x -> f x | Error exn -> Error exn
 
   let unsafe_ok = function Ok x -> x | Error exn -> assert false
+end
+
+module Option =
+struct
+  let iter f = function Some x -> f x | None -> ()
+  let map f = function Some x -> Some (f x) | None -> None
 end
 
 module SHA1 =
@@ -51,7 +59,7 @@ struct
     Cstruct.of_bigarray result
 end
 
-module ZC : Pack.Z =
+module ZDC : Pack.Z =
 struct
   type t =
     { state          : Zlib.stream
@@ -129,7 +137,7 @@ struct
     end
 end
 
-module ZO : Pack.Z =
+module ZDO : Pack.Z =
 struct
   open Decompress
 
@@ -153,7 +161,7 @@ struct
     Deflate.eval src dst t
 end
 
-module InflateO : Unpack.Z with type window = Decompress.B.bs Decompress.Window.t =
+module ZIO : Unpack.Z with type window = Decompress.B.bs Decompress.Window.t =
 struct
   open Decompress
 
@@ -179,7 +187,7 @@ struct
     Inflate.eval src dst t
 end
 
-module InflateC : Unpack.Z with type window = unit =
+module ZIC : Unpack.Z with type window = unit =
 struct
   type t =
     { state          : Zlib.stream
@@ -272,16 +280,29 @@ end
 module IDXLazy     = Idx.Lazy(SHA1)
 module IDXDecoder  = Idx.Decoder(SHA1)
 module IDXEncoder  = Idx.Encoder(SHA1)
-module Decoder     = Unpack.MakeDecoder(SHA1)(Mapper)(InflateO)
+module Decoder     = Unpack.MakeDecoder(SHA1)(Mapper)(ZIO)
 module PACKDecoder = Decoder.P
 module Delta       = Pack.MakeDelta(SHA1)
-module PACKEncoder = Pack.MakePACKEncoder(SHA1)(ZO)
+module PACKEncoder = Pack.MakePACKEncoder(SHA1)(ZDO)
 module Radix       = PACKEncoder.Radix
 
 module Commit = Minigit.Commit(SHA1)
 module Tree   = Minigit.Tree(SHA1)
 module Tag    = Minigit.Tag(SHA1)
 module Blob   = Minigit.Blob
+
+let hash_of_object base =
+  let typename = match base.Decoder.Object.kind with
+    | `Commit -> "commit"
+    | `Tree -> "tree"
+    | `Blob -> "blob"
+    | `Tag -> "tag"
+  in
+
+  let hdr = Format.sprintf "%s %Ld\000" typename base.Decoder.Object.length in
+
+  SHA1.digestv [ Cstruct.to_bigarray @@ Cstruct.of_string hdr
+               ; Cstruct.to_bigarray base.Decoder.Object.raw ]
 
 let cstruct_map filename =
   let i = Unix.openfile filename [ Unix.O_RDONLY ] 0o644 in
@@ -311,9 +332,11 @@ let idx_from_filename filename =
 
 (* global tempory buffer *)
 let z_tmp = Cstruct.create 0x8000
+let z_tmp0 = Cstruct.create 0x8000
 let o_tmp = Cstruct.create 0x8000
 let h_tmp = Cstruct.create 0x8000
 let z_win = Decompress.Window.create ~proof:Decompress.B.proof_bigstring
+let z_win0 = Decompress.Window.create ~proof:Decompress.B.proof_bigstring
 let p_nam = Hashtbl.create 100
 
 let save_names_of_tree hash raw =
@@ -343,14 +366,233 @@ let pp_option pp_data fmt = function
 external write : Unix.file_descr -> Cstruct.buffer -> int -> int -> int =
   "bigstring_write" [@@noalloc]
 
-let make_pack pack_out idx_out pack access entries =
-  let rec loop_pack ?(raw = false) t =
-    match PACKEncoder.eval o_tmp t with
+type deserializer =
+  { window          : Unpack.Window.t
+  ; consume         : int
+  ; state           : Decoder.P.t
+  ; hash            : SHA1.t
+  ; final           : bool
+  ; i_off           : int
+  ; i_pos           : int
+  ; i_len           : int
+  ; apply_idx       : int option
+  ; u_in            : int }
+
+let pp_deserializer fmt t =
+  let pp_option pp_data fmt = function
+    | Some x -> pp_data fmt x
+    | None -> Format.fprintf fmt "<none>"
+  in
+
+  Format.fprintf fmt "{ @[<hov>window = @[<hov>%a@];@ \
+                               consume = %d;@ \
+                               state = @[<hov>%a@];@ \
+                               hash = @[<hov>%a@];@ \
+                               final = %b;@ \
+                               i_off = %d;@ \
+                               i_pos = %d;@ \
+                               i_len = %d;@ \
+                               apply_idx = @[<hov>%a@];@ \
+                               u_in = %d;@] }"
+    Unpack.Window.pp t.window
+    t.consume Decoder.P.pp t.state SHA1.pp t.hash t.final t.i_off t.i_pos t.i_len (pp_option Format.pp_print_int) t.apply_idx t.u_in
+
+let s_tmp = Cstruct.create 0x8000
+
+let apply src trg state = function
+  | Decoder.P.HunkDecoder.Insert i ->
+    (match state.apply_idx with
+    | Some idx ->
+      let n = min (state.i_len - state.i_pos) (Cstruct.len i - idx) in
+      Cstruct.blit i idx trg state.i_pos n;
+      { state with i_pos = state.i_pos + n
+                  ; apply_idx = if idx + n = Cstruct.len i then None else Some (idx + n)
+                  ; state = if idx + n = Cstruct.len i then Decoder.P.continue state.state else state.state }
+    | None ->
+      let n = min (state.i_len - state.i_pos) (Cstruct.len i) in
+      Cstruct.blit i 0 trg state.i_pos n;
+      { state with i_pos = state.i_pos + n
+                  ; apply_idx = if n = Cstruct.len i then None else Some n
+                  ; state = if n = Cstruct.len i then Decoder.P.continue state.state else state.state })
+  | Decoder.P.HunkDecoder.Copy (off, len) ->
+    (match state.apply_idx with
+    | Some idx ->
+      let n = min (state.i_len - state.i_pos) (len - idx) in
+      Cstruct.blit src (off + idx) trg state.i_pos n;
+      { state with i_pos = state.i_pos + n
+                  ; apply_idx = if idx + n = len then None else Some (idx + n)
+                  ; state = if idx + n = len then Decoder.P.continue state.state else state.state }
+    | None ->
+      let n = min (state.i_len - state.i_pos) len in
+      Cstruct.blit src off trg state.i_pos n;
+      { state with i_pos = state.i_pos + n
+                  ; apply_idx = if n = len then None else Some n
+                  ; state = if n = len then Decoder.P.continue state.state else state.state })
+
+let fill trg deserializer =
+  let o, n = Decoder.P.output deserializer.state in
+
+  match deserializer.apply_idx with
+  | Some idx ->
+    let n' = min (n - idx) (deserializer.i_len - deserializer.i_pos) in
+    Cstruct.blit o idx trg deserializer.i_pos n';
+    { deserializer with i_pos = deserializer.i_pos + n'
+                      ; apply_idx = if idx + n' = n then None else Some (idx + n')
+                      ; state = if idx + n' = n then Decoder.P.flush 0 (Cstruct.len o) deserializer.state else deserializer.state }
+  | None ->
+    let n' = min n (deserializer.i_len - deserializer.i_pos) in
+    Cstruct.blit o 0 trg deserializer.i_pos n';
+    { deserializer with i_pos = deserializer.i_pos + n'
+                      ; apply_idx = if n' = n then None else Some n'
+                      ; state = if n' = n then Decoder.P.flush 0 (Cstruct.len o) deserializer.state else deserializer.state }
+
+let rec filler ?(chunk = 0x8000) source pack s_tmp d_tmp t =
+  if t.i_pos = t.i_len
+  then Ok (t, source)
+  else match Decoder.P.eval t.window.Unpack.Window.raw t.state with
+    | `Await state ->
+      let rest_in_window = min (t.window.Unpack.Window.len - t.consume) chunk in
+
+      if rest_in_window > 0
+      then
+        filler
+          source
+          pack s_tmp d_tmp
+          { t with consume = t.consume + rest_in_window
+                 ; state = Decoder.P.refill t.consume rest_in_window state }
+      else begin
+        let window, relative_offset = Decoder.find pack Int64.(add t.window.Unpack.Window.off (of_int t.consume)) in
+        filler
+          source
+          pack s_tmp d_tmp
+          { t with window = window
+                 ; consume = relative_offset
+                 ; state = Decoder.P.refill 0 0 state }
+      end
+    | `Hunk (state, hunk) ->
+      (match source with
+       | Some raw ->
+         let t' = apply raw s_tmp { t with state = state } hunk in
+         filler source pack s_tmp d_tmp t'
+       | None ->
+        (* XXX(dinosaure): About this code. We continue to control the
+                            memory fingerprint and prefer to re-use
+                            [old_raw0] and [old_raw1] created in the
+                            main function. We can change this code to
+                            be more efficient (about memory) and limit
+                            these buffer to [max_int32 + 0x10000].
+                            Indeed, by the format (see Rabin's
+                            fingerprint), we use only [max_int32 +
+                            0x10000]. So for a huge git object, we can
+                            limit the memory size to this - obviously,
+                            if one of a git object is upper than
+                            [max_int32 + 0x10000], it's certainly the
+                            end of the world.
+
+                            However, in this context, we ensure than
+                            the serializer don't use [access] (which
+                            one uses [old_raw0] and [old_raw1]). This
+                            note appear only because I don't change yet
+                            the code.
+        *)
+         let getter state =
+           match Decoder.P.kind state with
+           | Decoder.P.Hunk { Decoder.P.HunkDecoder.reference = Decoder.P.HunkDecoder.Offset ofs; _ } ->
+             let absolute_offset = Int64.sub (Decoder.P.offset state) ofs in
+             Decoder.get' pack absolute_offset z_tmp0 z_win0 d_tmp
+           | Decoder.P.Hunk { Decoder.P.HunkDecoder.reference = Decoder.P.HunkDecoder.Hash hash; _ } ->
+             Decoder.get pack hash z_tmp0 z_win0 d_tmp
+           | _ -> assert false
+         in
+
+         (match getter state with
+          | Ok base -> filler (Some base.Decoder.Object.raw) pack s_tmp d_tmp { t with state = state }
+          | Error exn -> Error exn))
+    | `Flush state ->
+      let t' = fill s_tmp { t with state = state } in
+      filler source pack s_tmp d_tmp t'
+    | `Object state ->
+      Ok ({ t with final = true
+                 ; state = state }, source)
+    | `End state -> assert false
+    | `Error (state, exn) ->
+      Format.eprintf "> %a\n%!" Decoder.P.pp_error exn;
+      Error (Decoder.Unpack_error (state, t.window, exn))
+
+let pp_option pp_data fmt = function
+  | Some x -> pp_data fmt x
+  | None -> Format.fprintf fmt "<none>"
+
+let make_pack ?(chunk = 0x8000) pack_out idx_out pack (raw0, raw1) access entries =
+  let rec loop_pack (deserializer, source) t =
+    match PACKEncoder.eval s_tmp o_tmp t with
+    | `Await t ->
+      (match deserializer with
+       | Some deserializer0 ->
+         Format.eprintf "deserializer0: %a\n%!" pp_deserializer deserializer0;
+
+         (match filler source pack s_tmp (raw0, raw1) deserializer0 with
+          | Ok ({ final = false; _ } as deserializer1, source) ->
+            Format.eprintf "`Await, `Flush: %a\n%!" pp_deserializer deserializer1;
+
+            let used_in' = deserializer1.u_in + PACKEncoder.used_in t in
+
+            let t, deserializer2 =
+              if used_in' = deserializer1.i_pos
+              then PACKEncoder.refill 0 0 t,
+                   { deserializer1 with i_off = 0
+                                      ; i_pos = 0
+                                      ; i_len = Cstruct.len s_tmp
+                                      ; u_in = 0 }
+              else
+                PACKEncoder.refill (deserializer1.i_off + used_in') (deserializer1.i_pos - used_in') t,
+                { deserializer1 with u_in = used_in' }
+            in
+
+            loop_pack (Some deserializer2, source) t
+          | Ok ({ final = true; _ } as deserializer1, source) ->
+            Format.eprintf "`Await, `End: %a\n%!" pp_deserializer deserializer1;
+
+            let used_in' = deserializer1.u_in + PACKEncoder.used_in t in
+
+            let t, deserializer2 =
+              if used_in' = deserializer1.i_pos
+              then PACKEncoder.finish t, None
+              else
+                PACKEncoder.refill (deserializer1.i_off + used_in') (deserializer1.i_pos - used_in') t,
+                Some { deserializer1 with u_in = used_in' }
+            in
+
+            loop_pack (deserializer2, source) t
+          | Error exn -> Error exn)
+       | None ->
+         match pack.Decoder.idx (PACKEncoder.expect t) with
+         | Some (crc, absolute_offset) ->
+           let window, relative_offset = Decoder.find pack absolute_offset in
+           let deserializer =
+             { window
+             ; consume = relative_offset
+             ; state = Decoder.P.from_window window relative_offset z_tmp z_win
+             ; hash  = (PACKEncoder.expect t)
+             ; final = false
+             ; i_off = 0
+             ; i_pos = 0
+             ; i_len = Cstruct.len s_tmp
+             ; apply_idx = None
+             ; u_in  = 0 }
+           in
+           loop_pack (Some deserializer, None) t
+         | None -> Error (Decoder.Invalid_hash (PACKEncoder.expect t)))
     | `Flush t ->
       let n = PACKEncoder.used_out t in
+      let deserializer =
+        Option.map
+          (fun deserializer -> { deserializer with u_in = deserializer.u_in + (PACKEncoder.used_in t) })
+          deserializer
+      in
 
       ignore @@ write pack_out (Cstruct.to_bigarray o_tmp) 0 n;
-      loop_pack (PACKEncoder.flush 0 (Cstruct.len o_tmp) t)
+      loop_pack (deserializer, source) (PACKEncoder.flush 0 (Cstruct.len o_tmp) t)
     | `Error (t, exn) ->
       Format.eprintf "PACK encoder: %a\n%!" PACKEncoder.pp_error exn;
       assert false
@@ -358,7 +600,7 @@ let make_pack pack_out idx_out pack access entries =
       if PACKEncoder.used_out t <> 0
       then ignore @@ write pack_out (Cstruct.to_bigarray o_tmp) 0 (PACKEncoder.used_out t);
 
-      PACKEncoder.idx t, hash
+      Ok (PACKEncoder.idx t, hash)
   in
 
   let rec loop_idx t =
@@ -377,11 +619,13 @@ let make_pack pack_out idx_out pack access entries =
       assert false
   in
 
-  let tree_idx, hash_pack = loop_pack (PACKEncoder.default h_tmp access entries) in
+  match loop_pack (None, None) (PACKEncoder.default h_tmp access entries) with
+  | Ok (tree_idx, hash_pack) ->
+    Format.printf "Hash produced: %a\n%!" SHA1.pp hash_pack;
 
-  Format.printf "Hash produced: %a\n%!" SHA1.pp hash_pack;
-
-  loop_idx (IDXEncoder.default (Radix.to_sequence tree_idx) hash_pack)
+    loop_idx (IDXEncoder.default (Radix.to_sequence tree_idx) hash_pack)
+  | Error exn ->
+    Format.eprintf "Error happens: %a\n%!" Decoder.pp_error exn
 
 let idx_filename  = "pack.idx"
 let pack_filename = "pack.pack"
@@ -396,9 +640,6 @@ let pp_list ?(sep = (fun fmt () -> ()) )pp_data fmt lst =
     | [ x ] -> pp_data fmt x
     | x :: r -> Format.fprintf fmt "%a%a" pp_data x sep (); aux r
   in aux lst
-
-module Cache = Lru.M.Make(SHA1)(struct type t = Decoder.kind * Cstruct.t let weight (_, x) = 1 + 3 + Cstruct.len x + 1  end)
-module Rev = Map.Make(Int64)
 
 let cstruct_copy x =
   let l = Cstruct.len x in
@@ -422,7 +663,8 @@ let () =
 
   Format.eprintf "PACK file loaded.\n%!";
 
-  let max_length = IDXLazy.fold old_idx (fun hash _ acc -> match Decoder.needed old_pack hash z_tmp z_win with
+  let max_length = IDXLazy.fold old_idx (fun hash _ acc ->
+      match Decoder.needed old_pack hash z_tmp z_win with
       | Ok length ->
         Format.eprintf "get length for %a: %d\n%!" SHA1.pp hash (max length acc);
         max length acc
@@ -434,14 +676,25 @@ let () =
   Format.printf "Max length calculated: %d\n%!" max_length;
 
   let old_raw0, old_raw1 = Cstruct.create max_length, Cstruct.create max_length in
+  let tmp_raw0, tmp_raw1 = Cstruct.create max_length, Cstruct.create max_length in
 
   let each_git_object hash (crc, offset) acc =
-    match Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
+    match Decoder.get old_pack hash z_tmp z_win (old_raw0, old_raw1) with
     | Ok ({ Decoder.Object.kind = `Tree; _ } as base) ->
+      if SHA1.neq (hash_of_object base) hash
+      then assert false;
+      if Crc32.neq crc (Decoder.Object.first_crc_exn base)
+      then assert false;
+
       Format.eprintf "unpack object: %a\n%!" SHA1.pp hash;
       save_names_of_tree hash base.Decoder.Object.raw;
       object_to_entry hash base :: acc
     | Ok base ->
+      if SHA1.neq (hash_of_object base) hash
+      then assert false;
+      if Crc32.neq crc  (Decoder.Object.first_crc_exn base)
+      then assert false;
+
       Format.eprintf "unpack object: %a\n%!" SHA1.pp hash;
       object_to_entry hash base :: acc
     | Error exn ->
@@ -459,7 +712,7 @@ let () =
   in
 
   match Delta.deltas entries
-      (fun hash -> match Decoder.get old_pack hash z_tmp z_win with
+      (fun hash -> match Decoder.get_with_allocation old_pack hash z_tmp z_win with
          | Ok base -> Some base.Decoder.Object.raw
          | Error exn ->
            Format.eprintf "Silent error with %a: %a\n%!" SHA1.pp hash Decoder.pp_error exn;
@@ -472,14 +725,14 @@ let () =
     let pack_out = Unix.openfile pack_filename [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o644 in
     let idx_out  = Unix.openfile idx_filename [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o644 in
 
-    let access hash = match Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
+    let access hash = match Decoder.get old_pack hash z_tmp z_win (old_raw0, old_raw1) with
       | Ok base -> Some base.Decoder.Object.raw
       | Error exn ->
         Format.eprintf "Silent error with %a: %a\n%!" SHA1.pp hash Decoder.pp_error exn;
         None
     in
 
-    make_pack pack_out idx_out old_pack access entries;
+    make_pack pack_out idx_out old_pack (tmp_raw0, tmp_raw1) access entries;
     Unix.close pack_out;
     Unix.close idx_out;
 
@@ -492,10 +745,13 @@ let () =
         (fun hash -> None)
     in
 
-    let max_length = IDXLazy.fold new_idx (fun hash _ acc -> match Decoder.needed new_pack hash z_tmp z_win with
-      | Ok length -> max length acc
-      | Error exn ->
-        Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
+    let max_length = IDXLazy.fold new_idx (fun hash _ acc ->
+        match Decoder.needed new_pack hash z_tmp z_win with
+        | Ok length ->
+          Format.eprintf "get length for %a: %d\n%!" SHA1.pp hash (max length acc);
+          max length acc
+        | Error exn ->
+          Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
         assert false) 0
     in
 
@@ -504,9 +760,14 @@ let () =
     let new_raw0, new_raw1 = Cstruct.create max_length, Cstruct.create max_length in
 
     let each_git_object hash (crc, offset) =
-      match Decoder.get' new_pack hash z_tmp z_win (new_raw0, new_raw1),
-            Decoder.get' old_pack hash z_tmp z_win (old_raw0, old_raw1) with
+      match Decoder.get new_pack hash z_tmp z_win (new_raw0, new_raw1),
+            Decoder.get old_pack hash z_tmp z_win (old_raw0, old_raw1) with
       | Ok new_base, Ok old_base ->
+        if SHA1.neq (hash_of_object new_base) hash
+        then assert false;
+        if Crc32.neq crc (Decoder.Object.first_crc_exn new_base)
+        then Format.eprintf "CRC-32 is %a but expected %a.\n%!" Crc32.pp (Decoder.Object.first_crc_exn new_base) Crc32.pp crc;
+
         Format.eprintf "unpack object: %a\n%!" SHA1.pp hash;
       | Error exn, _ | _, Error exn ->
         Format.eprintf "Invalid PACK: %a\n%!" Decoder.pp_error exn;
