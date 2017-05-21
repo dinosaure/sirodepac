@@ -192,7 +192,7 @@ struct
     for i = 0 to t.number_of_hashes - 1
     do
       let hash = Cstruct.sub t.map (t.hashes_offset + (i * Hash.length)) Hash.length in
-      let crc = Cstruct.BE.get_uint32 t.map (t.crcs_offset + (i * 4)) in
+      let crc = Crc32.of_int32 (Cstruct.BE.get_uint32 t.map (t.crcs_offset + (i * 4))) in
       let off = Cstruct.BE.get_uint32 t.map (t.values_offset + (i * 4)) in
 
       let off =
