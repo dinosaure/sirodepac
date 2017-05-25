@@ -202,7 +202,7 @@ struct
   and error = Error
   and window = unit
 
-  let pp_error fmt Error = Format.fprintf fmt "(Deflate_error #zlib)" (* lazy *)
+  let pp_error fmt Error = Format.fprintf fmt "(Inflate_error #zlib)" (* lazy *)
   let pp fmt _ = Format.fprintf fmt "#inflateState"
 
   let empty_in = Bytes.create 0
@@ -286,10 +286,10 @@ module Delta       = Pack.MakeDelta(SHA1)
 module PACKEncoder = Pack.MakePACKEncoder(SHA1)(ZDO)
 module Radix       = PACKEncoder.Radix
 
-module Commit = Minigit.Commit(SHA1)
-module Tree   = Minigit.Tree(SHA1)
-module Tag    = Minigit.Tag(SHA1)
-module Blob   = Minigit.Blob
+module Commit      = Minigit.Commit(SHA1)
+module Tree        = Minigit.Tree(SHA1)
+module Tag         = Minigit.Tag(SHA1)
+module Blob        = Minigit.Blob
 
 let hash_of_object base =
   let typename = match base.Decoder.Object.kind with
@@ -475,26 +475,6 @@ let rec filler ?(chunk = 0x8000) source pack s_tmp d_tmp t =
          let t' = apply raw s_tmp { t with state = state } hunk in
          filler source pack s_tmp d_tmp t'
        | None ->
-        (* XXX(dinosaure): About this code. We continue to control the
-                            memory fingerprint and prefer to re-use
-                            [old_raw0] and [old_raw1] created in the
-                            main function. We can change this code to
-                            be more efficient (about memory) and limit
-                            these buffer to [max_int32 + 0x10000].
-                            Indeed, by the format (see Rabin's
-                            fingerprint), we use only [max_int32 +
-                            0x10000]. So for a huge git object, we can
-                            limit the memory size to this - obviously,
-                            if one of a git object is upper than
-                            [max_int32 + 0x10000], it's certainly the
-                            end of the world.
-
-                            However, in this context, we ensure than
-                            the serializer don't use [access] (which
-                            one uses [old_raw0] and [old_raw1]). This
-                            note appear only because I don't change yet
-                            the code.
-        *)
          let getter state =
            match Decoder.P.kind state with
            | Decoder.P.Hunk { Decoder.P.HunkDecoder.reference = Decoder.P.HunkDecoder.Offset ofs; _ } ->
@@ -529,12 +509,8 @@ let make_pack ?(chunk = 0x8000) pack_out idx_out pack (raw0, raw1) access entrie
     | `Await t ->
       (match deserializer with
        | Some deserializer0 ->
-         Format.eprintf "deserializer0: %a\n%!" pp_deserializer deserializer0;
-
          (match filler source pack s_tmp (raw0, raw1) deserializer0 with
           | Ok ({ final = false; _ } as deserializer1, source) ->
-            Format.eprintf "`Await, `Flush: %a\n%!" pp_deserializer deserializer1;
-
             let used_in' = deserializer1.u_in + PACKEncoder.used_in t in
 
             let t, deserializer2 =
@@ -551,8 +527,6 @@ let make_pack ?(chunk = 0x8000) pack_out idx_out pack (raw0, raw1) access entrie
 
             loop_pack (Some deserializer2, source) t
           | Ok ({ final = true; _ } as deserializer1, source) ->
-            Format.eprintf "`Await, `End: %a\n%!" pp_deserializer deserializer1;
-
             let used_in' = deserializer1.u_in + PACKEncoder.used_in t in
 
             let t, deserializer2 =
@@ -577,7 +551,7 @@ let make_pack ?(chunk = 0x8000) pack_out idx_out pack (raw0, raw1) access entrie
              ; final = false
              ; i_off = 0
              ; i_pos = 0
-             ; i_len = Cstruct.len s_tmp
+             ; i_len = 0
              ; apply_idx = None
              ; u_in  = 0 }
            in
@@ -764,7 +738,7 @@ let () =
             Decoder.get old_pack hash z_tmp z_win (old_raw0, old_raw1) with
       | Ok new_base, Ok old_base ->
         if SHA1.neq (hash_of_object new_base) hash
-        then assert false;
+        then begin Format.eprintf "SHA1 does not correspond for: %a\n%!" SHA1.pp hash; assert false end;
         if Crc32.neq crc (Decoder.Object.first_crc_exn new_base)
         then Format.eprintf "CRC-32 is %a but expected %a.\n%!" Crc32.pp (Decoder.Object.first_crc_exn new_base) Crc32.pp crc;
 
