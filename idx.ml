@@ -75,7 +75,7 @@ struct
   let ( >>= ) = bind
   let ( *> ) u v = match u with Ok _ -> v | Error _ as e -> e
 
-  let make map =
+  let make ?(cache = 1024) map =
     check_header map
     *> check_version map
     *> number_of_hashes map
@@ -95,7 +95,7 @@ struct
          ; crcs_offset
          ; values_offset
          ; v64_offset
-         ; cache = Cache.create ~random:true 1024 }
+         ; cache = Cache.create ~random:true cache }
 
   exception Break
 
