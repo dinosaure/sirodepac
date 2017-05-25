@@ -147,9 +147,7 @@ struct
 
   (* XXX(dinosaure): hash from git to sort git objects.
                      in git, this hash is computed in an [int32],
-                     so we have a problem for the 32-bits architecture.
-
-                     TODO!
+                     but we can don't care .
    *)
   let hash name =
     let res = ref 0 in
@@ -161,7 +159,7 @@ struct
 
     !res
 
-  (* XXX(dinosaure): git hash only the basename. *)
+  (* XXX(dinosaure): git hashes only the basename. *)
   let hash name = hash (Filename.basename name)
 
   type kind =
@@ -294,7 +292,7 @@ end
 
 module MakeHunkEncoder (Hash : HASH) =
 struct
-  type error = ..
+  type error
 
   let pp_error fmt exn = () (* no error *)
 
@@ -302,12 +300,16 @@ struct
     { o_off         : int
     ; o_pos         : int
     ; o_len         : int
+    ; i_off         : int
+    ; i_pos         : int
+    ; i_len         : int
+    ; i_abs         : int
     ; write         : int (* XXX(dinosaure): difficult to write a Hunk bigger than [max_int].
                                              consider that it's safe to use [int] instead [int64]. *)
     ; reference     : reference
     ; source_length : int
     ; target_length : int
-    ; hunks         : Hunk.t array
+    ; hunks         : Rabin.e list
     ; state         : state }
   and reference =
     | Offset of int64
@@ -315,27 +317,30 @@ struct
   and k = Cstruct.t -> t -> res
   and state =
     | Header of k
-    | List of int
+    | List
     | Hunk of k
-    | Insert of k
+    | Insert of (Cstruct.t -> k)
     | Copy of k
+    | Consume
     | End
     | Exception of error
   and res =
     | Error of t * error
     | Cont  of t
     | Flush of t
+    | Wait  of t
     | Ok    of t
 
   let pp = Format.fprintf
 
   let pp_state fmt = function
     | Header k -> pp fmt "(Header #k)"
-    | List idx -> pp fmt "(List %d)" idx
+    | List -> pp fmt "List"
     | Hunk k -> pp fmt "(Hunk #k)"
     | Insert k -> pp fmt "(Insert #k)"
     | Copy k -> pp fmt "(Copy #k)"
     | End -> pp fmt "End"
+    | Consume -> pp fmt "Consume"
     | Exception exn -> pp fmt "(Error %a)" pp_error exn
 
   let pp_reference fmt = function
@@ -346,6 +351,10 @@ struct
     pp fmt "{ @[<hov>o_off = %d;@ \
                      o_pos = %d;@ \
                      o_len = %d;@ \
+                     i_off = %d;@ \
+                     i_pos = %d;@ \
+                     i_len = %d;@ \
+                     i_abs = %d;@ \
                      write = %d;@ \
                      reference = %a;@ \
                      source_length = %d;@ \
@@ -353,12 +362,14 @@ struct
                      hunks = @[<hov>%a@];@ \
                      state = @[<hov>%a@]@] }"
       t.o_off t.o_pos t.o_len
+      t.i_off t.i_pos t.i_len t.i_abs
       t.write pp_reference t.reference t.source_length t.target_length
-      (pp_list ~sep:(fun fmt () -> pp fmt ";@ ") Hunk.pp) (Array.to_list t.hunks)
+      (pp_list ~sep:(fun fmt () -> pp fmt ";@ ") Rabin.pp) t.hunks
       pp_state t.state
 
   let ok t = Ok { t with state = End }
   let flush t = Flush t
+  let await t = Wait t
   let error t exn = Error ({ t with state = Exception exn }, exn)
 
   let rec put_byte ~ctor byte k dst t =
@@ -390,27 +401,27 @@ struct
 
   module KInsert =
   struct
-    let rec put_raw raw k dst t =
-      if (t.o_len - t.o_pos) > Cstruct.len raw
+    let rec put_raw (off, len) k src dst t =
+      if (t.o_len - t.o_pos) > len
       then begin
-        Cstruct.blit raw 0 dst (t.o_off + t.o_pos) (Cstruct.len raw);
+        Cstruct.blit src off dst (t.o_off + t.o_pos) len;
 
-        k dst { t with o_pos = t.o_pos + Cstruct.len raw
-                     ; write = t.write + Cstruct.len raw }
+        k src dst { t with o_pos = t.o_pos + len
+                         ; write = t.write + len }
       end else if (t.o_len - t.o_pos) > 0
       then
-        let rec loop rest dst t =
+        let rec loop rest src dst t =
           let n = min (t.o_len - t.o_pos) rest in
-          Cstruct.blit raw (Cstruct.len raw - rest) dst (t.o_off + t.o_pos) n;
+          Cstruct.blit src (len - rest) dst (t.o_off + t.o_pos) n;
 
           if rest - n = 0
-          then k dst { t with o_pos = t.o_pos + n
-                            ; write = t.write + n }
+          then k src dst { t with o_pos = t.o_pos + n
+                                ; write = t.write + n }
           else Flush { t with o_pos = t.o_pos + n
                             ; write = t.write + n
                             ; state = Insert (loop (rest - n)) }
-        in loop (Cstruct.len raw) dst t
-      else Flush { t with state = Insert (put_raw raw k) }
+        in loop len src dst t
+      else Flush { t with state = Insert (put_raw (off, len) k) }
   end
 
   module KCopy =
@@ -439,10 +450,32 @@ struct
       if n = 0 then acc else aux (acc + 1) (n lsr 8)
     in if n = 0 then 1 else aux 0 n
 
-  let insert idx raw dst t =
-    KInsert.put_raw raw (fun dst t -> Cont { t with state = List (idx + 1) }) dst t
+  let rec insert res absolute_offset len src dst t =
+    Format.eprintf "insert> i_pos: %d, i_len: %d, i_off: %d, i_abs: %d\n%!"
+      t.i_pos t.i_len t.i_off t.i_abs;
+    Format.eprintf "insert> absolute_offset: %d, len: %d, res: %d\n%!"
+      absolute_offset len res;
 
-  let copy idx (off, (flag_o1, flag_o2, flag_o3)) (len, (flag_len1, flag_len2)) dst t =
+    if res = 0
+    then Cont { t with state = List }
+    else
+      (if absolute_offset + (len - res) >= t.i_abs
+       && absolute_offset + (len - res) < t.i_abs + t.i_len
+       then
+         let relative_offset = (absolute_offset - t.i_abs) - t.i_pos in
+         let n = min res (t.i_len - (relative_offset + t.i_pos + (len - res))) in
+
+         Format.eprintf "insert> we write %d bytes\n%!" n;
+         Format.eprintf "insert> off: %d + %d + %d + (%d - %d):%d %d\n%!"
+           t.i_off relative_offset t.i_pos len res (t.i_off + relative_offset + t.i_pos + (len - res)) n;
+
+         (KInsert.put_raw ((t.i_off + relative_offset + t.i_pos + (len - res)), n)
+          @@ fun src dst t -> Cont { t with state = Insert (insert (res - n) absolute_offset len)
+                                          ; i_pos = t.i_pos + n })
+           src dst t
+       else await { t with i_pos = t.i_len })
+
+  let copy (off, (flag_o1, flag_o2, flag_o3)) (len, (flag_len1, flag_len2)) dst t =
     let o0 = off land 0xFF in
     let o1 = (off land 0xFF00) lsr 8 in
     let o2 = (off land 0xFF0000) lsr 16 in
@@ -460,25 +493,33 @@ struct
      @@ KCopy.put_byte ~force:(l2 <> 0) l1
      @@ KCopy.put_byte l2
      @@ fun dst t ->
-        Cont { t with state = List (idx + 1) })
-    dst t
+        Cont { t with state = List })
+      dst t
 
-  let list idx dst t =
-    if Array.length t.hunks <> idx
-    then let hunk = Array.get t.hunks idx in
+  let consume t =
+    await { t with i_pos = t.i_len }
+
+  let list src dst t = match t.hunks with
+    | [] -> Cont { t with state = Consume }
+    | hunk :: r ->
       match hunk with
-      | Hunk.Insert raw ->
-        assert (Cstruct.len raw > 0 && Cstruct.len raw <= 0x7F);
+      | Rabin.I (off, len) ->
+        Format.eprintf "Write: Insert (%d, %d)\n%!" off len;
 
-        let byte = Cstruct.len raw land 0x7F in
+        assert (len > 0 && len <= 0x7F);
+
+        let byte = len land 0x7F in
           (* TODO: be sure the length of the raw is lower than 0x7F.
 
              XXX(dinosaure): this is the case because we called
                              [of_patience_diff] (which calls [split_to_127]).
            *)
 
-        KHunk.put_byte byte (insert idx raw) dst t
-      | Hunk.Copy (off, len) ->
+        KHunk.put_byte byte (fun dst t -> Cont { t with state = Insert (insert len off len)
+                                                      ; hunks = r }) dst t
+      | Rabin.C (off, len) ->
+        Format.eprintf "Write: Copy (%d, %d)\n%!" off len;
+
         let n_offset = how_many_bytes off in
         let n_length = if len = 0x10000 then 1 else how_many_bytes len in
 
@@ -498,23 +539,23 @@ struct
           | _ -> assert false
         in
 
-        KHunk.put_byte (0x80 lor (l lsl 4) lor o) (copy idx (off, fo)  (if len = 0x10000 then (0, (false, false)) else len, fl)) dst t
-      else ok t
+        KHunk.put_byte (0x80 lor (l lsl 4) lor o) (copy (off, fo)  (if len = 0x10000 then (0, (false, false)) else len, fl)) dst { t with hunks = r }
 
   let header dst t =
     (KHeader.length t.source_length
      @@ KHeader.length t.target_length
-     @@ fun dst t -> Cont { t with state = List 0 })
+     @@ fun dst t -> Cont { t with state = List })
     dst t
 
-  let eval dst t =
+  let eval src dst t =
     let eval0 t = match t.state with
       | Header k -> k dst t
-      | List idx -> list idx dst t
+      | List -> list src dst t
       | Hunk k -> k dst t
-      | Insert k -> k dst t
+      | Insert k -> k src dst t
       | Copy k -> k dst t
       | End -> ok t
+      | Consume -> consume t
       | Exception exn -> error t exn
     in
 
@@ -522,6 +563,7 @@ struct
       match eval0 t with
       | Cont t -> loop t
       | Flush t -> `Flush t
+      | Wait t -> `Await t
       | Error (t, exn) -> `Error (t, exn)
       | Ok t -> `End t
     in
@@ -532,11 +574,15 @@ struct
     { o_off = 0
     ; o_pos = 0
     ; o_len = 0
+    ; i_off = 0
+    ; i_pos = 0
+    ; i_len = 0
+    ; i_abs = 0
     ; write = 0
     ; reference
     ; source_length
     ; target_length
-    ; hunks = Array.of_list hunks
+    ; hunks = hunks
     ; state = Header header }
 
   let length src_len trg_len hunks =
@@ -553,6 +599,23 @@ struct
     { t with o_off = off
            ; o_len = len
            ; o_pos = 0 }
+
+  let refill off len t =
+    { t with i_off = off
+           ; i_pos = 0
+           ; i_len = len
+           ; i_abs = t.i_abs + t.i_len }
+    (* XXX(dinosaure): we consider than we [refill] continuously the input fixed
+                       size buffer.
+     *)
+
+  let finish t = { t with state = End
+                        ; i_pos = 0
+                        ; i_len = 0
+                        ; i_off = 0
+                        ; i_abs = 0 }
+
+  let used_in t = t.i_pos
 
   let used_out t = t.o_pos
 
@@ -1148,7 +1211,6 @@ struct
       dst t
 
     | KindHash, { Delta.delta = Delta.S { length; depth; hunks; src; src_length; src_hash; } } ->
-      let hunks      = Hunk.from_rabin hunks entry_raw in
       let trg_length = Cstruct.len entry_raw in
       let abs_off    = t.write in
 
@@ -1168,8 +1230,6 @@ struct
        let z = Deflate.default 4 in
        let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos) z in
 
-       Format.eprintf "CRC-32 after hash header: %a\n%!" Crc32.pp crc;
-
        Cont { t with state = WriteH { x = (entry, entry_delta, entry_raw)
                                     ; r = rest
                                     ; crc
@@ -1185,8 +1245,6 @@ struct
     | KindOffset, { Delta.delta = Delta.S { length; depth; hunks; src; src_length; src_hash; } } ->
       (match Radix.lookup t.radix src_hash with
        | Some (src_crc, src_off) ->
-
-         let hunks      = Hunk.from_rabin hunks entry_raw in
          let trg_length = Cstruct.len entry_raw in
          let abs_off    = t.write in
          let rel_off    = Int64.sub abs_off src_off in
@@ -1220,61 +1278,36 @@ struct
 
     | _, _ -> assert false
 
-  (* XXX(dinosaure): the last cases can't appear. in [iter] we check than when
-                     we have [KindOffset], the source entry is saved in the
-                     radix tree and [iter] catch all other cases and move the
-                     state to an error.
-   *)
-
   let writez src dst t ((entry, entry_raw) as x) r crc off used_in z =
-    (* XXX(dinosaure): to be clear, we follow the semantic provided by [Deflate]. That means, concretely,
-                       we follow [Decompress] or [Zlib]. For [writez], normally, we don't have any
-                       problem because we just want to compress an input stream.
-
-                       [writek] needs more explications.
-     *)
-
-    let rec loop used_in z = match Deflate.eval src dst z with
+    match Deflate.eval src dst z with
       | `Await z ->
         await { t with state = WriteZ { x; r; crc; off; ui = used_in; z; }
-                     ; i_pos = t.i_pos + Deflate.used_in z }
+                     ; i_pos = Deflate.used_in z }
       | `Flush z ->
         let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
-        Format.eprintf "Update CRC-32: %a\n%!" Crc32.pp crc;
 
         flush dst { t with state = WriteZ { x; r; crc; off; ui = (Deflate.used_in z); z; }
                          ; o_pos = t.o_pos + (Deflate.used_out z)
-                         ; i_pos = t.i_pos + (Deflate.used_in z)
+                         ; i_pos = Deflate.used_in z
                          ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
       | `End z ->
         let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
-        Format.eprintf "Update CRC-32: %a\n%!" Crc32.pp crc;
 
         Cont { t with state = Save { x = entry; r; crc; off; }
                     ; o_pos = t.o_pos + (Deflate.used_out z)
-                    ; i_pos = t.i_pos + (Deflate.used_in z)
+                    ; i_pos = Deflate.used_in z
                     ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
       | `Error (z, exn) -> error t (Deflate_error exn)
-    in
-
-    loop used_in z
 
   let writeh src dst t ((entry, entry_delta, entry_raw) as x) r crc off used_in h z =
     match Deflate.eval t.h_tmp dst z with
     | `Await z ->
-      (match HunkEncoder.eval t.h_tmp h with
+      (match HunkEncoder.eval src t.h_tmp h with
+       | `Await h ->
+         await { t with state = WriteH { x; r; crc; off; ui = used_in; z; h; }
+                      ; i_pos = HunkEncoder.used_in h }
        | `Flush h ->
          let used_in' = used_in + Deflate.used_in z in
-         (* Description of this state:
-            - in the [Decompress] case, [used_in] returns all the time the
-              number of bytes than [HunkEncoder] wrote
-            - in the [zlib] case, [used_in] can returns a number lowest than
-              what is provided by [HunkEncoder] - in other words, [zlib] can not
-              consume all bytes available in [t.h_tmp].
-
-            While [used_in] is not equal to [HunkEncoder.used_out], [t.h_tmp] is
-            considered as the same (physically) and it is immutable.
-          *)
 
          let z, h, ui =
            if used_in' = HunkEncoder.used_out h
@@ -1282,11 +1315,8 @@ struct
            else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
          in
 
-         (* We ensure than, in this context, [HunkEncoder.used_out] is constant.
-            Indeed, while were are not consumed all, [h] stay exactly the same.
-          *)
-
-         Cont { t with state = WriteH { x; r; crc; off; ui; h; z; } }
+         Cont { t with state = WriteH { x; r; crc; off; ui; h; z; }
+                     ; i_pos = HunkEncoder.used_in h }
        | `End h ->
          let used_in' = used_in + Deflate.used_in z in
 
@@ -1296,7 +1326,8 @@ struct
            else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
          in
 
-         Cont { t with state = WriteH { x; r; crc; off; ui; h; z; } }
+         Cont { t with state = WriteH { x; r; crc; off; ui; h; z; }
+                     ; i_pos = HunkEncoder.used_in h }
        | `Error (h, exn) -> error t (Hunk_error exn))
     | `Flush z ->
       let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
@@ -1304,12 +1335,16 @@ struct
 
       flush dst { t with state = WriteH { x; r; crc; off; ui = used_in'; h; z; }
                        ; o_pos = t.o_pos + (Deflate.used_out z)
+                       ; i_pos = HunkEncoder.used_in h
                        ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
     | `End z ->
       let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
 
       Cont { t with state = Save { x = entry; r; crc; off; }
                   ; o_pos = t.o_pos + (Deflate.used_out z)
+                  ; i_pos = 0
+                  ; i_len = 0
+                  ; i_off = 0
                   ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
     | `Error (z, exn) -> error t (Deflate_error exn)
 
@@ -1397,12 +1432,11 @@ struct
 
   let expect t =
     match t.state with
+    | WriteH { x = ({ Entry.hash_object; _ }, _, _); _ } -> hash_object
     | WriteZ { x = ({ Entry.hash_object; _ }, _); _ } -> hash_object
     | _ -> raise (Invalid_argument "PACKEncoder.expect")
 
   let refill offset len t =
-    Format.eprintf "refill: %d, %d\n%!" offset len;
-
     if (t.i_len - t.i_pos) = 0
     then
       match t.state with
@@ -1411,6 +1445,11 @@ struct
                ; i_len = len
                ; i_pos = 0
                ; state = WriteZ { x; r; crc; off; ui; z = Deflate.no_flush offset len z } }
+      | WriteH { x; r; crc; off; ui; z; h; } ->
+        { t with i_off = offset
+               ; i_len = len
+               ; i_pos = 0
+               ; state = WriteH { x; r; crc; off; ui; z; h = HunkEncoder.refill offset len h } }
       | _ -> { t with i_off = offset
                     ; i_len = len
                     ; i_pos = 0 }
@@ -1421,6 +1460,8 @@ struct
     then match t.state with
       | WriteZ { x; r; crc; off; ui; z; } ->
         { t with state = WriteZ { x; r; crc; off; ui; z = Deflate.finish z } }
+      | WriteH { x; r; crc; off; ui; z; h; } ->
+        { t with state = WriteH { x; r; crc; off; ui; z; h = HunkEncoder.finish h } }
       | _ -> t
     else raise (Invalid_argument (Format.sprintf "PACKEncoder.finish: you lost something (pos: %d, len: %d)" t.i_pos t.i_len))
 
@@ -1428,7 +1469,7 @@ struct
 
   let default h_tmp access objects =
     { o_off = 0
-    ; o_pos = 0 
+    ; o_pos = 0
     ; o_len = 0
     ; i_off = 0
     ; i_pos = 0
