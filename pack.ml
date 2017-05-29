@@ -147,7 +147,6 @@ struct
 
   (* XXX(dinosaure): hash from git to sort git objects.
                      in git, this hash is computed in an [int32],
-                     but we can don't care .
    *)
   let hash name =
     let res = ref 0 in
@@ -310,6 +309,7 @@ struct
     ; source_length : int
     ; target_length : int
     ; hunks         : Rabin.e list
+    ; safe_hunks    : Hunk.t list
     ; state         : state }
   and reference =
     | Offset of int64
@@ -412,7 +412,7 @@ struct
       then
         let rec loop rest src dst t =
           let n = min (t.o_len - t.o_pos) rest in
-          Cstruct.blit src (len - rest) dst (t.o_off + t.o_pos) n;
+          Cstruct.blit src (off + (len - rest)) dst (t.o_off + t.o_pos) n;
 
           if rest - n = 0
           then k src dst { t with o_pos = t.o_pos + n
@@ -450,28 +450,53 @@ struct
       if n = 0 then acc else aux (acc + 1) (n lsr 8)
     in if n = 0 then 1 else aux 0 n
 
-  let rec insert res absolute_offset len src dst t =
-    Format.eprintf "insert> i_pos: %d, i_len: %d, i_off: %d, i_abs: %d\n%!"
-      t.i_pos t.i_len t.i_off t.i_abs;
-    Format.eprintf "insert> absolute_offset: %d, len: %d, res: %d\n%!"
-      absolute_offset len res;
+  let tmp = Buffer.create 0x7F
 
+  let rec insert safe_raw res absolute_offset len src dst t =
     if res = 0
-    then Cont { t with state = List }
-    else
+    then begin
+      Format.eprintf "Insert produced: %a\n%!" pp_cstruct (Cstruct.of_string (Buffer.contents tmp));
+      Buffer.clear tmp;
+      Cont { t with state = List }
+    end else
+      (* XXX(dinosaure): We ensure than the [absolute_offset] requested is
+                         available inside [src]. So, [t.i_abs] keep how many
+                         bytes we computed before __continuously__ and
+                         correspond to the current absolute offset of [src].
+
+                         We just need to check if what we need to write is
+                         available inside the interval [t.i_abs (t.i_abs +
+                         t.i_len)[.
+       *)
       (if absolute_offset + (len - res) >= t.i_abs
        && absolute_offset + (len - res) < t.i_abs + t.i_len
        then
-         let relative_offset = (absolute_offset - t.i_abs) - t.i_pos in
-         let n = min res (t.i_len - (relative_offset + t.i_pos + (len - res))) in
+         let relative_offset = (absolute_offset - t.i_abs) in
+         let n = min res (t.i_len - (relative_offset + (len - res))) in
 
-         Format.eprintf "insert> we write %d bytes\n%!" n;
-         Format.eprintf "insert> off: %d + %d + %d + (%d - %d):%d %d\n%!"
-           t.i_off relative_offset t.i_pos len res (t.i_off + relative_offset + t.i_pos + (len - res)) n;
+         (* XXX(dinosaure): then, we have a [relative_offset] correspond to the
+                            [absolute_offset] but inside the current [src] and
+                            the interval [t.i_off (t.i_off + t.i_len)[.
+         *)
 
-         (KInsert.put_raw ((t.i_off + relative_offset + t.i_pos + (len - res)), n)
-          @@ fun src dst t -> Cont { t with state = Insert (insert (res - n) absolute_offset len)
-                                          ; i_pos = t.i_pos + n })
+         if Cstruct.compare (Cstruct.sub safe_raw (len - res) n) (Cstruct.sub src (t.i_off + relative_offset + (len - res)) n) <> 0
+         then begin
+           Format.eprintf "We expect to write: %a.\n%!" pp_cstruct (Cstruct.sub safe_raw (len - res) n);
+           Format.eprintf "But we write: %a.\n%!" pp_cstruct (Cstruct.sub src (t.i_off + relative_offset + (len - res)) n);
+         end;
+
+         Buffer.add_string tmp (Cstruct.to_string (Cstruct.sub src (t.i_off + relative_offset + (len - res)) n));
+
+         (KInsert.put_raw ((t.i_off + relative_offset + (len - res)), n)
+          @@ fun src dst t -> Cont { t with state = Insert (insert safe_raw (res - n) absolute_offset len)
+                                          (* XXX(dinosaure): we need to keep how
+                                                             many bytes we rode
+                                                             because,
+                                                             externally, we
+                                                             could use
+                                                             [used_in].
+                                           *)
+                                          ; i_pos = relative_offset + (len - res) + n })
            src dst t
        else await { t with i_pos = t.i_len })
 
@@ -499,47 +524,57 @@ struct
   let consume t =
     await { t with i_pos = t.i_len }
 
-  let list src dst t = match t.hunks with
-    | [] -> Cont { t with state = Consume }
-    | hunk :: r ->
-      match hunk with
-      | Rabin.I (off, len) ->
-        Format.eprintf "Write: Insert (%d, %d)\n%!" off len;
+  let list src dst t = match t.hunks, t.safe_hunks with
+    | [], [] -> Cont { t with state = Consume }
+    | hunk :: r, safe_hunk :: safe_r ->
+      (match hunk, safe_hunk with
+       | Rabin.I (off, len), Hunk.Insert safe_raw ->
+         Format.eprintf "Write: (Insert (%d, %d)) (Insert %a)\n%!" off len pp_cstruct safe_raw;
 
-        assert (len > 0 && len <= 0x7F);
+         assert (len > 0 && len <= 0x7F);
+         (* XXX(dinosaure): the [xdiff] algorithm ensures than an [Rabin.I] can't be upper than [0x7F]. *)
 
-        let byte = len land 0x7F in
-          (* TODO: be sure the length of the raw is lower than 0x7F.
+         let byte = len land 0x7F in
 
-             XXX(dinosaure): this is the case because we called
-                             [of_patience_diff] (which calls [split_to_127]).
-           *)
+         KHunk.put_byte byte (fun dst t -> Cont { t with state = Insert (insert safe_raw len off len)
+                                                       ; hunks = r
+                                                       ; safe_hunks = safe_r }) dst t
+       | Rabin.C (off, len), Hunk.Copy (safe_off, safe_len) ->
+         Format.eprintf "Write: Copy (%d, %d)\n%!" off len;
 
-        KHunk.put_byte byte (fun dst t -> Cont { t with state = Insert (insert len off len)
-                                                      ; hunks = r }) dst t
-      | Rabin.C (off, len) ->
-        Format.eprintf "Write: Copy (%d, %d)\n%!" off len;
+         assert (safe_off = off && safe_len = len);
 
-        let n_offset = how_many_bytes off in
-        let n_length = if len = 0x10000 then 1 else how_many_bytes len in
+         let n_offset = how_many_bytes off in
+         let n_length = if len = 0x10000 then 1 else how_many_bytes len in
 
-        let o, fo = match n_offset with
-          | 1 -> 0b0001, (false, false, false)
-          | 2 -> 0b0011, (true, false, false)
-          | 3 -> 0b0111, (true, true, false)
-          | 4 -> 0b1111, (true, true, true)
-          | _ ->
-            assert false
-        in
+         let o, fo = match n_offset with
+           | 1 -> 0b0001, (false, false, false)
+           | 2 -> 0b0011, (true, false, false)
+           | 3 -> 0b0111, (true, true, false)
+           | 4 -> 0b1111, (true, true, true)
+           | _ ->
+             assert false
+         in
 
-        let l, fl = match n_length with
-          | 1 -> 0b001, (false, false)
-          | 2 -> 0b011, (true, false)
-          | 3 -> 0b111, (true, true)
-          | _ -> assert false
-        in
+         let l, fl = match n_length with
+           | 1 -> 0b001, (false, false)
+           | 2 -> 0b011, (true, false)
+           | 3 -> 0b111, (true, true)
+           | _ -> assert false
+         in
 
-        KHunk.put_byte (0x80 lor (l lsl 4) lor o) (copy (off, fo)  (if len = 0x10000 then (0, (false, false)) else len, fl)) dst { t with hunks = r }
+         KHunk.put_byte (0x80 lor (l lsl 4) lor o) (copy (off, fo)  (if len = 0x10000 then (0, (false, false)) else len, fl)) dst
+           { t with hunks = r
+                  ; safe_hunks = safe_r }
+       | Rabin.C (off, len), Hunk.Insert raw ->
+         Format.eprintf "We have (C (%d, %d)) and (Insert %a)\n%!"
+           off len pp_cstruct raw;
+         assert false
+       | Rabin.I (off, len), Hunk.Copy (off', len') ->
+         Format.eprintf "We have (I (%d, %d)) and (Copy (%d, %d))\n%!"
+           off len off' len';
+         assert false)
+    | _ -> assert false
 
   let header dst t =
     (KHeader.length t.source_length
@@ -570,7 +605,7 @@ struct
 
     loop t
 
-  let default reference source_length target_length hunks =
+  let default reference source_length target_length hunks safe_hunks =
     { o_off = 0
     ; o_pos = 0
     ; o_len = 0
@@ -583,6 +618,7 @@ struct
     ; source_length
     ; target_length
     ; hunks = hunks
+    ; safe_hunks
     ; state = Header header }
 
   let length src_len trg_len hunks =
@@ -718,7 +754,7 @@ struct
       | Some a, None -> Some a (* XXX(dinosaure): [a] is considered as the best. *)
       | None, Some (a, hunks_a, len_a) ->
         if not (only_insert hunks_a) then Some (a, hunks_a, len_a) else None
-        (* Rabin's fingerprint can produce only [Insert] hunks and we avoid that. *)
+        (* XXX(dinosaure): Rabin's fingerprint can produce only [Insert] hunks and we avoid that. *)
       | Some (a, hunks_a, len_a), Some (b, hunks_b, len_b) ->
         if len_a < len_b
         then Some (a, hunks_a, len_a)
@@ -798,7 +834,7 @@ struct
 
   exception Uncaught_hash of Hash.t
 
-  module MemoryCache = Lru.F.Make(Entry)(WeightByMemory)
+  module MemoryCache  = Lru.F.Make(Entry)(WeightByMemory)
   module ElementCache = Lru.F.Make(Entry)(WeightByElement)
 
   let deltas ?(memory = false) entries get tag window max =
@@ -830,9 +866,9 @@ struct
       let window = Window.empty window in
       let normal = Hashtbl.create (List.length tries) in
 
-      (* XXX(dinosaure): [normalize] apply the diff to all [untries] entries.
-                         however, we need to apply to [untries] a topological sort to
-                         ensure than when we try to apply a diff in one
+      (* XXX(dinosaure): [normalize] applies the diff to all [untries] entries.
+                         however, we need to apply to [untries] a topological
+                         sort to ensure than when we try to apply a diff in one
                          /untries/ entry, we already computed the source
                          (available in [tries] or [untries]). It's why we keep
                          an hash-table and update this hash-table for each diff.
@@ -887,8 +923,21 @@ struct
             match delta window window_pack max entry raw base with
             | None -> window, (entry, base) :: acc
             | Some (src_entry, hunks, length) ->
+
               match Window.find ~promote:true src_entry window with
               | Some ((src, src_raw, rabin), window) ->
+                let rec print = function
+                  | [] -> ()
+                  | Rabin.I (off, len) :: r ->
+                    Format.eprintf "> (Insert (%d, %d)) (Insert %a)\n%!" off len pp_cstruct (Cstruct.sub raw off len);
+                    print r
+                  | Rabin.C (off, len) :: r ->
+                    Format.eprintf "> (Copy (%d, %d))\n%!" off len;
+                    print r
+                in
+
+                let () = print hunks in
+
                 let depth  = depth src + 1 in
 
                 base.delta <- S { length
@@ -1192,7 +1241,7 @@ struct
     | KindRaw, { Delta.delta = Delta.Z } ->
       let abs_off = t.write in
 
-      Format.eprintf "%a: Raw\n%!" Hash.pp entry.Entry.hash_object;
+      Format.eprintf "%a (start at %Ld): Raw\n%!" Hash.pp entry.Entry.hash_object t.write;
 
       (KWriteK.header (Kind.to_bin entry.Entry.kind) entry.Entry.length Crc32.default
        @@ fun crc dst t ->
@@ -1216,12 +1265,12 @@ struct
 
       (* XXX(dinosaure): we can obtain the source hash by [entry.delta]. TODO! *)
 
-      Format.eprintf "%a: Hash from %a (source length: %Ld, target length: %d)\n%!"
-        Hash.pp entry.Entry.hash_object Hash.pp src_hash src_length trg_length;
+      Format.eprintf "%a (start at: %Ld): Hash from %a (source length: %Ld, target length: %d)\n%!"
+        Hash.pp entry.Entry.hash_object t.write Hash.pp src_hash src_length trg_length;
 
       let h =
         HunkEncoder.flush 0 (Cstruct.len t.h_tmp)
-        @@ HunkEncoder.default (HunkEncoder.Hash src_hash) (Int64.to_int src_length) trg_length hunks
+        @@ HunkEncoder.default (HunkEncoder.Hash src_hash) (Int64.to_int src_length) trg_length hunks (Hunk.from_rabin hunks entry_raw)
       in
 
       (KWriteK.header 0b111 (Int64.of_int length) Crc32.default
@@ -1249,12 +1298,12 @@ struct
          let abs_off    = t.write in
          let rel_off    = Int64.sub abs_off src_off in
 
-         Format.eprintf "%a: Offset from %Ld:%Ld (source length: %Ld, target length: %d)\n%!"
-           Hash.pp entry.Entry.hash_object rel_off abs_off src_length trg_length;
+         Format.eprintf "%a (start at: %Ld): Offset from %Ld:%Ld (source length: %Ld, target length: %d)\n%!"
+           Hash.pp entry.Entry.hash_object t.write rel_off abs_off src_length trg_length;
 
          let h =
            HunkEncoder.flush 0 (Cstruct.len t.h_tmp)
-           @@ HunkEncoder.default (HunkEncoder.Offset rel_off) (Int64.to_int src_length) trg_length hunks
+           @@ HunkEncoder.default (HunkEncoder.Offset rel_off) (Int64.to_int src_length) trg_length hunks (Hunk.from_rabin hunks entry_raw)
          in
 
          (KWriteK.header 0b110 (Int64.of_int length) Crc32.default
@@ -1304,15 +1353,17 @@ struct
     | `Await z ->
       (match HunkEncoder.eval src t.h_tmp h with
        | `Await h ->
-         await { t with state = WriteH { x; r; crc; off; ui = used_in; z; h; }
+         await { t with state = WriteH { x; r; crc; off; ui = 0; z; h; }
                       ; i_pos = HunkEncoder.used_in h }
        | `Flush h ->
          let used_in' = used_in + Deflate.used_in z in
 
          let z, h, ui =
            if used_in' = HunkEncoder.used_out h
-           then Deflate.no_flush 0 0 z, HunkEncoder.flush 0 (Cstruct.len t.h_tmp) h, 0
-           else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
+           then begin
+             Format.eprintf "We deflate: @[<hov>%a@]\n%!" Cstruct.hexdump_pp (Cstruct.sub t.h_tmp 0 (HunkEncoder.used_out h));
+             Deflate.no_flush 0 0 z, HunkEncoder.flush 0 (Cstruct.len t.h_tmp) h, 0
+           end else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
          in
 
          Cont { t with state = WriteH { x; r; crc; off; ui; h; z; }
@@ -1322,8 +1373,10 @@ struct
 
          let z, h, ui =
            if used_in' = HunkEncoder.used_out h
-           then Deflate.finish z, h, used_in'
-           else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
+           then begin
+             Format.eprintf "We deflate: @[<hov>%a@]\n%!" Cstruct.hexdump_pp (Cstruct.sub t.h_tmp 0 (HunkEncoder.used_out h));
+             Deflate.finish z, h, used_in'
+           end else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
          in
 
          Cont { t with state = WriteH { x; r; crc; off; ui; h; z; }
@@ -1334,8 +1387,8 @@ struct
       let used_in' = used_in + Deflate.used_in z in
 
       flush dst { t with state = WriteH { x; r; crc; off; ui = used_in'; h; z; }
-                       ; o_pos = t.o_pos + (Deflate.used_out z)
                        ; i_pos = HunkEncoder.used_in h
+                       ; o_pos = t.o_pos + (Deflate.used_out z)
                        ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
     | `End z ->
       let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
@@ -1434,7 +1487,21 @@ struct
     match t.state with
     | WriteH { x = ({ Entry.hash_object; _ }, _, _); _ } -> hash_object
     | WriteZ { x = ({ Entry.hash_object; _ }, _); _ } -> hash_object
-    | _ -> raise (Invalid_argument "PACKEncoder.expect")
+    | _ -> raise (Invalid_argument "PACKEncoder.expecti: bad state")
+
+  let header_of_expected t =
+    match t.state with
+    | WriteH { x = (entry, _, _); _ }
+    | WriteZ { x = (entry, _); _ } ->
+      let typename = match entry.Entry.kind with
+        | Kind.Commit -> "commit"
+        | Kind.Tree -> "tree"
+        | Kind.Blob -> "blob"
+        | Kind.Tag -> "tag"
+      in
+
+      Format.sprintf "%s %Ld\000" typename entry.Entry.length
+    | _ -> raise (Invalid_argument "PACKEncoder.header_of_expected: bad state")
 
   let refill offset len t =
     if (t.i_len - t.i_pos) = 0
@@ -1465,7 +1532,10 @@ struct
       | _ -> t
     else raise (Invalid_argument (Format.sprintf "PACKEncoder.finish: you lost something (pos: %d, len: %d)" t.i_pos t.i_len))
 
-  let used_in t = t.i_pos
+  let used_in t = match t.state with
+    | WriteZ { z; _ } -> Deflate.used_in z
+    | WriteH { h; _ } -> HunkEncoder.used_in h
+    | _ -> raise (Invalid_argument "PACKEncoder.used_in: bad state")
 
   let default h_tmp access objects =
     { o_off = 0

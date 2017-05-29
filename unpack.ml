@@ -204,45 +204,52 @@ struct
     let get_byte = get_byte ~ctor:(fun k -> List k)
   end
 
-  let rec copy opcode =
+  let rec copy opcode src t =
     let rec get_byte flag k src t =
       if not flag
       then k 0 src t
       else if (t.i_len - t.i_pos) > 0
-          then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
-                k byte src
-                  { t with i_pos = t.i_pos + 1
-                         ; read = t.read + 1 }
-          else await { t with state = Is_copy (fun src t -> (get_byte[@tailcall]) flag k src t) }
+      then let byte = Cstruct.get_uint8 src (t.i_off + t.i_pos) in
+        k byte src
+          { t with i_pos = t.i_pos + 1
+                 ; read = t.read + 1 }
+      else await { t with state = Is_copy (fun src t -> (get_byte[@tailcall]) flag k src t) }
     in
 
-    get_byte ((opcode lsr 0) land 1 <> 0)
-    @@ fun o0 -> get_byte ((opcode lsr 1) land 1 <> 0)
-    @@ fun o1 -> get_byte ((opcode lsr 2) land 1 <> 0)
-    @@ fun o2 -> get_byte ((opcode lsr 3) land 1 <> 0)
-    @@ fun o3 -> get_byte ((opcode lsr 4) land 1 <> 0)
-    @@ fun l0 -> get_byte ((opcode lsr 5) land 1 <> 0)
-    @@ fun l1 -> get_byte ((opcode lsr 6) land 1 <> 0)
-    @@ fun l2 src t ->
-      (* TODO: may be a bug with little-endian architecture. *)
-      let dst = o0 lor (o1 lsl 8) lor (o2 lsl 16) lor (o3 lsl 24) in
-      let len =
-        let len0 = l0 lor (l1 lsl 8) lor (l2 lsl 16) in
-        if len0 = 0 then 0x10000 else len0
+    (get_byte (opcode land 0x01 <> 0)
+     @@ fun o0 -> get_byte (opcode land 0x02 <> 0)
+     @@ fun o1 -> get_byte (opcode land 0x04 <> 0)
+     @@ fun o2 -> get_byte (opcode land 0x08 <> 0)
+     @@ fun o3 -> get_byte (opcode land 0x10 <> 0)
+     @@ fun l0 -> get_byte (opcode land 0x20 <> 0)
+     @@ fun l1 -> get_byte (opcode land 0x40 <> 0)
+     @@ fun l2 src t ->
 
-        (* XXX(dinosaure): in git, we can encode the length [0x10000]. But this
-                           value can't be encoded in 3 bytes, so in this format,
-                           we consider than when [length = 0], the really length
-                           is [0x10000]. It's why we decoded the [Copy] hunk in
-                           this way.
-         *)
-      in
+       let dst = ref 0 in
+       let len = ref 0 in
 
-      if dst + len > t._source_length
-      then error t (Wrong_copy_hunk (dst, len, t._source_length))
-      else
-        Cont { t with _hunks = (Copy (dst, len)) :: t._hunks
-                    ; state = Stop }
+       if opcode land 0x01 <> 0 then dst := o0;
+       if opcode land 0x02 <> 0 then dst := !dst lor (o1 lsl 8);
+       if opcode land 0x04 <> 0 then dst := !dst lor (o2 lsl 16);
+       if opcode land 0x08 <> 0 then dst := !dst lor (o3 lsl 24);
+
+       if opcode land 0x10 <> 0 then len := l0;
+       if opcode land 0x20 <> 0 then len := !len lor (l1 lsl 8);
+       if opcode land 0x40 <> 0 then len := !len lor (l2 lsl 16);
+
+       let dst = !dst in
+       let len = !len in
+
+       let len = if len = 0 then 0x10000 else len in
+
+       if dst + len > t._source_length
+       then begin
+         error t (Wrong_copy_hunk (dst, len, t._source_length))
+         (* Cont { t with state = Stop } (* avoid error *) *)
+       end else
+         Cont { t with _hunks = (Copy (dst, len)) :: t._hunks
+                     ; state = Stop })
+    src t
 
   let stop src t = Cont t
 
@@ -257,7 +264,9 @@ struct
               | _ ->
                 Cont { t with state = Is_copy (copy opcode) })
           src t
-    else ok { t with _hunks = List.rev t._hunks }
+    else begin
+      ok { t with _hunks = List.rev t._hunks }
+    end
 
   let cstruct_copy cs =
     let ln = Cstruct.len cs in
@@ -273,12 +282,12 @@ struct
     Cstruct.blit src (t.i_off + t.i_pos) buffer off n;
 
     if rest - n = 0
-    then
+    then begin
       Cont ({ t with _hunks = (Insert (cstruct_copy buffer)) :: t._hunks
                       ; i_pos = t.i_pos + n
                       ; read = t.read + n
                       ; state = Stop })
-    else await { t with i_pos = t.i_pos + n
+    end else await { t with i_pos = t.i_pos + n
                       ; read = t.read + n
                       ; state = Is_insert (buffer, off + n, rest - n) }
 
@@ -661,6 +670,30 @@ struct
   let stop_hunks src t hs =
     Cont { t with state = StopHunks hs }
 
+  (* XXX(dinosaure): Need an explanation. We must compute firstly the evaluation
+                     of the [HunkDecoder] before [Inflate] to be sure we wait
+                     something (and ask only when it's needed [Inflate]).
+
+                     Then, we need to be ensure than [HunkDecoder] consumed all
+                     bytes provided by the input. That means, when [HunkDecoder]
+                     returns [`Await], we ensure than [t.o_z] is totally free.
+
+                     Then, we can safely [refill] [HunkDecoder] and, at the same
+                     time, [flush] [t.o_z] because we ensure than to the next
+                     call, [Inflate.eval] appear (and write something inside
+                     [t.o_z]) only when [HunkDecoder] consumed all bytes
+                     available.
+
+                     So, when you change this code or [HunkDecoder], we need to
+                     keep these assertions. Otherwise, it's end of the world.
+
+                     - When [HunkDecoder] returns `Await, we ensure than it
+                       consumed all bytes available (so, you are free to do what
+                       you want with [t.o_z])
+                     - We [Inflate] only when it's needed (so, when
+                       [HunkDecoder] returns [`Await])
+
+   *)
   let hunks src t offset length consumed crc z h =
     match HunkDecoder.eval t.o_z h with
     | `Await h ->
@@ -673,12 +706,19 @@ struct
                       ; i_pos = t.i_pos + (Inflate.used_in z)
                       ; read  = Int64.add t.read (Int64.of_int (Inflate.used_in z)) }
        | `Flush z ->
-         let h = HunkDecoder.refill 0 (Inflate.used_in z) h in
+         let h = HunkDecoder.refill 0 (Inflate.used_out z) h in
          let z = Inflate.flush 0 (Cstruct.len t.o_z) z in
 
          Cont { t with state = Hunks { offset; length; consumed; crc; z; h; } }
        | `End z ->
-         (* XXX(dinosaure): may be we have some input. *)
+         (* XXX(dinosaure): In [zlib] and [decompress], it could be happen to
+                            return [`End] and consume a part of the input
+                            [t.o_z].
+
+                            So, we compute the CRC-32 checksum and update
+                            [consumed].
+          *)
+         let consumed = consumed + Inflate.used_in z in
          let crc = Crc32.digest ~off:(t.i_off + t.i_pos) ~len:(Inflate.used_in z) crc src in
          let h = HunkDecoder.refill 0 (Inflate.used_out z) h in
 
@@ -824,6 +864,7 @@ struct
                                         ; z } }
       else
         let crc = Crc32.digest ~off:(t.i_off + t.i_pos) ~len:(Inflate.used_in z) crc src in
+        let consumed = consumed + Inflate.used_in z in
 
         Cont { t with state = Next { length
                                    ; length' = Inflate.write z
@@ -964,7 +1005,8 @@ struct
       t.o_z, Inflate.used_out z
     | _ -> raise (Invalid_argument "PACKDecoder.output: bad state")
 
-  let next_object t = match t.state with
+  let next_object t =
+    match t.state with
     | Next _ when t.process = `All ->
       if Int32.pred t.counter = 0l
       then { t with state = Checksum checksum
@@ -1034,8 +1076,10 @@ struct
   let rec eval src t =
     let rec loop t =
       match eval0 src t with
-      | Cont ({ state = Next _ } as t) -> `Object t
-      | Cont ({ state = StopHunks hs } as t) -> `Hunk (t, HunkDecoder.current hs.h)
+      | Cont ({ state = Next _ } as t) ->
+        `Object t
+      | Cont ({ state = StopHunks hs } as t) ->
+        `Hunk (t, HunkDecoder.current hs.h)
       | Cont t -> loop t
       | Wait t -> `Await t
       | Flush t -> `Flush t
@@ -1410,13 +1454,11 @@ struct
           | None -> aux absolute_offset
           | Some hash -> match t.cache hash with
             | Some base ->
-              Format.eprintf "cache used for (from offset): %a.\n%!" Hash.pp hash;
               Ok (Object (base.Object.kind, Object.to_partial base, base.Object.raw))
             | None -> aux absolute_offset)
     | H.Hash hash ->
       match t.cache hash with
       | Some base ->
-        Format.eprintf "cache used for (from hash): %a.\n%!" Hash.pp hash;
         Ok (Object (base.Object.kind, Object.to_partial base, base.Object.raw))
       | None -> match t.idx hash with
         | Some (crc, absolute_offset) ->

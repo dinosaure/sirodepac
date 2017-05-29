@@ -1,5 +1,14 @@
 let () = Printexc.record_backtrace true
 
+let pp_cstruct fmt cs =
+  Format.fprintf fmt "\"";
+  for i = 0 to Cstruct.len cs - 1
+  do if Cstruct.get_uint8 cs i > 32 && Cstruct.get_uint8 cs i < 127
+    then Format.fprintf fmt "%c" (Cstruct.get_char cs i)
+    else Format.fprintf fmt "."
+  done;
+  Format.fprintf fmt "\""
+
 module Result =
 struct
   let ( >>| ) x f =
@@ -338,6 +347,7 @@ let h_tmp = Cstruct.create 0x8000
 let z_win = Decompress.Window.create ~proof:Decompress.B.proof_bigstring
 let z_win0 = Decompress.Window.create ~proof:Decompress.B.proof_bigstring
 let p_nam = Hashtbl.create 100
+let s_tmp = Cstruct.create 0x8000
 
 let save_names_of_tree hash raw =
   match Tree.Decoder.to_result raw with
@@ -375,8 +385,8 @@ type deserializer =
   ; i_off           : int
   ; i_pos           : int
   ; i_len           : int
-  ; apply_idx       : int option
-  ; u_in            : int }
+  ; o_pos           : int option
+  ; used_in         : int }
 
 let pp_deserializer fmt t =
   let pp_option pp_data fmt = function
@@ -392,61 +402,78 @@ let pp_deserializer fmt t =
                                i_off = %d;@ \
                                i_pos = %d;@ \
                                i_len = %d;@ \
-                               apply_idx = @[<hov>%a@];@ \
-                               u_in = %d;@] }"
+                               o_pos = @[<hov>%a@];@ \
+                               used_in = %d;@] }"
     Unpack.Window.pp t.window
-    t.consume Decoder.P.pp t.state SHA1.pp t.hash t.final t.i_off t.i_pos t.i_len (pp_option Format.pp_print_int) t.apply_idx t.u_in
+    t.consume Decoder.P.pp t.state SHA1.pp t.hash t.final t.i_off t.i_pos t.i_len (pp_option Format.pp_print_int) t.o_pos t.used_in
 
-let s_tmp = Cstruct.create 0x8000
-
-let apply src trg state = function
+let apply src trg t = function
   | Decoder.P.HunkDecoder.Insert i ->
-    (match state.apply_idx with
-    | Some idx ->
-      let n = min (state.i_len - state.i_pos) (Cstruct.len i - idx) in
-      Cstruct.blit i idx trg state.i_pos n;
-      { state with i_pos = state.i_pos + n
-                  ; apply_idx = if idx + n = Cstruct.len i then None else Some (idx + n)
-                  ; state = if idx + n = Cstruct.len i then Decoder.P.continue state.state else state.state }
-    | None ->
-      let n = min (state.i_len - state.i_pos) (Cstruct.len i) in
-      Cstruct.blit i 0 trg state.i_pos n;
-      { state with i_pos = state.i_pos + n
-                  ; apply_idx = if n = Cstruct.len i then None else Some n
-                  ; state = if n = Cstruct.len i then Decoder.P.continue state.state else state.state })
+    (match t.o_pos with
+     | Some o_pos ->
+       let n = min (t.i_len - t.i_pos) (Cstruct.len i - o_pos) in
+       Cstruct.blit i o_pos trg t.i_pos n;
+       { t with i_pos = t.i_pos + n
+              ; o_pos = if o_pos + n = Cstruct.len i then None else Some (o_pos + n)
+              ; state = if o_pos + n = Cstruct.len i then Decoder.P.continue t.state else t.state }
+     | None ->
+       let n = min (t.i_len - t.i_pos) (Cstruct.len i) in
+       Cstruct.blit i 0 trg t.i_pos n;
+       { t with i_pos = t.i_pos + n
+              ; o_pos = if n = Cstruct.len i then None else Some n
+              ; state = if n = Cstruct.len i then Decoder.P.continue t.state else t.state })
   | Decoder.P.HunkDecoder.Copy (off, len) ->
-    (match state.apply_idx with
-    | Some idx ->
-      let n = min (state.i_len - state.i_pos) (len - idx) in
-      Cstruct.blit src (off + idx) trg state.i_pos n;
-      { state with i_pos = state.i_pos + n
-                  ; apply_idx = if idx + n = len then None else Some (idx + n)
-                  ; state = if idx + n = len then Decoder.P.continue state.state else state.state }
-    | None ->
-      let n = min (state.i_len - state.i_pos) len in
-      Cstruct.blit src off trg state.i_pos n;
-      { state with i_pos = state.i_pos + n
-                  ; apply_idx = if n = len then None else Some n
-                  ; state = if n = len then Decoder.P.continue state.state else state.state })
+    (match t.o_pos with
+     | Some o_pos ->
+       let n = min (t.i_len - t.i_pos) (len - o_pos) in
+       Cstruct.blit src (off + o_pos) trg t.i_pos n;
+       { t with i_pos = t.i_pos + n
+              ; o_pos = if o_pos + n = len then None else Some (o_pos + n)
+              ; state = if o_pos + n = len then Decoder.P.continue t.state else t.state }
+     | None ->
+       let n = min (t.i_len - t.i_pos) len in
+       Cstruct.blit src off trg t.i_pos n;
+       { t with i_pos = t.i_pos + n
+              ; o_pos = if n = len then None else Some n
+              ; state = if n = len then Decoder.P.continue t.state else t.state })
 
-let fill trg deserializer =
-  let o, n = Decoder.P.output deserializer.state in
+let fill trg t =
+  let o, n = Decoder.P.output t.state in
 
-  match deserializer.apply_idx with
-  | Some idx ->
-    let n' = min (n - idx) (deserializer.i_len - deserializer.i_pos) in
-    Cstruct.blit o idx trg deserializer.i_pos n';
-    { deserializer with i_pos = deserializer.i_pos + n'
-                      ; apply_idx = if idx + n' = n then None else Some (idx + n')
-                      ; state = if idx + n' = n then Decoder.P.flush 0 (Cstruct.len o) deserializer.state else deserializer.state }
+  match t.o_pos with
+  | Some o_pos ->
+    let n' = min (n - o_pos) (t.i_len - t.i_pos) in
+    Cstruct.blit o o_pos trg t.i_pos n';
+    { t with i_pos = t.i_pos + n'
+           ; o_pos = if o_pos + n' = n then None else Some (o_pos + n')
+           ; state = if o_pos + n' = n then Decoder.P.flush 0 (Cstruct.len o) t.state else t.state }
   | None ->
-    let n' = min n (deserializer.i_len - deserializer.i_pos) in
-    Cstruct.blit o 0 trg deserializer.i_pos n';
-    { deserializer with i_pos = deserializer.i_pos + n'
-                      ; apply_idx = if n' = n then None else Some n'
-                      ; state = if n' = n then Decoder.P.flush 0 (Cstruct.len o) deserializer.state else deserializer.state }
+    let n' = min n (t.i_len - t.i_pos) in
+    Cstruct.blit o 0 trg t.i_pos n';
+    { t with i_pos = t.i_pos + n'
+           ; o_pos = if n' = n then None else Some n'
+           ; state = if n' = n then Decoder.P.flush 0 (Cstruct.len o) t.state else t.state }
 
-let rec filler ?(chunk = 0x8000) source pack s_tmp d_tmp t =
+(* XXX(dinosaure): This function fills [s_tmp] by what we expect:
+                   - [source] is a [Cstruct.t option] - may be is more relevant to declare this inside [t].
+                     It used to store the source needed to undelta-ified the git object expected
+                   - [pack] is a *stop-the-world* state used to load the [source] git object
+                   - [r_tmp] is two [Cstruct.t] used by [pack] to load [source]
+
+                   As you understand, it's not mandatory to use [source], [pack]
+                   and [r_tmp] but it can be happen when the git object
+                   requested is delta-ified. So, semantically, [r_tmp] must not
+                   be used by another computation (it's needed to be free).
+
+                   Then, [filler] starts with [source = None] but for each call
+                   of [filler], you need to keep [source] (and it's why [source]
+                   is returned).
+
+                   Finally, [s_tmp] contains a part of the git object requested.
+
+                   When [t.final = false], that means the end of the git object.
+ *)
+let rec filler ?(chunk = 0x8000) source pack s_tmp r_tmp t =
   if t.i_pos = t.i_len
   then Ok (t, source)
   else match Decoder.P.eval t.window.Unpack.Window.raw t.state with
@@ -457,14 +484,14 @@ let rec filler ?(chunk = 0x8000) source pack s_tmp d_tmp t =
       then
         filler
           source
-          pack s_tmp d_tmp
+          pack s_tmp r_tmp
           { t with consume = t.consume + rest_in_window
                  ; state = Decoder.P.refill t.consume rest_in_window state }
       else begin
         let window, relative_offset = Decoder.find pack Int64.(add t.window.Unpack.Window.off (of_int t.consume)) in
         filler
           source
-          pack s_tmp d_tmp
+          pack s_tmp r_tmp
           { t with window = window
                  ; consume = relative_offset
                  ; state = Decoder.P.refill 0 0 state }
@@ -473,30 +500,36 @@ let rec filler ?(chunk = 0x8000) source pack s_tmp d_tmp t =
       (match source with
        | Some raw ->
          let t' = apply raw s_tmp { t with state = state } hunk in
-         filler source pack s_tmp d_tmp t'
+         filler source pack s_tmp r_tmp t'
        | None ->
+         (* XXX(dinosaure): it's only in this case when [pack], [source] and [r_tmp] is relevant.
+                            note that [source] is one of buffers [r_tmp] physically.
+          *)
          let getter state =
            match Decoder.P.kind state with
            | Decoder.P.Hunk { Decoder.P.HunkDecoder.reference = Decoder.P.HunkDecoder.Offset ofs; _ } ->
              let absolute_offset = Int64.sub (Decoder.P.offset state) ofs in
-             Decoder.get' pack absolute_offset z_tmp0 z_win0 d_tmp
+             Decoder.get' pack absolute_offset z_tmp0 z_win0 r_tmp
            | Decoder.P.Hunk { Decoder.P.HunkDecoder.reference = Decoder.P.HunkDecoder.Hash hash; _ } ->
-             Decoder.get pack hash z_tmp0 z_win0 d_tmp
+             Decoder.get pack hash z_tmp0 z_win0 r_tmp
            | _ -> assert false
+           (* XXX(dinosaure): [Decoder.P.eval] returns [`Hunk] only when the
+                              [kind] of the requested object is a [Decoder.P.Hunk].
+                              We can use GADT!!!!
+            *)
          in
 
          (match getter state with
-          | Ok base -> filler (Some base.Decoder.Object.raw) pack s_tmp d_tmp { t with state = state }
+          | Ok base -> filler (Some base.Decoder.Object.raw) pack s_tmp r_tmp { t with state = state }
           | Error exn -> Error exn))
     | `Flush state ->
       let t' = fill s_tmp { t with state = state } in
-      filler source pack s_tmp d_tmp t'
+      filler source pack s_tmp r_tmp t'
     | `Object state ->
       Ok ({ t with final = true
                  ; state = state }, source)
     | `End state -> assert false
     | `Error (state, exn) ->
-      Format.eprintf "> %a\n%!" Decoder.P.pp_error exn;
       Error (Decoder.Unpack_error (state, t.window, exn))
 
 let pp_option pp_data fmt = function
@@ -504,42 +537,120 @@ let pp_option pp_data fmt = function
   | None -> Format.fprintf fmt "<none>"
 
 let make_pack ?(chunk = 0x8000) pack_out idx_out pack (raw0, raw1) access entries =
-  let rec loop_pack (deserializer, source) t =
+  let rec loop_pack (deserializer, source, ctx) t =
+    Format.eprintf "deserialization: %a\n%!" (pp_option pp_deserializer) deserializer;
+
     match PACKEncoder.eval s_tmp o_tmp t with
     | `Await t ->
+      (* XXX(dinosaure): we need to explain this big part and why we want to
+                         serialize the PACK file in this way. As you know, [git]
+                         can handle a big file and it's possible to try to
+                         serialize a huge git object (like a huge [blob]). In
+                         this case, we have 2 ways to handle this:
+
+                         - the naive way: it consists to load by [Decoder.get*]
+                           the object we want to serialize. Then, we just need
+                           to iter inside the git object and send it to
+                           [zlib]/[decompress] to serialize. This way is very
+                           easy because we don't need to deal so much with the
+                           non-blocking state of [zlib]/[decompress] and just to
+                           what we want in one run.
+
+                           However, if we try to serialize a big git object
+                           (like 1 Go needed in the memory), may be we will
+                           catch the [Out_of_memory] easily too. So, in a scale
+                           and industrial context, we need to change this way.a
+
+                         - the second way (the current) is to deserialize the
+                           git object requested in a fixed size buffer and
+                           serialize it at the same time. So, clearly, it's not
+                           easy because we need to deal with a first state to
+                           deserialize what we want, then, deal with the
+                           [PACKEncoder] state and internally the
+                           [zlib]/[decompress] state. Finally, [PACKEncoder]
+                           wants to serialize the git object in the [Raw] way,
+                           or the [Hunk]/delta-ified way.
+
+                         So, this part just send to the [PACKEncoder] state a
+                         fixed size buffer of the git object requested/[expect]
+                         continuously. Inside, we use directly
+                         [zlib]/[decompress] to deflate the git object to the
+                         PACK file or we destruct the input to some
+                         [Hunk.Insert] and [Hunk.Copy] and serialize/deflate
+                         them to the PACK file.
+
+                         The big problem is to find a common semantic of the
+                         computation between [decompress], [zlib] and the
+                         [HunkEncoder] and hidden what is going on inside the
+                         [PACKEncoder].
+
+                         So, the [filler] function is a computation to fill
+                         completely and continuously [s_tmp] and send it to the
+                         [PACKEncoder] state. Obviously, we need a
+                         [deserializer] state and keep the [source] used by the
+                         [filler].
+
+                         NOTE: to avoid clash of name and understand what happen
+                         internally, it's better to rename, for each change, the
+                         variable [t0] to [t1].
+      *)
       (match deserializer with
        | Some deserializer0 ->
          (match filler source pack s_tmp (raw0, raw1) deserializer0 with
           | Ok ({ final = false; _ } as deserializer1, source) ->
-            let used_in' = deserializer1.u_in + PACKEncoder.used_in t in
+            let used_in' = deserializer1.used_in + PACKEncoder.used_in t in
 
             let t, deserializer2 =
               if used_in' = deserializer1.i_pos
-              then PACKEncoder.refill 0 0 t,
+              then begin
+                Format.eprintf "refill\n%!";
+
+                PACKEncoder.refill 0 0 t,
                    { deserializer1 with i_off = 0
                                       ; i_pos = 0
                                       ; i_len = Cstruct.len s_tmp
-                                      ; u_in = 0 }
-              else
+                                      ; used_in = 0 }
+              end else begin
+                (* XXX(dinosaure): we ensure than what we send to the [PACKEncoder] is continuoulsy the git object expected.
+                                   for each refill, we feed [ctx] and at the end of [filler], if I'm a killer OCaml developer,
+                                   the SHA1 produced will be the same as expected.
+                 *)
+                SHA1.feed ctx (Cstruct.to_bigarray @@ Cstruct.sub s_tmp (deserializer1.i_off + used_in') (deserializer1.i_pos - used_in'));
+
                 PACKEncoder.refill (deserializer1.i_off + used_in') (deserializer1.i_pos - used_in') t,
-                { deserializer1 with u_in = used_in' }
+                { deserializer1 with used_in = used_in' }
+              end
             in
 
-            loop_pack (Some deserializer2, source) t
+            loop_pack (Some deserializer2, source, ctx) t
           | Ok ({ final = true; _ } as deserializer1, source) ->
-            let used_in' = deserializer1.u_in + PACKEncoder.used_in t in
+            let used_in' = deserializer1.used_in + PACKEncoder.used_in t in
 
-            let t, deserializer2 =
+            let t, deserializer2, source0, ctx0 =
               if used_in' = deserializer1.i_pos
-              then PACKEncoder.finish t, None
-              else
+              then begin
+                let hash_produced = SHA1.get ctx in
+
+                if SHA1.neq hash_produced deserializer1.hash
+                then begin Format.eprintf "expected:%a <> has:%a" SHA1.pp deserializer1.hash SHA1.pp hash_produced; assert false end;
+
+                PACKEncoder.finish t, None, None, SHA1.init ()
+              end else begin
+                SHA1.feed ctx (Cstruct.to_bigarray @@ Cstruct.sub s_tmp (deserializer1.i_off + used_in') (deserializer1.i_pos - used_in'));
+
                 PACKEncoder.refill (deserializer1.i_off + used_in') (deserializer1.i_pos - used_in') t,
-                Some { deserializer1 with u_in = used_in' }
+                Some { deserializer1 with used_in = used_in' },
+                source,
+                ctx
+              end
             in
 
-            loop_pack (deserializer2, source) t
+            loop_pack (deserializer2, source0, ctx0) t
           | Error exn -> Error exn)
        | None ->
+         let hdr = PACKEncoder.header_of_expected t in
+         SHA1.feed ctx (Cstruct.to_bigarray @@ Cstruct.of_string hdr);
+
          match pack.Decoder.idx (PACKEncoder.expect t) with
          | Some (crc, absolute_offset) ->
            let window, relative_offset = Decoder.find pack absolute_offset in
@@ -552,21 +663,21 @@ let make_pack ?(chunk = 0x8000) pack_out idx_out pack (raw0, raw1) access entrie
              ; i_off = 0
              ; i_pos = 0
              ; i_len = 0
-             ; apply_idx = None
-             ; u_in  = 0 }
+             ; o_pos = None
+             ; used_in  = 0 }
            in
-           loop_pack (Some deserializer, None) t
+           loop_pack (Some deserializer, None, ctx) t
          | None -> Error (Decoder.Invalid_hash (PACKEncoder.expect t)))
     | `Flush t ->
       let n = PACKEncoder.used_out t in
-      let deserializer =
+      (* let deserializer =
         Option.map
-          (fun deserializer -> { deserializer with u_in = deserializer.u_in + (PACKEncoder.used_in t) })
+          (fun deserializer -> { deserializer with used_in = deserializer.used_in + (PACKEncoder.used_in t) })
           deserializer
-      in
+         in *)
 
       ignore @@ write pack_out (Cstruct.to_bigarray o_tmp) 0 n;
-      loop_pack (deserializer, source) (PACKEncoder.flush 0 (Cstruct.len o_tmp) t)
+      loop_pack (deserializer, source, ctx) (PACKEncoder.flush 0 (Cstruct.len o_tmp) t)
     | `Error (t, exn) ->
       Format.eprintf "PACK encoder: %a\n%!" PACKEncoder.pp_error exn;
       assert false
@@ -593,7 +704,7 @@ let make_pack ?(chunk = 0x8000) pack_out idx_out pack (raw0, raw1) access entrie
       assert false
   in
 
-  match loop_pack (None, None) (PACKEncoder.default h_tmp access entries) with
+  match loop_pack (None, None, SHA1.init ()) (PACKEncoder.default h_tmp access entries) with
   | Ok (tree_idx, hash_pack) ->
     Format.printf "Hash produced: %a\n%!" SHA1.pp hash_pack;
 
