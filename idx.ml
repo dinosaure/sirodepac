@@ -14,11 +14,34 @@ sig
   val equal   : t -> t -> bool
 end
 
-module Lazy (Hash : HASH) =
-struct
+module type LAZY =
+sig
+  module Hash : HASH
+
   type error =
     | Invalid_header of string
-    | Invalid_version of Int32.t
+    | Invalid_version of int32
+    | Invalid_index
+    | Expected_bigoffset_table
+    | Invalid_bigoffset_index of int
+
+  val pp_error : Format.formatter -> error -> unit
+
+  type t
+
+  val make : ?cache:int -> Cstruct.t -> (t, error) result
+  val find : t -> Hash.t -> (Crc32.t * int64) option
+  val iter : t -> (Hash.t -> (Crc32.t * int64) -> unit) -> unit
+  val fold : t -> (Hash.t -> (Crc32.t * int64) -> 'a -> 'a) -> 'a -> 'a
+end
+
+module Lazy (Hash : HASH) : LAZY with module Hash = Hash =
+struct
+  module Hash = Hash
+
+  type error =
+    | Invalid_header of string
+    | Invalid_version of int32
     | Invalid_index
     | Expected_bigoffset_table
     | Invalid_bigoffset_index of int
@@ -221,8 +244,31 @@ struct
   let value ~default = function Some x -> x | None -> default
 end
 
-module Decoder (Hash : HASH) =
+module type DECODER =
+sig
+  module Hash : HASH
+
+  type error =
+    | Invalid_byte of int
+    | Invalid_version of Int32.t
+    | Invalid_index_of_bigoffset of int
+    | Expected_bigoffset_table
+    | Invalid_hash of Hash.t * Hash.t
+
+  val pp_error : Format.formatter -> error -> unit
+
+  type t
+
+  val pp     : Format.formatter -> t -> unit
+  val make   : unit -> t
+  val refill : int -> int -> t -> t
+  val eval   : Cstruct.t -> t -> [ `Await of t | `End of t * Hash.t | `Hash of t * (Hash.t * Crc32.t * int64) | `Error of t * error ]
+end
+
+module Decoder (Hash : HASH) : DECODER with module Hash = Hash =
 struct
+  module Hash = Hash
+
   type error =
     | Invalid_byte of int
     | Invalid_version of Int32.t
@@ -580,8 +626,30 @@ struct
     loop t
 end
 
-module Encoder (Hash : HASH) =
+module type ENCODER =
+sig
+  module Hash : HASH
+
+  type error
+
+  val pp_error : Format.formatter -> error -> unit
+
+  type t
+
+  val pp : Format.formatter -> t -> unit
+
+  type 'a sequence = ('a -> unit) -> unit
+
+  val default  : (Hash.t * (Crc32.t * int64)) sequence -> Hash.t -> t
+  val flush    : int -> int -> t -> t
+  val used_out : t -> int
+  val eval     : Cstruct.t -> t -> [ `Flush of t | `End of t | `Error of t * error ]
+end
+
+module Encoder (Hash : HASH) : ENCODER with module Hash = Hash =
 struct
+  module Hash = Hash
+
   type error = unit
 
   let pp_error fmt () = ()
