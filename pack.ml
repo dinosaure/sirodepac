@@ -130,24 +130,23 @@ struct
   let rec pp
     : type delta. Format.formatter -> t -> unit
     = fun fmt { hash_name; hash_object; name; kind; preferred; delta; length; } ->
-    Format.fprintf fmt "{ @[<hov>name = %d and @[<hov>%a@];@ \
-                                 hash = @[<hov>%a@];@ \
-                                 kind = @[<hov>%a@];@ \
-                                 preferred = %b;@ \
-                                 delta = @[<hov>%a@];@ \
-                                 length = %Ld;@] }"
-      hash_name
-      (pp_option Format.pp_print_string)
-      name
-      Hash.pp hash_object
-      Kind.pp kind
-      preferred
-      pp_source delta
-      length
+      Format.fprintf fmt "{ @[<hov>name = %d and @[<hov>%a@];@ \
+                          hash = @[<hov>%a@];@ \
+                          kind = @[<hov>%a@];@ \
+                          preferred = %b;@ \
+                          delta = @[<hov>%a@];@ \
+                          length = %Ld;@] }"
+        hash_name
+        (pp_option Format.pp_print_string)
+        name
+        Hash.pp hash_object
+        Kind.pp kind
+        preferred
+        pp_source delta
+        length
 
-  (* XXX(dinosaure): hash from git to sort git objects.
-                     in git, this hash is computed in an [int32],
-   *)
+  (* XXX(dinosaure): hash from git to sort git objects. in git, this hash is
+     computed in an [int32], *)
   let hash name =
     let res = ref 0 in
 
@@ -186,12 +185,11 @@ struct
   let compare a b =
     (* - first, sort by type. Different objects never delta with each other.
        - then sort by filename/dirname. hash of the basename occupies the top
-         BITS_PER_BITS - DIR_BITS, and bottom DIR_BITS are for hash of leading
-         path elements.
+       BITS_PER_BITS - DIR_BITS, and bottom DIR_BITS are for hash of leading
+       path elements.
        - then if we are doing "thin" pack, the objects wa are not going to pack
-         but we know about are sorted earlier than other object.
-       - and finally sort by size, larger to smaller
-     *)
+       but we know about are sorted earlier than other object.
+       - and finally sort by size, larger to smaller *)
 
     let int_of_bool v = if v then 1 else 0 in
 
@@ -303,13 +301,13 @@ struct
     ; i_pos         : int
     ; i_len         : int
     ; i_abs         : int
-    ; write         : int (* XXX(dinosaure): difficult to write a Hunk bigger than [max_int].
-                                             consider that it's safe to use [int] instead [int64]. *)
+    ; write         : int (* XXX(dinosaure): difficult to write a Hunk bigger
+                             than [max_int]. consider that it's safe to use
+                             [int] instead [int64]. *)
     ; reference     : reference
     ; source_length : int
     ; target_length : int
     ; hunks         : Rabin.e list
-    ; safe_hunks    : Hunk.t list
     ; state         : state }
   and reference =
     | Offset of int64
@@ -450,24 +448,17 @@ struct
       if n = 0 then acc else aux (acc + 1) (n lsr 8)
     in if n = 0 then 1 else aux 0 n
 
-  let tmp = Buffer.create 0x7F
-
-  let rec insert safe_raw res absolute_offset len src dst t =
+  let rec insert res absolute_offset len src dst t =
     if res = 0
-    then begin
-      Format.eprintf "Insert produced: %a\n%!" pp_cstruct (Cstruct.of_string (Buffer.contents tmp));
-      Buffer.clear tmp;
-      Cont { t with state = List }
-    end else
+    then Cont { t with state = List }
+    else
       (* XXX(dinosaure): We ensure than the [absolute_offset] requested is
-                         available inside [src]. So, [t.i_abs] keep how many
-                         bytes we computed before __continuously__ and
-                         correspond to the current absolute offset of [src].
+         available inside [src]. So, [t.i_abs] keep how many bytes we computed
+         before __continuously__ and correspond to the current absolute offset
+         of [src].
 
-                         We just need to check if what we need to write is
-                         available inside the interval [t.i_abs (t.i_abs +
-                         t.i_len)[.
-       *)
+         We just need to check if what we need to write is available inside the
+         interval [t.i_abs (t.i_abs + t.i_len)[. *)
       (if absolute_offset + (len - res) >= t.i_abs
        && absolute_offset + (len - res) < t.i_abs + t.i_len
        then
@@ -475,27 +466,14 @@ struct
          let n = min res (t.i_len - (relative_offset + (len - res))) in
 
          (* XXX(dinosaure): then, we have a [relative_offset] correspond to the
-                            [absolute_offset] but inside the current [src] and
-                            the interval [t.i_off (t.i_off + t.i_len)[.
-         *)
-
-         if Cstruct.compare (Cstruct.sub safe_raw (len - res) n) (Cstruct.sub src (t.i_off + relative_offset + (len - res)) n) <> 0
-         then begin
-           Format.eprintf "We expect to write: %a.\n%!" pp_cstruct (Cstruct.sub safe_raw (len - res) n);
-           Format.eprintf "But we write: %a.\n%!" pp_cstruct (Cstruct.sub src (t.i_off + relative_offset + (len - res)) n);
-         end;
-
-         Buffer.add_string tmp (Cstruct.to_string (Cstruct.sub src (t.i_off + relative_offset + (len - res)) n));
-
+            [absolute_offset] but inside the current [src] and the interval
+            [t.i_off (t.i_off + t.i_len)[. *)
          (KInsert.put_raw ((t.i_off + relative_offset + (len - res)), n)
-          @@ fun src dst t -> Cont { t with state = Insert (insert safe_raw (res - n) absolute_offset len)
+          @@ fun src dst t -> Cont { t with state = Insert (insert (res - n) absolute_offset len)
                                           (* XXX(dinosaure): we need to keep how
-                                                             many bytes we rode
-                                                             because,
-                                                             externally, we
-                                                             could use
-                                                             [used_in].
-                                           *)
+                                             many bytes we rode because,
+                                             externally, we could use [used_in].
+                                             *)
                                           ; i_pos = relative_offset + (len - res) + n })
            src dst t
        else await { t with i_pos = t.i_len })
@@ -524,57 +502,41 @@ struct
   let consume t =
     await { t with i_pos = t.i_len }
 
-  let list src dst t = match t.hunks, t.safe_hunks with
-    | [], [] -> Cont { t with state = Consume }
-    | hunk :: r, safe_hunk :: safe_r ->
-      (match hunk, safe_hunk with
-       | Rabin.I (off, len), Hunk.Insert safe_raw ->
-         Format.eprintf "Write: (Insert (%d, %d)) (Insert %a)\n%!" off len pp_cstruct safe_raw;
+  let list src dst t = match t.hunks with
+    | [] -> Cont { t with state = Consume }
+    | hunk :: r ->
+      match hunk with
+      | Rabin.I (off, len) ->
+        assert (len > 0 && len <= 0x7F);
+        (* XXX(dinosaure): the [xdiff] algorithm ensures than an [Rabin.I] can't
+           be upper than [0x7F]. *)
 
-         assert (len > 0 && len <= 0x7F);
-         (* XXX(dinosaure): the [xdiff] algorithm ensures than an [Rabin.I] can't be upper than [0x7F]. *)
+        let byte = len land 0x7F in
 
-         let byte = len land 0x7F in
+        KHunk.put_byte byte (fun dst t -> Cont { t with state = Insert (insert len off len)
+                                                      ; hunks = r }) dst t
+      | Rabin.C (off, len) ->
+        let n_offset = how_many_bytes off in
+        let n_length = if len = 0x10000 then 1 else how_many_bytes len in
 
-         KHunk.put_byte byte (fun dst t -> Cont { t with state = Insert (insert safe_raw len off len)
-                                                       ; hunks = r
-                                                       ; safe_hunks = safe_r }) dst t
-       | Rabin.C (off, len), Hunk.Copy (safe_off, safe_len) ->
-         Format.eprintf "Write: Copy (%d, %d)\n%!" off len;
+        let o, fo = match n_offset with
+          | 1 -> 0b0001, (false, false, false)
+          | 2 -> 0b0011, (true, false, false)
+          | 3 -> 0b0111, (true, true, false)
+          | 4 -> 0b1111, (true, true, true)
+          | _ ->
+            assert false
+        in
 
-         assert (safe_off = off && safe_len = len);
+        let l, fl = match n_length with
+          | 1 -> 0b001, (false, false)
+          | 2 -> 0b011, (true, false)
+          | 3 -> 0b111, (true, true)
+          | _ -> assert false
+        in
 
-         let n_offset = how_many_bytes off in
-         let n_length = if len = 0x10000 then 1 else how_many_bytes len in
-
-         let o, fo = match n_offset with
-           | 1 -> 0b0001, (false, false, false)
-           | 2 -> 0b0011, (true, false, false)
-           | 3 -> 0b0111, (true, true, false)
-           | 4 -> 0b1111, (true, true, true)
-           | _ ->
-             assert false
-         in
-
-         let l, fl = match n_length with
-           | 1 -> 0b001, (false, false)
-           | 2 -> 0b011, (true, false)
-           | 3 -> 0b111, (true, true)
-           | _ -> assert false
-         in
-
-         KHunk.put_byte (0x80 lor (l lsl 4) lor o) (copy (off, fo)  (if len = 0x10000 then (0, (false, false)) else len, fl)) dst
-           { t with hunks = r
-                  ; safe_hunks = safe_r }
-       | Rabin.C (off, len), Hunk.Insert raw ->
-         Format.eprintf "We have (C (%d, %d)) and (Insert %a)\n%!"
-           off len pp_cstruct raw;
-         assert false
-       | Rabin.I (off, len), Hunk.Copy (off', len') ->
-         Format.eprintf "We have (I (%d, %d)) and (Copy (%d, %d))\n%!"
-           off len off' len';
-         assert false)
-    | _ -> assert false
+        KHunk.put_byte (0x80 lor (l lsl 4) lor o) (copy (off, fo)  (if len = 0x10000 then (0, (false, false)) else len, fl)) dst
+          { t with hunks = r }
 
   let header dst t =
     (KHeader.length t.source_length
@@ -605,7 +567,7 @@ struct
 
     loop t
 
-  let default reference source_length target_length hunks safe_hunks =
+  let default reference source_length target_length hunks =
     { o_off = 0
     ; o_pos = 0
     ; o_len = 0
@@ -618,7 +580,6 @@ struct
     ; source_length
     ; target_length
     ; hunks = hunks
-    ; safe_hunks
     ; state = Header header }
 
   let length src_len trg_len hunks =
@@ -641,9 +602,8 @@ struct
            ; i_pos = 0
            ; i_len = len
            ; i_abs = t.i_abs + t.i_len }
-    (* XXX(dinosaure): we consider than we [refill] continuously the input fixed
-                       size buffer.
-     *)
+  (* XXX(dinosaure): we consider than we [refill] continuously the input fixed
+     size buffer. *)
 
   let finish t = { t with state = End
                         ; i_pos = 0
@@ -672,20 +632,23 @@ struct
            ; depth      : int
            ; hunks      : Rabin.e list
            ; src        : t
-           ; src_length : int64 (* XXX(dinosaure): this is the length of the inflated raw of [src]. *)
+           ; src_length : int64 (* XXX(dinosaure): this is the length of the
+                                   inflated raw of [src]. *)
            ; src_hash   : Hash.t }
-    (* XXX(dinosaure): I try to use GADT (peano number) and ... I really crazy. *)
+    (* XXX(dinosaure): I try to use GADT (peano number) and ... I really crazy.
+       *)
 
   module WeightByMemory =
   struct
     type nonrec t = t * Cstruct.t * Rabin.Index.t
 
     let weight (_, raw, rabin) =
-      (* XXX(dinosaure): 1 word for [t]
-                         len of raw
-                         1 for ... I don't know
-                         memory size of the rabin's fingerprint
-       *)
+      (* XXX(dinosaure):
+         - 1 word for [t]
+         - len of raw
+         - 1 for ... I don't know
+         - memory size of the rabin's fingerprint
+      *)
       1 + Cstruct.len raw + 1 + (Rabin.Index.memory_size rabin)
   end
 
@@ -742,52 +705,54 @@ struct
   let delta
     : type window. window -> (module WINDOW with type t = window) -> int -> Entry.t -> Cstruct.t -> t -> (Entry.t * Rabin.e list * int) option
     = fun window window_pack max trg_entry trg_raw trg ->
-    let limit src = match trg.delta with
-      | S { length; src; _ } ->
-        length * (max - (depth src)) / (max - (depth trg + 1))
-      | Z ->
-        (Int64.to_int trg_entry.Entry.length / 2 - 20) * (max - (depth src)) / (max - 1)
-    in
-
-    let choose a b = match a, b with
-      | None, None -> None
-      | Some a, None -> Some a (* XXX(dinosaure): [a] is considered as the best. *)
-      | None, Some (a, hunks_a, len_a) ->
-        if not (only_insert hunks_a) then Some (a, hunks_a, len_a) else None
-        (* XXX(dinosaure): Rabin's fingerprint can produce only [Insert] hunks and we avoid that. *)
-      | Some (a, hunks_a, len_a), Some (b, hunks_b, len_b) ->
-        if len_a < len_b
-        then Some (a, hunks_a, len_a)
-        else Some (b, hunks_b, len_b)
-    in
-
-    let apply src_entry (src, src_raw, rabin) best =
-      let diff =
-        if src_entry.Entry.length < trg_entry.Entry.length
-        then Int64.to_int (Int64.sub trg_entry.Entry.length src_entry.Entry.length)
-        else 0
+      let limit src = match trg.delta with
+        | S { length; src; _ } ->
+          length * (max - (depth src)) / (max - (depth trg + 1))
+        | Z ->
+          (Int64.to_int trg_entry.Entry.length / 2 - 20) * (max - (depth src)) / (max - 1)
       in
 
-      if src_entry.Entry.kind <> trg_entry.Entry.kind
-       || (depth src) = max
-       || (limit src) = 0
-       || (limit src) <= diff
-       || trg_entry.Entry.length < Int64.(src_entry.Entry.length / 32L)
-       || Hash.equal src_entry.Entry.hash_object trg_entry.Entry.hash_object
-      then best
-      else
-        let hunks  = Rabin.delta rabin trg_raw in
-        let length = length (Cstruct.len src_raw) (Cstruct.len trg_raw) hunks in
+      let choose a b = match a, b with
+        | None, None -> None
+        | Some a, None -> Some a (* XXX(dinosaure): [a] is considered as the
+                                    best. *)
+        | None, Some (a, hunks_a, len_a) ->
+          if not (only_insert hunks_a) then Some (a, hunks_a, len_a) else None
+        (* XXX(dinosaure): Rabin's fingerprint can produce only [Insert] hunks
+           and we avoid that. *)
+        | Some (a, hunks_a, len_a), Some (b, hunks_b, len_b) ->
+          if len_a < len_b
+          then Some (a, hunks_a, len_a)
+          else Some (b, hunks_b, len_b)
+      in
 
-        choose best (Some (src_entry, hunks, length))
-    in
+      let apply src_entry (src, src_raw, rabin) best =
+        let diff =
+          if src_entry.Entry.length < trg_entry.Entry.length
+          then Int64.to_int (Int64.sub trg_entry.Entry.length src_entry.Entry.length)
+          else 0
+        in
 
-    let module Window = (val window_pack) in
+        if src_entry.Entry.kind <> trg_entry.Entry.kind
+        || (depth src) = max
+        || (limit src) = 0
+        || (limit src) <= diff
+        || trg_entry.Entry.length < Int64.(src_entry.Entry.length / 32L)
+        || Hash.equal src_entry.Entry.hash_object trg_entry.Entry.hash_object
+        then best
+        else
+          let hunks  = Rabin.delta rabin trg_raw in
+          let length = length (Cstruct.len src_raw) (Cstruct.len trg_raw) hunks in
 
-    if not trg_entry.Entry.preferred
-       && (depth trg) < max
-    then Window.fold apply None window
-    else None
+          choose best (Some (src_entry, hunks, length))
+      in
+
+      let module Window = (val window_pack) in
+
+      if not trg_entry.Entry.preferred
+      && (depth trg) < max
+      then Window.fold apply None window
+      else None
 
   let int_of_bool v = if v then 1 else 0
 
@@ -803,18 +768,27 @@ struct
     ; entry        : Entry.t * t }
 
   (* XXX(dinosaure): git prioritize some entries in imperative weird way. we
-                     can't reproduce the same with a small cost so we decide to
-                     let the user to prioritize some entries by the [tag]
-                     function and keep the lexicographic order:
+     can't reproduce the same with a small cost so we decide to let the user to
+     prioritize some entries by the [tag] function and keep the lexicographic
+     order:
 
-                     - tagged
-                     - commit
-                     - tag
-                     - tree
-                     - rest
+     - tagged
+     - commit
+     - tag
+     - tree
+     - rest
 
-                     We can don't care about that in other side ...
-   *)
+     We can don't care about that in other side ... In reality, we have a
+     topological sort to optimize the deserialization and avoid the
+     fragmentation of the delta-ification. Indeed, when we have a hunks object
+     which refers to a git object by the hash, it's because the source is
+     located after the current object. So, technically, we need (may be) to
+     allocates a new [Window] to deserialize the source and use the old [Window]
+     to deserialize the object requested. For a big delta-ification (like with
+     50 depths), it's not optimal to find all objects needed in all the PACK
+     file and it's more efficient to locate (by the topological sort) all
+     sources needed previously than the requested object (and limit in this way
+     how much [Window.t] we need to reconstruct the object). TODO! *)
   let sort tag lst =
     let compare a b =
       if int_of_bool a.tagged > int_of_bool b.tagged
@@ -867,12 +841,10 @@ struct
       let normal = Hashtbl.create (List.length tries) in
 
       (* XXX(dinosaure): [normalize] applies the diff to all [untries] entries.
-                         however, we need to apply to [untries] a topological
-                         sort to ensure than when we try to apply a diff in one
-                         /untries/ entry, we already computed the source
-                         (available in [tries] or [untries]). It's why we keep
-                         an hash-table and update this hash-table for each diff.
-       *)
+         however, we need to apply to [untries] a topological sort to ensure
+         than when we try to apply a diff in one /untries/ entry, we already
+         computed the source (available in [tries] or [untries]). It's why we
+         keep an hash-table and update this hash-table for each diff. *)
       let normalize =
         List.map (fun trg_entry -> match trg_entry.Entry.delta with
             | Entry.None -> (trg_entry, { delta = Z })
@@ -880,14 +852,10 @@ struct
               let src = try Hashtbl.find normal hash with Not_found -> { delta = Z } in
 
               (* XXX(dinosaure): if we can't find [src] in the hash-table, that
-                                 means the source object is outside the PACK
-                                 file because we ensure than if [trg_entry] has
-                                 a dependence, by the topological sort, we
-                                 already computed all /in-PACK/ sources
-                                 necessary for the next and update the
-                                 hash-table with these sources.
-               *)
-
+                 means the source object is outside the PACK file because we
+                 ensure than if [trg_entry] has a dependence, by the topological
+                 sort, we already computed all /in-PACK/ sources necessary for
+                 the next and update the hash-table with these sources. *)
               match get hash, get trg_entry.Entry.hash_object with
               | Some src_raw, Some trg_raw ->
                 let rabin  = Rabin.Index.make ~copy:false src_raw in (* we don't keep [rabin]. *)
@@ -912,44 +880,30 @@ struct
 
       List.fold_left
         (fun (window, acc) entry -> match get entry.Entry.hash_object with
-          | None -> raise (Uncaught_hash entry.Entry.hash_object)
-          | Some raw ->
-            Format.eprintf "try to delta: %a (length of window: %d)\n%!" Hash.pp entry.Entry.hash_object (Window.items window);
+           | None -> raise (Uncaught_hash entry.Entry.hash_object)
+           | Some raw ->
+             let base   = { delta = Z } in
+             let rabin  = Rabin.Index.make ~copy:false raw in (* we keep [rabin] with [raw] in the [window]. *)
+             let window = Window.add entry (base, raw, rabin) window in
 
-            let base   = { delta = Z } in
-            let rabin  = Rabin.Index.make ~copy:false raw in (* we keep [rabin] with [raw] in the [window]. *)
-            let window = Window.add entry (base, raw, rabin) window in
+             match delta window window_pack max entry raw base with
+             | None -> window, (entry, base) :: acc
+             | Some (src_entry, hunks, length) ->
 
-            match delta window window_pack max entry raw base with
-            | None -> window, (entry, base) :: acc
-            | Some (src_entry, hunks, length) ->
+               match Window.find ~promote:true src_entry window with
+               | Some ((src, src_raw, rabin), window) ->
+                 let depth  = depth src + 1 in
 
-              match Window.find ~promote:true src_entry window with
-              | Some ((src, src_raw, rabin), window) ->
-                let rec print = function
-                  | [] -> ()
-                  | Rabin.I (off, len) :: r ->
-                    Format.eprintf "> (Insert (%d, %d)) (Insert %a)\n%!" off len pp_cstruct (Cstruct.sub raw off len);
-                    print r
-                  | Rabin.C (off, len) :: r ->
-                    Format.eprintf "> (Copy (%d, %d))\n%!" off len;
-                    print r
-                in
+                 base.delta <- S { length
+                                 ; depth
+                                 ; hunks
+                                 ; src
+                                 ; src_length = src_entry.Entry.length
+                                 ; src_hash = src_entry.Entry.hash_object };
+                 Hashtbl.add normal entry.Entry.hash_object base;
 
-                let () = print hunks in
-
-                let depth  = depth src + 1 in
-
-                base.delta <- S { length
-                                ; depth
-                                ; hunks
-                                ; src
-                                ; src_length = src_entry.Entry.length
-                                ; src_hash = src_entry.Entry.hash_object };
-                Hashtbl.add normal entry.Entry.hash_object base;
-
-                window, ({ entry with Entry.delta = Entry.From src_entry.Entry.hash_object }, base) :: acc
-              | None -> window, (entry, base) :: acc)
+                 window, ({ entry with Entry.delta = Entry.From src_entry.Entry.hash_object }, base) :: acc
+               | None -> window, (entry, base) :: acc)
         (window, []) tries
       |> fun (window, res) -> List.rev res
                               |> List.append (normalize untries)
@@ -1011,7 +965,6 @@ struct
     ; i_len   : int
     ; write   : int64
     ; radix   : (Crc32.t * int64) Radix.t
-    ; access  : (Hash.t -> Cstruct.t option)
     ; hash    : Hash.ctx
     ; h_tmp   : Cstruct.t
     ; state   : state }
@@ -1020,13 +973,13 @@ struct
     | Header of k
     | Object of k
     | WriteK of k
-    | WriteZ of { x   : Entry.t * Cstruct.t
+    | WriteZ of { x   : Entry.t
                 ; r   : (Entry.t * Delta.t) list
                 ; crc : Crc32.t
                 ; off : int64
                 ; ui  : int
                 ; z   : Deflate.t }
-    | WriteH of { x   : Entry.t * Delta.t * Cstruct.t
+    | WriteH of { x   : Entry.t * Delta.t
                 ; r   : (Entry.t * Delta.t) list
                 ; crc : Crc32.t
                 ; off : int64
@@ -1236,19 +1189,17 @@ struct
 
     KHash.put_hash (Cstruct.of_bigarray hash) (fun dst t -> ok t hash) dst t
 
-  let writek kind entry entry_raw entry_delta rest dst t =
+  let writek kind entry entry_delta rest dst t =
     match kind, entry_delta with
     | KindRaw, { Delta.delta = Delta.Z } ->
       let abs_off = t.write in
-
-      Format.eprintf "%a (start at %Ld): Raw\n%!" Hash.pp entry.Entry.hash_object t.write;
 
       (KWriteK.header (Kind.to_bin entry.Entry.kind) entry.Entry.length Crc32.default
        @@ fun crc dst t ->
        let z = Deflate.default 4 in
        let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos) z in
 
-       Cont { t with state = WriteZ { x = (entry, entry_raw)
+       Cont { t with state = WriteZ { x = entry
                                     ; r = rest
                                     ; crc
                                     ; off = abs_off
@@ -1257,20 +1208,20 @@ struct
                    ; i_off = 0
                    ; i_pos = 0
                    ; i_len = 0 })
-      dst t
+        dst t
 
     | KindHash, { Delta.delta = Delta.S { length; depth; hunks; src; src_length; src_hash; } } ->
-      let trg_length = Cstruct.len entry_raw in
+      let trg_length = entry.Entry.length in
       let abs_off    = t.write in
 
-      (* XXX(dinosaure): we can obtain the source hash by [entry.delta]. TODO! *)
-
-      Format.eprintf "%a (start at: %Ld): Hash from %a (source length: %Ld, target length: %d)\n%!"
-        Hash.pp entry.Entry.hash_object t.write Hash.pp src_hash src_length trg_length;
+      (* XXX(dinosaure): we can obtain the source hash by [entry.delta]. TODO!
+         *)
 
       let h =
         HunkEncoder.flush 0 (Cstruct.len t.h_tmp)
-        @@ HunkEncoder.default (HunkEncoder.Hash src_hash) (Int64.to_int src_length) trg_length hunks (Hunk.from_rabin hunks entry_raw)
+        @@ HunkEncoder.default (HunkEncoder.Hash src_hash) (Int64.to_int src_length) (Int64.to_int trg_length) hunks
+        (* XXX(dinosaure): FIXME: [trg_length] is an [int64] but HunkEncoder
+           expects an [int]. *)
       in
 
       (KWriteK.header 0b111 (Int64.of_int length) Crc32.default
@@ -1279,7 +1230,7 @@ struct
        let z = Deflate.default 4 in
        let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos) z in
 
-       Cont { t with state = WriteH { x = (entry, entry_delta, entry_raw)
+       Cont { t with state = WriteH { x = (entry, entry_delta)
                                     ; r = rest
                                     ; crc
                                     ; off = abs_off
@@ -1294,16 +1245,15 @@ struct
     | KindOffset, { Delta.delta = Delta.S { length; depth; hunks; src; src_length; src_hash; } } ->
       (match Radix.lookup t.radix src_hash with
        | Some (src_crc, src_off) ->
-         let trg_length = Cstruct.len entry_raw in
+         let trg_length = entry.Entry.length in
          let abs_off    = t.write in
          let rel_off    = Int64.sub abs_off src_off in
 
-         Format.eprintf "%a (start at: %Ld): Offset from %Ld:%Ld (source length: %Ld, target length: %d)\n%!"
-           Hash.pp entry.Entry.hash_object t.write rel_off abs_off src_length trg_length;
-
          let h =
            HunkEncoder.flush 0 (Cstruct.len t.h_tmp)
-           @@ HunkEncoder.default (HunkEncoder.Offset rel_off) (Int64.to_int src_length) trg_length hunks (Hunk.from_rabin hunks entry_raw)
+           @@ HunkEncoder.default (HunkEncoder.Offset rel_off) (Int64.to_int src_length) (Int64.to_int trg_length) hunks
+           (* XXX(dinosaure): FIXME: [trg_length] is an [int64] but HunkEncoder
+              expects an [int]. *)
          in
 
          (KWriteK.header 0b110 (Int64.of_int length) Crc32.default
@@ -1312,7 +1262,7 @@ struct
           let z = Deflate.default 4 in
           let z = Deflate.flush (t.o_off + t.o_pos) (t.o_len - t.o_pos) z in
 
-          Cont { t with state = WriteH { x = (entry, entry_delta, entry_raw)
+          Cont { t with state = WriteH { x = (entry, entry_delta)
                                        ; r = rest
                                        ; crc
                                        ; off = abs_off
@@ -1327,7 +1277,7 @@ struct
 
     | _, _ -> assert false
 
-  let writez src dst t ((entry, entry_raw) as x) r crc off used_in z =
+  let writez src dst t x r crc off used_in z =
     match Deflate.eval src dst z with
       | `Await z ->
         await { t with state = WriteZ { x; r; crc; off; ui = used_in; z; }
@@ -1342,13 +1292,13 @@ struct
       | `End z ->
         let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
 
-        Cont { t with state = Save { x = entry; r; crc; off; }
+        Cont { t with state = Save { x; r; crc; off; }
                     ; o_pos = t.o_pos + (Deflate.used_out z)
                     ; i_pos = Deflate.used_in z
                     ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
       | `Error (z, exn) -> error t (Deflate_error exn)
 
-  let writeh src dst t ((entry, entry_delta, entry_raw) as x) r crc off used_in h z =
+  let writeh src dst t ((entry, entry_delta) as x) r crc off used_in h z =
     match Deflate.eval t.h_tmp dst z with
     | `Await z ->
       (match HunkEncoder.eval src t.h_tmp h with
@@ -1360,10 +1310,8 @@ struct
 
          let z, h, ui =
            if used_in' = HunkEncoder.used_out h
-           then begin
-             Format.eprintf "We deflate: @[<hov>%a@]\n%!" Cstruct.hexdump_pp (Cstruct.sub t.h_tmp 0 (HunkEncoder.used_out h));
-             Deflate.no_flush 0 0 z, HunkEncoder.flush 0 (Cstruct.len t.h_tmp) h, 0
-           end else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
+           then Deflate.no_flush 0 0 z, HunkEncoder.flush 0 (Cstruct.len t.h_tmp) h, 0
+           else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
          in
 
          Cont { t with state = WriteH { x; r; crc; off; ui; h; z; }
@@ -1373,10 +1321,8 @@ struct
 
          let z, h, ui =
            if used_in' = HunkEncoder.used_out h
-           then begin
-             Format.eprintf "We deflate: @[<hov>%a@]\n%!" Cstruct.hexdump_pp (Cstruct.sub t.h_tmp 0 (HunkEncoder.used_out h));
-             Deflate.finish z, h, used_in'
-           end else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
+           then Deflate.finish z, h, used_in'
+           else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
          in
 
          Cont { t with state = WriteH { x; r; crc; off; ui; h; z; }
@@ -1404,15 +1350,14 @@ struct
   let iter lst dst t = match lst with
     | [] -> Cont { t with state = Hash hash }
     | (entry, delta) :: r ->
-      match entry.Entry.delta, delta, t.access entry.Entry.hash_object with
-      | Entry.From src_hash, { Delta.delta = Delta.S _ }, Some raw ->
+      match entry.Entry.delta, delta with
+      | Entry.From src_hash, { Delta.delta = Delta.S _ } ->
         if Radix.exists t.radix src_hash
-        then Cont { t with state = WriteK (writek KindOffset entry raw delta r) }
-        else Cont { t with state = WriteK (writek KindHash entry raw delta r) }
-      | Entry.None, { Delta.delta = Delta.Z }, Some raw ->
-        Cont { t with state = WriteK (writek KindRaw entry raw delta r) }
-      | _, _, Some _ -> error t (Invalid_entry (entry, delta))
-      | _, _, None -> error t (Invalid_hash entry.Entry.hash_object)
+        then Cont { t with state = WriteK (writek KindOffset entry delta r) }
+        else Cont { t with state = WriteK (writek KindHash entry delta r) }
+      | Entry.None, { Delta.delta = Delta.Z } ->
+        Cont { t with state = WriteK (writek KindRaw entry delta r) }
+      | _, _ -> error t (Invalid_hash entry.Entry.hash_object)
 
   let save dst t x r crc off =
     Cont { t with state = Object (iter r)
@@ -1485,14 +1430,14 @@ struct
 
   let expect t =
     match t.state with
-    | WriteH { x = ({ Entry.hash_object; _ }, _, _); _ } -> hash_object
-    | WriteZ { x = ({ Entry.hash_object; _ }, _); _ } -> hash_object
+    | WriteH { x = ({ Entry.hash_object; _ }, _); _ } -> hash_object
+    | WriteZ { x = { Entry.hash_object; _ }; _ } -> hash_object
     | _ -> raise (Invalid_argument "PACKEncoder.expecti: bad state")
 
   let header_of_expected t =
     match t.state with
-    | WriteH { x = (entry, _, _); _ }
-    | WriteZ { x = (entry, _); _ } ->
+    | WriteH { x = (entry, _); _ }
+    | WriteZ { x = entry; _ } ->
       let typename = match entry.Entry.kind with
         | Kind.Commit -> "commit"
         | Kind.Tree -> "tree"
@@ -1537,7 +1482,7 @@ struct
     | WriteH { h; _ } -> HunkEncoder.used_in h
     | _ -> raise (Invalid_argument "PACKEncoder.used_in: bad state")
 
-  let default h_tmp access objects =
+  let default h_tmp objects =
     { o_off = 0
     ; o_pos = 0
     ; o_len = 0
@@ -1546,7 +1491,6 @@ struct
     ; i_len = 0
     ; write = 0L
     ; radix = Radix.empty
-    ; access
     ; h_tmp
     ; hash = Hash.init ()
     ; state = (Header (header objects)) }

@@ -408,7 +408,7 @@ let pp_deserializer fmt t =
     t.consume Decoder.P.pp t.state SHA1.pp t.hash t.final t.i_off t.i_pos t.i_len (pp_option Format.pp_print_int) t.o_pos t.used_in
 
 let apply src trg t = function
-  | Decoder.P.HunkDecoder.Insert i ->
+  | Decoder.P.H.Insert i ->
     (match t.o_pos with
      | Some o_pos ->
        let n = min (t.i_len - t.i_pos) (Cstruct.len i - o_pos) in
@@ -422,7 +422,7 @@ let apply src trg t = function
        { t with i_pos = t.i_pos + n
               ; o_pos = if n = Cstruct.len i then None else Some n
               ; state = if n = Cstruct.len i then Decoder.P.continue t.state else t.state })
-  | Decoder.P.HunkDecoder.Copy (off, len) ->
+  | Decoder.P.H.Copy (off, len) ->
     (match t.o_pos with
      | Some o_pos ->
        let n = min (t.i_len - t.i_pos) (len - o_pos) in
@@ -507,10 +507,10 @@ let rec filler ?(chunk = 0x8000) source pack s_tmp r_tmp t =
           *)
          let getter state =
            match Decoder.P.kind state with
-           | Decoder.P.Hunk { Decoder.P.HunkDecoder.reference = Decoder.P.HunkDecoder.Offset ofs; _ } ->
+           | Decoder.P.Hunk { Decoder.P.H.reference = Decoder.P.H.Offset ofs; _ } ->
              let absolute_offset = Int64.sub (Decoder.P.offset state) ofs in
              Decoder.get' pack absolute_offset z_tmp0 z_win0 r_tmp
-           | Decoder.P.Hunk { Decoder.P.HunkDecoder.reference = Decoder.P.HunkDecoder.Hash hash; _ } ->
+           | Decoder.P.Hunk { Decoder.P.H.reference = Decoder.P.H.Hash hash; _ } ->
              Decoder.get pack hash z_tmp0 z_win0 r_tmp
            | _ -> assert false
            (* XXX(dinosaure): [Decoder.P.eval] returns [`Hunk] only when the
@@ -536,10 +536,8 @@ let pp_option pp_data fmt = function
   | Some x -> pp_data fmt x
   | None -> Format.fprintf fmt "<none>"
 
-let make_pack ?(chunk = 0x8000) pack_out idx_out pack (raw0, raw1) access entries =
-  let rec loop_pack (deserializer, source, ctx) t =
-    Format.eprintf "deserialization: %a\n%!" (pp_option pp_deserializer) deserializer;
-
+let make_pack ?(chunk = 0x8000) pack_out idx_out pack (raw0, raw1) entries =
+  let rec loop_pack (deserializer, source) t =
     match PACKEncoder.eval s_tmp o_tmp t with
     | `Await t ->
       (* XXX(dinosaure): we need to explain this big part and why we want to
@@ -602,56 +600,35 @@ let make_pack ?(chunk = 0x8000) pack_out idx_out pack (raw0, raw1) access entrie
 
             let t, deserializer2 =
               if used_in' = deserializer1.i_pos
-              then begin
-                Format.eprintf "refill\n%!";
-
+              then
                 PACKEncoder.refill 0 0 t,
                    { deserializer1 with i_off = 0
                                       ; i_pos = 0
                                       ; i_len = Cstruct.len s_tmp
                                       ; used_in = 0 }
-              end else begin
-                (* XXX(dinosaure): we ensure than what we send to the [PACKEncoder] is continuoulsy the git object expected.
-                                   for each refill, we feed [ctx] and at the end of [filler], if I'm a killer OCaml developer,
-                                   the SHA1 produced will be the same as expected.
-                 *)
-                SHA1.feed ctx (Cstruct.to_bigarray @@ Cstruct.sub s_tmp (deserializer1.i_off + used_in') (deserializer1.i_pos - used_in'));
-
+              else
                 PACKEncoder.refill (deserializer1.i_off + used_in') (deserializer1.i_pos - used_in') t,
                 { deserializer1 with used_in = used_in' }
-              end
             in
 
-            loop_pack (Some deserializer2, source, ctx) t
+            loop_pack (Some deserializer2, source) t
           | Ok ({ final = true; _ } as deserializer1, source) ->
             let used_in' = deserializer1.used_in + PACKEncoder.used_in t in
 
-            let t, deserializer2, source0, ctx0 =
+            let t, deserializer2, source0 =
               if used_in' = deserializer1.i_pos
-              then begin
-                let hash_produced = SHA1.get ctx in
-
-                if SHA1.neq hash_produced deserializer1.hash
-                then begin Format.eprintf "expected:%a <> has:%a" SHA1.pp deserializer1.hash SHA1.pp hash_produced; assert false end;
-
-                PACKEncoder.finish t, None, None, SHA1.init ()
-              end else begin
-                SHA1.feed ctx (Cstruct.to_bigarray @@ Cstruct.sub s_tmp (deserializer1.i_off + used_in') (deserializer1.i_pos - used_in'));
-
+              then
+                PACKEncoder.finish t, None, None
+              else
                 PACKEncoder.refill (deserializer1.i_off + used_in') (deserializer1.i_pos - used_in') t,
                 Some { deserializer1 with used_in = used_in' },
-                source,
-                ctx
-              end
+                source
             in
 
-            loop_pack (deserializer2, source0, ctx0) t
+            loop_pack (deserializer2, source0) t
           | Error exn -> Error exn)
        | None ->
-         let hdr = PACKEncoder.header_of_expected t in
-         SHA1.feed ctx (Cstruct.to_bigarray @@ Cstruct.of_string hdr);
-
-         match pack.Decoder.idx (PACKEncoder.expect t) with
+         match (Decoder.idx pack) (PACKEncoder.expect t) with
          | Some (crc, absolute_offset) ->
            let window, relative_offset = Decoder.find pack absolute_offset in
            let deserializer =
@@ -666,18 +643,13 @@ let make_pack ?(chunk = 0x8000) pack_out idx_out pack (raw0, raw1) access entrie
              ; o_pos = None
              ; used_in  = 0 }
            in
-           loop_pack (Some deserializer, None, ctx) t
+           loop_pack (Some deserializer, None) t
          | None -> Error (Decoder.Invalid_hash (PACKEncoder.expect t)))
     | `Flush t ->
       let n = PACKEncoder.used_out t in
-      (* let deserializer =
-        Option.map
-          (fun deserializer -> { deserializer with used_in = deserializer.used_in + (PACKEncoder.used_in t) })
-          deserializer
-         in *)
 
       ignore @@ write pack_out (Cstruct.to_bigarray o_tmp) 0 n;
-      loop_pack (deserializer, source, ctx) (PACKEncoder.flush 0 (Cstruct.len o_tmp) t)
+      loop_pack (deserializer, source) (PACKEncoder.flush 0 (Cstruct.len o_tmp) t)
     | `Error (t, exn) ->
       Format.eprintf "PACK encoder: %a\n%!" PACKEncoder.pp_error exn;
       assert false
@@ -704,7 +676,7 @@ let make_pack ?(chunk = 0x8000) pack_out idx_out pack (raw0, raw1) access entrie
       assert false
   in
 
-  match loop_pack (None, None, SHA1.init ()) (PACKEncoder.default h_tmp access entries) with
+  match loop_pack (None, None) (PACKEncoder.default h_tmp entries) with
   | Ok (tree_idx, hash_pack) ->
     Format.printf "Hash produced: %a\n%!" SHA1.pp hash_pack;
 
@@ -810,14 +782,7 @@ let () =
     let pack_out = Unix.openfile pack_filename [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o644 in
     let idx_out  = Unix.openfile idx_filename [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o644 in
 
-    let access hash = match Decoder.get old_pack hash z_tmp z_win (old_raw0, old_raw1) with
-      | Ok base -> Some base.Decoder.Object.raw
-      | Error exn ->
-        Format.eprintf "Silent error with %a: %a\n%!" SHA1.pp hash Decoder.pp_error exn;
-        None
-    in
-
-    make_pack pack_out idx_out old_pack (tmp_raw0, tmp_raw1) access entries;
+    make_pack pack_out idx_out old_pack (tmp_raw0, tmp_raw1) entries;
     Unix.close pack_out;
     Unix.close idx_out;
 
@@ -850,6 +815,7 @@ let () =
       | Ok new_base, Ok old_base ->
         if SHA1.neq (hash_of_object new_base) hash
         then begin Format.eprintf "SHA1 does not correspond for: %a\n%!" SHA1.pp hash; assert false end;
+
         if Crc32.neq crc (Decoder.Object.first_crc_exn new_base)
         then Format.eprintf "CRC-32 is %a but expected %a.\n%!" Crc32.pp (Decoder.Object.first_crc_exn new_base) Crc32.pp crc;
 
