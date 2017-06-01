@@ -41,22 +41,6 @@ sig
   val to_hex_string : t -> string
 end
 
-module Hunk =
-struct
-  type t =
-    | Insert of Cstruct.t
-    | Copy of int * int
-
-  let pp fmt = function
-    | Insert cs -> Format.fprintf fmt "(Insert [%a])" pp_cstruct cs
-    | Copy (off, len) -> Format.fprintf fmt "(Copy (%d, %d))" off len
-
-  let from_rabin lst raw =
-    List.map (function Rabin.C (off, len) -> Copy (off, len)
-                     | Rabin.I (off, len) -> Insert (Cstruct.sub raw off len))
-      lst
-end
-
 module Option =
 struct
   let value ~default = function
@@ -169,7 +153,6 @@ struct
   let name entry = entry.name
 
   let make
-
     : type delta. Hash.t -> ?name:string -> ?preferred:bool -> ?delta:source -> Kind.t -> int64 -> t
     = fun hash_object ?name ?(preferred = false) ?(delta = None) kind length ->
     let hash_name = Option.(value ~default:0 (name >>| hash)) in
@@ -181,6 +164,12 @@ struct
     ; preferred
     ; delta
     ; length }
+
+  let id { hash_object; _ } = hash_object
+
+  let name x name =
+    { x with hash_name = hash name
+           ; name = Some name }
 
   let compare a b =
     (* - first, sort by type. Different objects never delta with each other.
@@ -582,16 +571,6 @@ struct
     ; hunks = hunks
     ; state = Header header }
 
-  let length src_len trg_len hunks =
-    size_of_variable_length src_len
-    + size_of_variable_length trg_len
-    + List.fold_left
-      (fun acc -> function
-         | Hunk.Insert raw -> 1 + Cstruct.len raw + acc
-         | Hunk.Copy (off, len) ->
-           1 + (how_many_bytes off) + (if len = 0x10000 then 1 else how_many_bytes len) + acc)
-      0 hunks
-
   let flush off len t =
     { t with o_off = off
            ; o_len = len
@@ -927,17 +906,133 @@ sig
   val eval     : Cstruct.t -> Cstruct.t -> t -> [ `Flush of t | `Await of t | `Error of (t * error) | `End of t ]
 end
 
-module MakePACKEncoder (Hash : HASH) (Deflate : Z) =
-struct
-  module Entry = Entry(Hash)
-  module Delta = MakeDelta(Hash)
-  module Radix = Radix.Make(struct include Hash let get = Bigarray.Array1.get let length _ = Hash.length end)
-  module Write = Set.Make(Hash)
-  module HunkEncoder = MakeHunkEncoder(Hash)
+module type ENCODER =
+sig
+  module Hash : HASH
+  module Deflate : Z
+
+  module Entry :
+  sig
+    module Commit : (module type of Minigit.Commit(Hash))
+    module Tree   : (module type of Minigit.Tree(Hash))
+    module Tag    : (module type of Minigit.Tag(Hash))
+    module Blob   : (module type of Minigit.Blob)
+
+    type t
+
+    type source =
+      | From of Hash.t
+      | None
+
+    val pp : Format.formatter -> t -> unit
+    val pp_source : Format.formatter -> source -> unit
+
+    val hash : string -> int
+
+    val make : Hash.t -> ?name:string -> ?preferred:bool -> ?delta:source -> Kind.t -> int64 -> t
+
+    val id : t -> Hash.t
+    val name : t -> string -> t
+
+    val compare : t -> t -> int
+
+    val from_commit  : Hash.t -> ?preferred:bool -> ?delta:source -> Commit.t -> t
+    val from_tag     : Hash.t -> ?preferred:bool -> ?delta:source -> Tag.t -> t
+    val from_tree    : Hash.t -> ?preferred:bool -> ?delta:source -> ?path:string -> Tree.t -> t
+    val from_blob    : Hash.t -> ?preferred:bool -> ?delta:source -> ?path:string -> Blob.t -> t
+
+    val topological_sort : t list -> t list
+  end
+
+  module Delta :
+  sig
+    type t =
+      { mutable delta : delta }
+    and delta =
+      | Z
+      | S of { length     : int
+             ; depth      : int
+             ; hunks      : Rabin.e list
+             ; src        : t
+             ; src_length : int64
+             ; src_hash   : Hash.t
+             ; }
+
+    type error = Invalid_hash of Hash.t
+
+    val pp_error : Format.formatter -> error -> unit
+
+    val deltas : ?memory:bool -> Entry.t list -> (Hash.t -> Cstruct.t option) -> (Entry.t -> bool) -> int -> int -> ((Entry.t * t) list, error) result
+  end
+
+  module Radix : module type of Radix.Make(struct include Hash let get = Bigarray.Array1.get let length _ = Hash.length end)
+
+  module H :
+  sig
+    type error
+
+    val pp_error : Format.formatter -> error -> unit
+
+    type t
+
+    type reference =
+      | Offset of int64
+      | Hash of Hash.t
+
+    val pp : Format.formatter -> t -> unit
+
+    val default : reference -> int -> int -> Rabin.e list -> t
+
+    val refill : int -> int -> t -> t
+    val flush : int -> int -> t -> t
+    val finish : t -> t
+
+    val eval : Cstruct.t -> Cstruct.t -> t -> [ `Await of t | `Flush of t | `End of t | `Error of (t * error) ]
+
+    val used_in : t -> int
+    val used_out : t -> int
+  end
 
   type error =
     | Deflate_error of Deflate.error
-    | Hunk_error of HunkEncoder.error
+    | Hunk_error of H.error
+    | Invalid_entry of Entry.t * Delta.t
+    | Invalid_hash of Hash.t
+
+  val pp_error : Format.formatter -> error -> unit
+
+  type t
+
+  val used_out : t -> int
+  val used_in : t -> int
+
+  val flush : int -> int -> t -> t
+  val refill : int -> int -> t -> t
+  val finish : t -> t
+
+  val expect : t -> Hash.t
+  val idx : t -> (Crc32.t * int64) Radix.t
+
+  val default : Cstruct.t -> (Entry.t * Delta.t) list -> t
+
+  val eval : Cstruct.t -> Cstruct.t -> t -> [ `Flush of t | `Await of t | `End of (t * Hash.t) | `Error of (t * error) ]
+end
+
+module MakePACKEncoder (Hash : HASH) (Deflate : Z)
+  : ENCODER with module Hash = Hash
+             and module Deflate = Deflate =
+struct
+  module Hash = Hash
+  module Deflate = Deflate
+
+  module Entry = Entry(Hash)
+  module Delta = MakeDelta(Hash)
+  module Radix = Radix.Make(struct include Hash let get = Bigarray.Array1.get let length _ = Hash.length end)
+  module H     = MakeHunkEncoder(Hash)
+
+  type error =
+    | Deflate_error of Deflate.error
+    | Hunk_error of H.error
     | Invalid_entry of Entry.t * Delta.t
     | Invalid_hash of Hash.t
 
@@ -945,7 +1040,7 @@ struct
     | Deflate_error exn ->
       Format.fprintf fmt "(Deflate_error %a)" Deflate.pp_error exn
     | Hunk_error exn ->
-      Format.fprintf fmt "(Hunk_error %a)" HunkEncoder.pp_error exn
+      Format.fprintf fmt "(Hunk_error %a)" H.pp_error exn
     | Invalid_entry (entry, delta) ->
       Format.fprintf fmt "(Invalid_entry @[<hov>(%a,@ %a)@])"
         Entry.pp entry Delta.pp delta
@@ -984,7 +1079,7 @@ struct
                 ; crc : Crc32.t
                 ; off : int64
                 ; ui  : int
-                ; h   : HunkEncoder.t
+                ; h   : H.t
                 ; z   : Deflate.t }
     | Save   of { x   : Entry.t
                 ; r   : (Entry.t * Delta.t) list
@@ -1218,9 +1313,9 @@ struct
          *)
 
       let h =
-        HunkEncoder.flush 0 (Cstruct.len t.h_tmp)
-        @@ HunkEncoder.default (HunkEncoder.Hash src_hash) (Int64.to_int src_length) (Int64.to_int trg_length) hunks
-        (* XXX(dinosaure): FIXME: [trg_length] is an [int64] but HunkEncoder
+        H.flush 0 (Cstruct.len t.h_tmp)
+        @@ H.default (H.Hash src_hash) (Int64.to_int src_length) (Int64.to_int trg_length) hunks
+        (* XXX(dinosaure): FIXME: [trg_length] is an [int64] but H
            expects an [int]. *)
       in
 
@@ -1250,9 +1345,9 @@ struct
          let rel_off    = Int64.sub abs_off src_off in
 
          let h =
-           HunkEncoder.flush 0 (Cstruct.len t.h_tmp)
-           @@ HunkEncoder.default (HunkEncoder.Offset rel_off) (Int64.to_int src_length) (Int64.to_int trg_length) hunks
-           (* XXX(dinosaure): FIXME: [trg_length] is an [int64] but HunkEncoder
+           H.flush 0 (Cstruct.len t.h_tmp)
+           @@ H.default (H.Offset rel_off) (Int64.to_int src_length) (Int64.to_int trg_length) hunks
+           (* XXX(dinosaure): FIXME: [trg_length] is an [int64] but H
               expects an [int]. *)
          in
 
@@ -1301,39 +1396,39 @@ struct
   let writeh src dst t ((entry, entry_delta) as x) r crc off used_in h z =
     match Deflate.eval t.h_tmp dst z with
     | `Await z ->
-      (match HunkEncoder.eval src t.h_tmp h with
+      (match H.eval src t.h_tmp h with
        | `Await h ->
          await { t with state = WriteH { x; r; crc; off; ui = 0; z; h; }
-                      ; i_pos = HunkEncoder.used_in h }
+                      ; i_pos = H.used_in h }
        | `Flush h ->
          let used_in' = used_in + Deflate.used_in z in
 
          let z, h, ui =
-           if used_in' = HunkEncoder.used_out h
-           then Deflate.no_flush 0 0 z, HunkEncoder.flush 0 (Cstruct.len t.h_tmp) h, 0
-           else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
+           if used_in' = H.used_out h
+           then Deflate.no_flush 0 0 z, H.flush 0 (Cstruct.len t.h_tmp) h, 0
+           else Deflate.no_flush used_in' (H.used_out h - used_in') z, h, used_in'
          in
 
          Cont { t with state = WriteH { x; r; crc; off; ui; h; z; }
-                     ; i_pos = HunkEncoder.used_in h }
+                     ; i_pos = H.used_in h }
        | `End h ->
          let used_in' = used_in + Deflate.used_in z in
 
          let z, h, ui =
-           if used_in' = HunkEncoder.used_out h
+           if used_in' = H.used_out h
            then Deflate.finish z, h, used_in'
-           else Deflate.no_flush used_in' (HunkEncoder.used_out h - used_in') z, h, used_in'
+           else Deflate.no_flush used_in' (H.used_out h - used_in') z, h, used_in'
          in
 
          Cont { t with state = WriteH { x; r; crc; off; ui; h; z; }
-                     ; i_pos = HunkEncoder.used_in h }
+                     ; i_pos = H.used_in h }
        | `Error (h, exn) -> error t (Hunk_error exn))
     | `Flush z ->
       let crc = Crc32.digest ~off:(t.o_off + t.o_pos) ~len:(Deflate.used_out z) crc dst in
       let used_in' = used_in + Deflate.used_in z in
 
       flush dst { t with state = WriteH { x; r; crc; off; ui = used_in'; h; z; }
-                       ; i_pos = HunkEncoder.used_in h
+                       ; i_pos = H.used_in h
                        ; o_pos = t.o_pos + (Deflate.used_out z)
                        ; write = Int64.add t.write (Int64.of_int (Deflate.used_out z)) }
     | `End z ->
@@ -1461,7 +1556,7 @@ struct
         { t with i_off = offset
                ; i_len = len
                ; i_pos = 0
-               ; state = WriteH { x; r; crc; off; ui; z; h = HunkEncoder.refill offset len h } }
+               ; state = WriteH { x; r; crc; off; ui; z; h = H.refill offset len h } }
       | _ -> { t with i_off = offset
                     ; i_len = len
                     ; i_pos = 0 }
@@ -1473,13 +1568,13 @@ struct
       | WriteZ { x; r; crc; off; ui; z; } ->
         { t with state = WriteZ { x; r; crc; off; ui; z = Deflate.finish z } }
       | WriteH { x; r; crc; off; ui; z; h; } ->
-        { t with state = WriteH { x; r; crc; off; ui; z; h = HunkEncoder.finish h } }
+        { t with state = WriteH { x; r; crc; off; ui; z; h = H.finish h } }
       | _ -> t
     else raise (Invalid_argument (Format.sprintf "PACKEncoder.finish: you lost something (pos: %d, len: %d)" t.i_pos t.i_len))
 
   let used_in t = match t.state with
     | WriteZ { z; _ } -> Deflate.used_in z
-    | WriteH { h; _ } -> HunkEncoder.used_in h
+    | WriteH { h; _ } -> H.used_in h
     | _ -> raise (Invalid_argument "PACKEncoder.used_in: bad state")
 
   let default h_tmp objects =

@@ -291,8 +291,8 @@ module IDXDecoder  = Idx.Decoder(SHA1)
 module IDXEncoder  = Idx.Encoder(SHA1)
 module Decoder     = Unpack.MakeDecoder(SHA1)(Mapper)(ZIO)
 module PACKDecoder = Decoder.P
-module Delta       = Pack.MakeDelta(SHA1)
 module PACKEncoder = Pack.MakePACKEncoder(SHA1)(ZDO)
+module Delta       = PACKEncoder.Delta
 module Radix       = PACKEncoder.Radix
 
 module Commit      = Minigit.Commit(SHA1)
@@ -361,13 +361,13 @@ let object_to_entry hash base =
 
   match base.kind with
   | `Commit ->
-    Delta.Entry.make hash Pack.Kind.Commit base.length
+    PACKEncoder.Entry.make hash Pack.Kind.Commit base.length
   | `Tree ->
-    Delta.Entry.make hash Pack.Kind.Tree ?name:(try Some (Hashtbl.find p_nam hash) with Not_found -> None) base.length
+    PACKEncoder.Entry.make hash Pack.Kind.Tree ?name:(try Some (Hashtbl.find p_nam hash) with Not_found -> None) base.length
   | `Tag ->
-    Delta.Entry.make hash Pack.Kind.Tag base.length
+    PACKEncoder.Entry.make hash Pack.Kind.Tag base.length
   | `Blob ->
-    Delta.Entry.make hash Pack.Kind.Blob ?name:(try Some (Hashtbl.find p_nam hash) with Not_found -> None) base.length
+    PACKEncoder.Entry.make hash Pack.Kind.Blob ?name:(try Some (Hashtbl.find p_nam hash) with Not_found -> None) base.length
 
 let pp_option pp_data fmt = function
   | Some x -> pp_data fmt x
@@ -761,9 +761,8 @@ let () =
 
   let entries = IDXLazy.fold old_idx each_git_object [] in
   let entries =
-    List.map (fun x -> try let name = Hashtbl.find p_nam x.Delta.Entry.hash_object in
-                 { x with Delta.Entry.hash_name = Delta.Entry.hash name
-                        ; name = Some name }
+    List.map (fun x -> try let name = Hashtbl.find p_nam (PACKEncoder.Entry.id x) in
+                 (PACKEncoder.Entry.name x name)
                with Not_found -> x)
       entries
   in
